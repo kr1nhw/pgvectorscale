@@ -137,7 +137,6 @@ pub extern "C-unwind" fn ambuildempty(index: pg_sys::Relation) {
     unsafe {
         let index_rel = PgRelation::from_pg(index);
         let options = TSVIvfOptions::from_relation(&index_rel);
-        let num_lists = options.get_lists() as usize;
         let num_dimensions = index_rel
             .tuple_desc()
             .get(0)
@@ -146,26 +145,38 @@ pub extern "C-unwind" fn ambuildempty(index: pg_sys::Relation) {
         if num_dimensions == 0 {
             panic!("Cannot determine vector dimensions from index");
         }
+        write_empty_index(&index_rel, &options, num_dimensions as u32);
+    }
+}
 
-        let mut rng = SmallRng::from_entropy();
-        let rotation_seed: u64 = rng.gen();
+/// Write the minimal IVF on-disk structure (meta + empty list directory +
+/// empty centroid page) with the fixed block layout.
+fn write_empty_index(index: &PgRelation, options: &TSVIvfOptions, num_dimensions: u32) {
+    let num_lists = options.get_lists() as usize;
+    let mut rng = SmallRng::from_entropy();
+    let rotation_seed: u64 = rng.gen();
 
-        // Meta page (block 0), empty list directory (block 1), empty centroids (block 2).
-        let _meta = IvfMetaPage::create(
-            &index_rel,
-            num_dimensions as u32,
+    // Meta page (block 0), empty list directory (block 1), empty centroids (block 2).
+    let _meta = unsafe {
+        IvfMetaPage::create(
+            index,
+            num_dimensions,
             DistanceType::L2,
             num_lists as u16,
             crate::access_method::storage::StorageType::RabbitqCompression,
             1, // num_bits
             rotation_seed,
-        );
+        )
+    };
 
-        let list_directory = IvfListDirectory::new(num_lists as u16);
-        list_directory.store(&index_rel, true);
+    let list_directory = IvfListDirectory::new(num_lists as u16);
+    unsafe {
+        list_directory.store(index, true);
+    }
 
-        let centroid_page = IvfCentroidPage::new(Vec::new());
-        centroid_page.store(&index_rel, true);
+    let centroid_page = IvfCentroidPage::new(Vec::new());
+    unsafe {
+        centroid_page.store(index, true);
     }
 }
 
@@ -236,6 +247,9 @@ pub fn build_ivf_index_serial(
     num_dimensions: u32,
 ) -> IvfBuildResult {
     if vectors.is_empty() {
+        // PG calls ambuild (not ambuildempty) even for empty tables, so write
+        // the minimal on-disk structure here.
+        write_empty_index(index, options, num_dimensions);
         return IvfBuildResult {
             num_tuples: 0,
             centroids: Vec::new(),
