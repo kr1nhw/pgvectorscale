@@ -77,6 +77,7 @@ impl PageType {
             || matches!(self, PageType::IvfListDirectory)
             || matches!(self, PageType::IvfCentroids)
             || matches!(self, PageType::IvfQuantizerMetadata)
+            || matches!(self, PageType::IvfEntry)
     }
 }
 

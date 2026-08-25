@@ -68,10 +68,14 @@ impl IvfEntryPage {
 }
 
 /// Writer for IVF entry pages.
+///
+/// Collects all entries for a single inverted list and writes them as one
+/// chained item (a single serialized `IvfEntryPage`).  The chain handles items
+/// larger than a page, so there is no arbitrary per-page entry-count limit.
 pub struct IvfEntryWriter<'a> {
     index: &'a PgRelation,
-    current_page: IvfEntryPage,
-    pages_written: Vec<BlockNumber>,
+    list_id: u16,
+    entries: Vec<IvfEntry>,
 }
 
 impl<'a> IvfEntryWriter<'a> {
@@ -79,93 +83,67 @@ impl<'a> IvfEntryWriter<'a> {
     pub fn new(index: &'a PgRelation, list_id: u16) -> Self {
         Self {
             index,
-            current_page: IvfEntryPage::new(list_id),
-            pages_written: Vec::new(),
+            list_id,
+            entries: Vec::new(),
         }
     }
 
-    /// Add an entry to the current page, flushing if needed.
+    /// Add an entry to this list.
     pub fn add_entry(&mut self, entry: IvfEntry) {
-        self.current_page.add_entry(entry);
-
-        // Flush if page is getting full (arbitrary threshold for now)
-        if self.current_page.num_entries() >= 100 {
-            self.flush_page();
-        }
+        self.entries.push(entry);
     }
 
-    /// Flush the current page to disk.
-    fn flush_page(&mut self) {
-        if self.current_page.is_empty() {
-            return;
+    /// Finish writing and return the first page number and total entries.
+    pub fn finish(self) -> (Option<BlockNumber>, usize) {
+        let total_entries = self.entries.len();
+        if total_entries == 0 {
+            return (None, 0);
         }
+
+        let page = IvfEntryPage {
+            list_id: self.list_id,
+            entries: self.entries,
+            next_page: pgrx::pg_sys::InvalidBlockNumber,
+        };
 
         unsafe {
             let mut stats = crate::access_method::stats::WriteStats::default();
             let mut tape = ChainTapeWriter::new(self.index, PageType::IvfEntry, &mut stats);
-
-            let bytes = self.current_page.serialize_to_vec();
+            let bytes = page.serialize_to_vec();
             let off = tape.write(&bytes);
-
-            let block_number = off.block_number;
-            self.pages_written.push(block_number);
+            (Some(off.block_number), total_entries)
         }
-
-        // Start a new page
-        self.current_page = IvfEntryPage::new(self.current_page.list_id);
-    }
-
-    /// Finish writing and return the first page number and total entries.
-    pub fn finish(mut self) -> (Option<BlockNumber>, usize) {
-        self.flush_page();
-
-        let first_page = self.pages_written.first().copied();
-        let total_entries = self.pages_written.len() * 100; // Approximate
-        (first_page, total_entries)
     }
 }
 
 /// Reader for IVF entry pages.
-pub struct IvfEntryReader {
-    index: PgRelation,
+pub struct IvfEntryReader<'a> {
+    index: &'a PgRelation,
 }
 
-impl IvfEntryReader {
+impl<'a> IvfEntryReader<'a> {
     /// Create a new entry reader.
-    pub fn new(index: PgRelation) -> Self {
+    pub fn new(index: &'a PgRelation) -> Self {
         Self { index }
     }
 
     /// Read all entries for a given list starting from the given page.
     pub fn read_entries(&self, start_page: BlockNumber) -> Vec<IvfEntry> {
-        let mut entries = Vec::new();
-        let mut current_page = start_page;
+        unsafe {
+            let mut stats = crate::access_method::stats::WriteStats::default();
+            let mut reader = ChainItemReader::new(self.index, PageType::IvfEntry, &mut stats);
 
-        loop {
-            let page_data = unsafe {
-                let mut stats = crate::access_method::stats::WriteStats::default();
-                let mut tape = ChainItemReader::new(&self.index, PageType::IvfEntry, &mut stats);
-
-                let mut buf: Vec<u8> = Vec::new();
-                for item in tape.read(ItemPointer::new(current_page, 1)) {
-                    buf.extend_from_slice(item.get_data_slice());
-                }
-                buf
-            };
-
-            if page_data.is_empty() {
-                break;
+            let mut buf: Vec<u8> = Vec::new();
+            for item in reader.read(ItemPointer::new(start_page, 1)) {
+                buf.extend_from_slice(item.get_data_slice());
             }
 
-            let page = rkyv::from_bytes::<IvfEntryPage>(&page_data).unwrap();
-            entries.extend(page.entries);
-
-            if page.next_page == pgrx::pg_sys::InvalidBlockNumber {
-                break;
+            if buf.is_empty() {
+                return Vec::new();
             }
-            current_page = page.next_page;
+
+            let page = rkyv::from_bytes::<IvfEntryPage>(&buf).unwrap();
+            page.entries
         }
-
-        entries
     }
 }
