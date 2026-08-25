@@ -175,9 +175,10 @@ pub unsafe extern "C-unwind" fn amgettuple(
             heap_tid.to_item_pointer_data(&mut tid_data);
             (*scan).xs_heaptid = tid_data;
             (*scan).xs_recheck = false;
-            // Distances are RaBitQ estimates, so let the executor recheck the
-            // order-by exactly against the heap tuple.
-            (*scan).xs_recheckorderby = true;
+            // Trust the (approximate) RaBitQ order; the executor does not
+            // recheck, which would otherwise require the estimate to be a
+            // lower bound on the exact distance (it is unbiased, not bounded).
+            (*scan).xs_recheckorderby = false;
 
             // Provide the approximate distance as a proper Datum (the executor
             // still compares against it to order the recheck queue).
