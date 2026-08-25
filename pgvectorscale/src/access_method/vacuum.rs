@@ -8,6 +8,8 @@ use crate::{
         meta_page::MetaPage,
         plain::node::ArchivedPlainNode,
         plain::storage::PlainStorage,
+        rabitq::node::{ArchivedClassicRabitqNode, ArchivedLabeledRabitqNode},
+        rabitq::storage::RabitqStorage,
         sbq::node::{ArchivedClassicSbqNode, ArchivedLabeledSbqNode},
         sbq::storage::SbqSpeedupStorage,
     },
@@ -56,6 +58,26 @@ pub extern "C-unwind" fn ambulkdelete(
             }
             false => {
                 bulk_delete_for_storage::<SbqSpeedupStorage, ArchivedClassicSbqNode>(
+                    &index_relation,
+                    nblocks,
+                    results,
+                    callback,
+                    callback_state,
+                );
+            }
+        },
+        StorageType::RabitqCompression => match meta_page.has_labels() {
+            true => {
+                bulk_delete_for_storage::<RabitqStorage, ArchivedLabeledRabitqNode>(
+                    &index_relation,
+                    nblocks,
+                    results,
+                    callback,
+                    callback_state,
+                );
+            }
+            false => {
+                bulk_delete_for_storage::<RabitqStorage, ArchivedClassicRabitqNode>(
                     &index_relation,
                     nblocks,
                     results,

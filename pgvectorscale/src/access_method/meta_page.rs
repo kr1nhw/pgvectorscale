@@ -278,6 +278,7 @@ impl MetaPage {
         match self.get_storage_type() {
             StorageType::Plain => None,
             StorageType::SbqCompression => Some(self.quantizer_metadata),
+            StorageType::RabitqCompression => Some(self.quantizer_metadata),
         }
     }
 
@@ -287,6 +288,7 @@ impl MetaPage {
             match (*opt).get_storage_type() {
                 StorageType::Plain => 50,
                 StorageType::SbqCompression => 50,
+                StorageType::RabitqCompression => 50,
             }
         } else {
             num_neighbors as u32
@@ -309,28 +311,35 @@ impl MetaPage {
             opt.num_dimensions
         };
 
-        let bq_num_bits_per_dimension =
-            if opt.bq_num_bits_per_dimension == SBQ_NUM_BITS_PER_DIMENSION_DEFAULT_SENTINEL {
-                if (*opt).get_storage_type() == StorageType::SbqCompression
-                    && num_dimensions_to_index < 900
-                {
-                    2
-                } else {
-                    1
-                }
-            } else {
-                opt.bq_num_bits_per_dimension as u8
-            };
+        let storage_type = (*opt).get_storage_type();
 
-        if bq_num_bits_per_dimension > 1 && num_dimensions_to_index > 930 {
-            //limited by SbqMeans fitting on a page
-            pgrx::error!("SBQ with more than 1 bit per dimension is not supported for more than 900 dimensions");
-        }
-        if bq_num_bits_per_dimension > 1 && (*opt).get_storage_type() != StorageType::SbqCompression
-        {
-            pgrx::error!(
-                "SBQ with more than 1 bit per dimension is only supported with the memory_optimized storage layout"
-            );
+        let bq_num_bits_per_dimension = if storage_type == StorageType::RabitqCompression {
+            // For RaBitQ, num_bits_per_dimension means total bits per dimension (1/4/8).
+            let bits =
+                if opt.bq_num_bits_per_dimension == SBQ_NUM_BITS_PER_DIMENSION_DEFAULT_SENTINEL {
+                    1
+                } else {
+                    opt.bq_num_bits_per_dimension as u8
+                };
+            if !matches!(bits, 1 | 4 | 8) {
+                pgrx::error!("RaBitQ num_bits_per_dimension must be 1, 4 or 8");
+            }
+            bits
+        } else if opt.bq_num_bits_per_dimension == SBQ_NUM_BITS_PER_DIMENSION_DEFAULT_SENTINEL {
+            if storage_type == StorageType::SbqCompression && num_dimensions_to_index < 900 {
+                2
+            } else {
+                1
+            }
+        } else {
+            opt.bq_num_bits_per_dimension as u8
+        };
+
+        if storage_type == StorageType::SbqCompression {
+            if bq_num_bits_per_dimension > 1 && num_dimensions_to_index > 930 {
+                //limited by SbqMeans fitting on a page
+                pgrx::error!("SBQ with more than 1 bit per dimension is not supported for more than 900 dimensions");
+            }
         }
 
         let has_labels = get_num_index_attributes(index) == 2;

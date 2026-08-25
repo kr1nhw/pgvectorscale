@@ -13,6 +13,7 @@ mod node;
 pub mod options;
 pub mod pg_vector;
 pub mod plain;
+pub mod rabitq;
 mod sbq;
 mod scan;
 pub mod stats;

@@ -7,7 +7,7 @@ use pgrx::pg_extern;
 
 pub type DistanceFn = fn(&[f32], &[f32]) -> f32;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum DistanceType {
     Cosine = 0,
     L2 = 1,

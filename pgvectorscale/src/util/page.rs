@@ -35,6 +35,8 @@ pub enum PageType {
     MetaV2 = 6,
     SbqMeans = 7,
     Meta = 8,
+    RabitqNode = 9,
+    RabitqMetadata = 10,
 }
 
 impl PageType {
@@ -49,6 +51,8 @@ impl PageType {
             6 => PageType::MetaV2,
             7 => PageType::SbqMeans,
             8 => PageType::Meta,
+            9 => PageType::RabitqNode,
+            10 => PageType::RabitqMetadata,
             _ => panic!("Unknown PageType number {}", value),
         }
     }
@@ -57,7 +61,9 @@ impl PageType {
     /// This is not supported for all page types.  Note that `Tape` requires
     /// that the page type not be chained.
     pub fn is_chained(self) -> bool {
-        matches!(self, PageType::SbqMeans) || matches!(self, PageType::Meta)
+        matches!(self, PageType::SbqMeans)
+            || matches!(self, PageType::Meta)
+            || matches!(self, PageType::RabitqMetadata)
     }
 }
 
