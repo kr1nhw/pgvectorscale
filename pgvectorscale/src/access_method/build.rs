@@ -335,7 +335,10 @@ pub extern "C-unwind" fn ambuild(
     let heap_tuples = unsafe { heap_relation.rd_rel.as_ref().unwrap().reltuples as usize };
     let workers = if cfg!(feature = "build_parallel")
         && !meta_page.has_labels()
-        && meta_page.get_storage_type() == StorageType::SbqCompression
+        && matches!(
+            meta_page.get_storage_type(),
+            StorageType::SbqCompression | StorageType::RabitqCompression
+        )
     {
         // Check if we have a forced worker count setting
         let forced_workers = crate::access_method::guc::TSV_FORCE_PARALLEL_WORKERS.get();
