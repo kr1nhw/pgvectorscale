@@ -55,6 +55,8 @@ pub struct IvfMetaPage {
     lists: u16,
     /// Number of bits per dimension for quantization (SBQ/RaBitQ)
     bq_num_bits_per_dimension: u8,
+    /// Rotation seed for RaBitQ (deterministic random rotation).
+    rotation_seed: u64,
     /// Pointer to centroids page (Page 2)
     centroids_pointer: ItemPointer,
     /// Pointer to list directory page (Page 1)
@@ -87,6 +89,11 @@ impl IvfMetaPage {
     /// Get the number of bits per dimension for quantization.
     pub fn get_bq_num_bits_per_dimension(&self) -> u8 {
         self.bq_num_bits_per_dimension
+    }
+
+    /// Get the RaBitQ rotation seed.
+    pub fn get_rotation_seed(&self) -> u64 {
+        self.rotation_seed
     }
 
     /// Get pointer to centroids page.
@@ -139,6 +146,7 @@ impl IvfMetaPage {
         lists: u16,
         storage_type: StorageType,
         bq_num_bits_per_dimension: u8,
+        rotation_seed: u64,
     ) -> IvfMetaPage {
         let version = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
 
@@ -151,6 +159,7 @@ impl IvfMetaPage {
             storage_type: storage_type as u8,
             lists,
             bq_num_bits_per_dimension,
+            rotation_seed,
             centroids_pointer: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
             list_directory_pointer: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
             quantizer_metadata: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),

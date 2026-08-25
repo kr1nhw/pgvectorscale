@@ -42,6 +42,7 @@
 
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
+use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::access_method::distance::DistanceType;
 
@@ -147,7 +148,8 @@ pub fn code_hamming(a: &[u8], b: &[u8]) -> usize {
 ///   per-vector estimator gain `gamma = scale/⟨ō,o⟩` (see `quantize`).
 ///
 /// `dim` is the *padded* power-of-two dimension; `sum_of_x2 = ‖x‖²`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Archive, Deserialize, Serialize)]
+#[archive(check_bytes)]
 pub struct RabitqVector {
     pub dim: u32,
     pub sum_of_x2: f32,
@@ -287,12 +289,18 @@ impl RabitqQuantizer {
     /// Rotated global center (same rotation as `quantize`/`rotate_query`),
     /// used for the centroid-correction term ⟨c, code⟩.
     pub fn rotate_center(&self) -> (Vec<f32>, f32) {
-        if self.center.is_empty() {
+        self.rotate_center_of(&self.center.clone())
+    }
+
+    /// Rotate an arbitrary center/centroid vector (padded to the rotation dim),
+    /// returning the rotated vector and its element sum.
+    pub fn rotate_center_of(&self, center: &[f32]) -> (Vec<f32>, f32) {
+        if center.is_empty() {
             return (vec![0.0; self.dim], 0.0);
         }
         let mut rotated = vec![0f32; self.dim];
-        rotated[..self.center.len()].copy_from_slice(&self.center);
-        rotate_inplace(&mut rotated, self.center.len(), self.rotation_seed);
+        rotated[..center.len()].copy_from_slice(center);
+        rotate_inplace(&mut rotated, center.len(), self.rotation_seed);
         let sum = rotated.iter().sum::<f32>();
         (rotated, sum)
     }
@@ -359,21 +367,28 @@ fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u32) -> f32 {
 }
 
 pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
+        self.quantize_residual(&self.center.clone(), full_vector)
+    }
+
+    /// Quantize a vector relative to an explicit centroid (IVF list centroid),
+    /// rather than the global center.  The centroid is subtracted before
+    /// rotation; `cent_dot` stores ⟨rot(centroid), code⟩ for the L2 estimator.
+    pub fn quantize_residual(&self, centroid: &[f32], full_vector: &[f32]) -> RabitqVector {
         let mut centered = full_vector.to_vec();
-        if !self.center.is_empty() {
-            debug_assert_eq!(self.center.len(), full_vector.len());
-            for (x, c) in centered.iter_mut().zip(self.center.iter()) {
+        if !centroid.is_empty() {
+            debug_assert_eq!(centroid.len(), full_vector.len());
+            for (x, c) in centered.iter_mut().zip(centroid.iter()) {
                 *x -= c;
             }
         }
         // Lance-style residual RaBitQ: the vector is centered (residual to the
-        // global center), NOT normalized — the per-vector scale/add factors
-        // absorb the norms.  sum_of_x2 = ‖r‖² is the residual norm squared.
+        // centroid), NOT normalized — the per-vector scale/add factors absorb
+        // the norms.  sum_of_x2 = ‖r‖² is the residual norm squared.
         let sum_of_x2 = centered.iter().map(|v| v * v).sum::<f32>();
         let mut rotated = vec![0f32; self.dim];
         rotated[..full_vector.len()].copy_from_slice(&centered);
         rotate_inplace(&mut rotated, full_vector.len(), self.rotation_seed);
-        let (rot_c, sum_rc) = self.rotate_center();
+        let (rot_c, sum_rc) = self.rotate_center_of(centroid);
 
         match self.num_bits {
             4 | 8 => {
@@ -455,10 +470,15 @@ pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
     /// Rotate a full-precision query vector (kept in `f32` — the query is
     /// only quantized once per search, so precision is free).
     pub fn rotate_query(&self, query: &[f32]) -> RabitqQuery {
+        self.rotate_query_residual(&self.center.clone(), query)
+    }
+
+    /// Rotate a query relative to an explicit centroid (IVF list centroid).
+    pub fn rotate_query_residual(&self, centroid: &[f32], query: &[f32]) -> RabitqQuery {
         let mut centered = query.to_vec();
-        if !self.center.is_empty() {
-            debug_assert_eq!(self.center.len(), query.len());
-            for (x, c) in centered.iter_mut().zip(self.center.iter()) {
+        if !centroid.is_empty() {
+            debug_assert_eq!(centroid.len(), query.len());
+            for (x, c) in centered.iter_mut().zip(centroid.iter()) {
                 *x -= c;
             }
         }
@@ -468,11 +488,23 @@ pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
         rotate_inplace(&mut rotated, query.len(), self.rotation_seed);
         let l1 = rotated.iter().map(|v| v.abs()).sum::<f32>();
         RabitqQuery {
+            sum_q: rotated.iter().sum(),
             rotated,
-            sum_q: 0.0, // filled below
             sum_of_x2,
             l1,
         }
+    }
+
+    /// Lance-style L2 distance estimate between a quantized residual and a
+    /// rotated full-precision query residual (asymmetric estimator: data
+    /// vector quantized, query kept in f32).  Clamped to >= 0.
+    #[inline]
+    pub fn estimate_l2(&self, qv: &RabitqVector, rq: &RabitqQuery) -> f32 {
+        let full_dot = qv.dot_with_rotated(&rq.rotated);
+        let res_dot = qv.l1_of_rotated.max(1e-9);
+        let scale = -2.0 * qv.sum_of_x2 / res_dot;
+        let add = qv.sum_of_x2 + 2.0 * qv.sum_of_x2 * qv.cent_dot / res_dot;
+        (full_dot * scale + add + rq.sum_of_x2).max(0.0)
     }
 }
 

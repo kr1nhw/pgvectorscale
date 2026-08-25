@@ -16,8 +16,9 @@ use crate::access_method::ivf::entry::IvfEntryReader;
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::IvfMetaPage;
 use crate::access_method::ivf::options::IVF_PROBES;
-use crate::access_method::ivf::simd::{find_nearest_centroids, get_simd_distance_fn};
+use crate::access_method::ivf::simd::find_nearest_centroids;
 use crate::access_method::pg_vector::PgVectorInternal;
+use crate::access_method::quantization::rabitq::RabitqQuantizer;
 use crate::util::ItemPointer;
 
 /// Scan state for IVF index scans
@@ -139,15 +140,19 @@ pub unsafe extern "C-unwind" fn amgettuple(
             scan_state.probes,
         );
 
-        // Step 2: scan each probed list and compute exact distances
+        // Step 2: scan each probed list, estimating distances with RaBitQ
+        let num_bits = meta.get_bq_num_bits_per_dimension();
+        let rotation_seed = meta.get_rotation_seed();
+        let quantizer = RabitqQuantizer::new(num_bits, rotation_seed, meta.get_num_dimensions() as usize);
         let reader = IvfEntryReader::new(&index_rel);
-        let dist_fn = get_simd_distance_fn(distance_type);
         let mut results: Vec<(f32, ItemPointer)> = Vec::new();
         for list_id in nearest {
             if let Some(list_meta) = list_directory.get_list(list_id as u16) {
                 if list_meta.start_page != pg_sys::InvalidBlockNumber {
+                    let centroid = &centroid_page.centroids[list_id as usize];
+                    let rq = quantizer.rotate_query_residual(centroid, &scan_state.query);
                     for entry in reader.read_entries(list_meta.start_page) {
-                        let d = dist_fn(&scan_state.query, &entry.vector);
+                        let d = quantizer.estimate_l2(&entry.code, &rq);
                         results.push((d, entry.heap_tid));
                     }
                 }

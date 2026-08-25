@@ -8,6 +8,7 @@ use pgvectorscale_derive::{Readable, Writeable};
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::access_method::node::{ReadableNode, WriteableNode};
+use crate::access_method::quantization::rabitq::RabitqVector;
 use crate::util::chain::{ChainItemReader, ChainTapeWriter};
 use crate::util::page::PageType;
 use crate::util::*;
@@ -18,14 +19,14 @@ use crate::util::*;
 pub struct IvfEntry {
     /// Heap tuple ID (ctid) pointing to the original row
     pub heap_tid: ItemPointer,
-    /// The vector data
-    pub vector: Vec<f32>,
+    /// Centroid-relative RaBitQ code.
+    pub code: RabitqVector,
 }
 
 impl IvfEntry {
     /// Create a new entry.
-    pub fn new(heap_tid: ItemPointer, vector: Vec<f32>) -> Self {
-        Self { heap_tid, vector }
+    pub fn new(heap_tid: ItemPointer, code: RabitqVector) -> Self {
+        Self { heap_tid, code }
     }
 }
 

@@ -13,6 +13,7 @@ use crate::access_method::ivf::entry::{IvfEntry, IvfEntryWriter};
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::options::TSVIvfOptions;
 use crate::access_method::pg_vector::PgVectorInternal;
+use crate::access_method::quantization::rabitq::RabitqQuantizer;
 use crate::util::ItemPointer;
 
 /// Default number of samples for K-means training
@@ -212,6 +213,12 @@ pub fn build_ivf_index_serial(
     let num_lists = options.get_lists() as usize;
     let sample_size = DEFAULT_SAMPLE_SIZE.min(vectors.len());
 
+    // RaBitQ quantization: 1 bit per dim by default, deterministic rotation seed.
+    let num_bits: u8 = 1;
+    let mut rng = SmallRng::from_entropy();
+    let rotation_seed: u64 = rng.gen();
+    let quantizer = RabitqQuantizer::new(num_bits, rotation_seed, num_dimensions as usize);
+
     // Step 1: Sample vectors for K-means
     let samples = sample_vectors(vectors, sample_size);
 
@@ -228,7 +235,7 @@ pub fn build_ivf_index_serial(
     let assignments = assign_vectors_to_lists(vectors, &centroids, distance_type);
 
     // Step 4: Write meta page first (block 0).
-    let storage_type = crate::access_method::storage::StorageType::Plain;
+    let storage_type = crate::access_method::storage::StorageType::RabbitqCompression;
     let _meta_page = unsafe {
         crate::access_method::ivf::meta_page::IvfMetaPage::create(
             index,
@@ -236,7 +243,8 @@ pub fn build_ivf_index_serial(
             distance_type,
             num_lists as u16,
             storage_type,
-            0, // bq_num_bits_per_dimension
+            num_bits,       // bq_num_bits_per_dimension
+            rotation_seed,  // rotation seed
         )
     };
 
@@ -260,7 +268,9 @@ pub fn build_ivf_index_serial(
 
         for (i, &assigned_list) in assignments.iter().enumerate() {
             if assigned_list == list_id as u16 {
-                let entry = IvfEntry::new(heap_tids[i], vectors[i].clone());
+                // Quantize relative to this list's centroid.
+                let code = quantizer.quantize_residual(&centroids[list_id], &vectors[i]);
+                let entry = IvfEntry::new(heap_tids[i], code);
                 writer.add_entry(entry);
                 count += 1;
             }
