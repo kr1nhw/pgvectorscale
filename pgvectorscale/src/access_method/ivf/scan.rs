@@ -184,7 +184,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
             let orderbyvals =
                 pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>()) as *mut pg_sys::Datum;
             let orderbynulls = pg_sys::palloc(std::mem::size_of::<bool>()) as *mut bool;
-            *orderbyvals = distance.to_bits() as pg_sys::Datum;
+            *orderbyvals = pg_sys::Datum::from(distance.to_bits() as usize);
             *orderbynulls = false;
             (*scan).xs_orderbyvals = orderbyvals;
             (*scan).xs_orderbynulls = orderbynulls;
