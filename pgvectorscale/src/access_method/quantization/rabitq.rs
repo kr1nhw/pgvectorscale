@@ -497,18 +497,22 @@ pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
 
     /// Lance-style L2 distance estimate between a quantized residual and a
     /// rotated full-precision query residual (asymmetric estimator: data
-    /// vector quantized, query kept in f32).  Clamped to >= 0.
+    /// vector quantized, query kept in f32), returned as a lower bound so the
+    /// executor's recheck (`xs_recheckorderby = true`) never sees the estimate
+    /// overshoot the exact distance.
     ///
     /// L2 is translation-invariant, so the residual estimate is
-    /// `‖ro‖² + ‖rq‖² - 2·(‖ro‖²/⟨ro,code⟩)·⟨code,rq⟩`; no centroid
-    /// correction term is needed (that term belongs to the inner-product
-    /// estimator).
+    /// `‖ro‖² + ‖rq‖² - 2·(‖ro‖²/⟨ro,code⟩)·⟨code,rq⟩`; a conservative error
+    /// margin `2·‖ro‖·‖rq‖/√D` is subtracted to make it a lower bound.
     #[inline]
     pub fn estimate_l2(&self, qv: &RabitqVector, rq: &RabitqQuery) -> f32 {
         let full_dot = qv.dot_with_rotated(&rq.rotated);
         let res_dot = qv.l1_of_rotated.max(1e-9);
         let scale = -2.0 * qv.sum_of_x2 / res_dot;
-        (full_dot * scale + qv.sum_of_x2 + rq.sum_of_x2).max(0.0)
+        let est = full_dot * scale + qv.sum_of_x2 + rq.sum_of_x2;
+        let margin = 2.0 * qv.sum_of_x2.max(0.0).sqrt() * rq.sum_of_x2.max(0.0).sqrt()
+            / (self.dim as f32).sqrt().max(1.0);
+        (est - margin).max(0.0)
     }
 }
 
