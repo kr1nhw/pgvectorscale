@@ -131,6 +131,13 @@ pub unsafe extern "C-unwind" fn amgettuple(
         let centroid_page = IvfCentroidPage::load(&index_rel);
         let list_directory = IvfListDirectory::load(&index_rel);
 
+        warning!(
+            "IVF search: query_len={} n_centroids={} c0_len={}",
+            scan_state.query.len(),
+            centroid_page.centroids.len(),
+            centroid_page.centroids.first().map(|c| c.len()).unwrap_or(0)
+        );
+
         // Step 1: find nearest centroids (which lists to probe)
         let nearest = find_nearest_centroids(
             &scan_state.query,
