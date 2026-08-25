@@ -167,7 +167,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
 
     // Return next result if available
     if scan_state.result_index < scan_state.results.len() {
-        let (_distance, heap_tid) = scan_state.results[scan_state.result_index];
+        let (distance, heap_tid) = scan_state.results[scan_state.result_index];
         scan_state.result_index += 1;
 
         unsafe {
@@ -176,9 +176,18 @@ pub unsafe extern "C-unwind" fn amgettuple(
             (*scan).xs_heaptid = tid_data;
             (*scan).xs_recheck = false;
             // Distances are RaBitQ estimates, so let the executor recheck the
-            // order-by against the heap tuple for exact distances.
+            // order-by exactly against the heap tuple.
             (*scan).xs_recheckorderby = true;
-            (*scan).xs_orderbyvals = std::ptr::null_mut();
+
+            // Provide the approximate distance as a proper Datum (the executor
+            // still compares against it to order the recheck queue).
+            let orderbyvals =
+                pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>()) as *mut pg_sys::Datum;
+            let orderbynulls = pg_sys::palloc(std::mem::size_of::<bool>()) as *mut bool;
+            *orderbyvals = distance.to_bits() as pg_sys::Datum;
+            *orderbynulls = false;
+            (*scan).xs_orderbyvals = orderbyvals;
+            (*scan).xs_orderbynulls = orderbynulls;
         }
         true
     } else {
