@@ -227,9 +227,9 @@ pub fn build_ivf_index_serial(
     // Step 3: Assign vectors to lists
     let assignments = assign_vectors_to_lists(vectors, &centroids, distance_type);
 
-    // Step 4: Write meta page first (block 0)
+    // Step 4: Write meta page first (block 0).
     let storage_type = crate::access_method::storage::StorageType::Plain;
-    let meta_page = unsafe {
+    let _meta_page = unsafe {
         crate::access_method::ivf::meta_page::IvfMetaPage::create(
             index,
             num_dimensions,
@@ -240,16 +240,20 @@ pub fn build_ivf_index_serial(
         )
     };
 
-    // Step 5: Write centroid page (block 2)
+    // Step 5: Write an empty list directory at block 1 first, so the centroid
+    // page lands at block 2 (the fixed-block layout the loaders expect).
+    let mut list_directory = IvfListDirectory::new(num_lists as u16);
+    unsafe {
+        list_directory.store(index, true);
+    }
+
+    // Step 6: Write centroid page (block 2).
     let centroid_page = IvfCentroidPage::new(centroids.clone());
     unsafe {
         centroid_page.store(index, true);
     }
 
-    // Step 6: Create list directory (will be at block 1)
-    let mut list_directory = IvfListDirectory::new(num_lists as u16);
-
-    // Step 7: Write entry pages for each list
+    // Step 7: Write entry pages for each list (block 3+).
     for list_id in 0..num_lists {
         let mut writer = IvfEntryWriter::new(index, list_id as u16);
         let mut count = 0u64;
@@ -274,9 +278,9 @@ pub fn build_ivf_index_serial(
         }
     }
 
-    // Step 8: Write list directory (block 1)
+    // Step 8: Rewrite list directory in place at block 1 with the entry pointers.
     unsafe {
-        list_directory.store(index, true);
+        list_directory.store(index, false);
     }
 
     IvfBuildResult {
