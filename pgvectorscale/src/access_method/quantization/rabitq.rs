@@ -446,7 +446,7 @@ pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
                 }
             }
             _ => {
-                let mut code = vec![0u8; self.dim / 8];
+                let mut code = vec![0u8; self.dim.div_ceil(8)];
                 let mut l1 = 0f32; // Σ|rot| = ⟨rot, sign(code)⟩
                 for (i, &val) in rotated.iter().enumerate() {
                     if val > 0.0 {
