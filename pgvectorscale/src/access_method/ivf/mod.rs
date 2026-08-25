@@ -11,7 +11,6 @@ pub mod insert;
 pub mod list_directory;
 pub mod meta_page;
 pub mod options;
-pub mod partition;
 pub mod scan;
 pub mod simd;
 pub mod vacuum;

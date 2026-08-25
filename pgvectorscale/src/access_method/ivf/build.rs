@@ -14,8 +14,9 @@ use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::IvfMetaPage;
 use crate::access_method::ivf::options::TSVIvfOptions;
 use crate::access_method::pg_vector::PgVectorInternal;
-use crate::access_method::quantization::rabitq::RabitqQuantizer;
+use crate::access_method::quantization::rabitq::{RabitqQuantizer, RabitqVector};
 use crate::util::ItemPointer;
+use rayon::prelude::*;
 
 /// Default number of samples for K-means training
 const DEFAULT_SAMPLE_SIZE: usize = 10000;
@@ -231,6 +232,28 @@ pub fn assign_vectors_to_lists(
         .collect()
 }
 
+/// Find the nearest centroid to a single vector (index into `centroids`).
+#[inline]
+pub fn nearest_centroid(
+    vec: &[f32],
+    centroids: &[Vec<f32>],
+    distance_type: DistanceType,
+) -> u16 {
+    let dist_fn = distance_type.get_distance_function();
+    let mut best_list = 0u16;
+    let mut best_dist = dist_fn(vec, &centroids[0]);
+
+    for (c, centroid) in centroids.iter().enumerate().skip(1) {
+        let d = dist_fn(vec, centroid);
+        if d < best_dist {
+            best_dist = d;
+            best_list = c as u16;
+        }
+    }
+
+    best_list
+}
+
 /// Build IVF index from vectors (serial version).
 ///
 /// This is the main build function that:
@@ -278,8 +301,16 @@ pub fn build_ivf_index_serial(
         distance_type,
     );
 
-    // Step 3: Assign vectors to lists
-    let assignments = assign_vectors_to_lists(vectors, &centroids, distance_type);
+    // Step 3: Assign vectors to their nearest centroid and quantize each
+    // residual in parallel (the CPU-heavy part of the build).
+    let assigned: Vec<(u16, RabitqVector)> = vectors
+        .par_iter()
+        .map(|v| {
+            let list_id = nearest_centroid(v, &centroids, distance_type);
+            let code = quantizer.quantize_residual(&centroids[list_id as usize], v);
+            (list_id, code)
+        })
+        .collect();
 
     // Step 4: Write meta page first (block 0).
     let storage_type = crate::access_method::storage::StorageType::RabbitqCompression;
@@ -308,16 +339,15 @@ pub fn build_ivf_index_serial(
         centroid_page.store(index, true);
     }
 
-    // Step 7: Write entry pages for each list (block 3+).
+    // Step 7: Write entry pages for each list (block 3+).  The per-list append
+    // is serial because entry storage is a chained page per list.
     for list_id in 0..num_lists {
         let mut writer = IvfEntryWriter::new(index, list_id as u16);
         let mut count = 0u64;
 
-        for (i, &assigned_list) in assignments.iter().enumerate() {
-            if assigned_list == list_id as u16 {
-                // Quantize relative to this list's centroid.
-                let code = quantizer.quantize_residual(&centroids[list_id], &vectors[i]);
-                let entry = IvfEntry::new(heap_tids[i], code);
+        for (i, (assigned_list, code)) in assigned.iter().enumerate() {
+            if *assigned_list == list_id as u16 {
+                let entry = IvfEntry::new(heap_tids[i], code.clone());
                 writer.add_entry(entry);
                 count += 1;
             }
@@ -360,8 +390,9 @@ pub fn build_ivf_index_parallel(
     num_dimensions: u32,
     _num_workers: i32,
 ) -> IvfBuildResult {
-    // TODO: Implement parallel build with PostgreSQL workers
-    // For now, fall back to serial build
+    // The assignment + quantization phase is parallelized internally with
+    // rayon (see build_ivf_index_serial), so the parallel entry point simply
+    // delegates to it.  K-means runs on a small reservoir sample and is cheap.
     build_ivf_index_serial(
         index,
         vectors,
