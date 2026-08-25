@@ -115,7 +115,27 @@ impl RabitqSearchDistanceMeasure {
 
 pub struct RabitqNodeDistanceMeasure<'a> {
     vec: Vec<RabitqVectorElement>,
+    f_add: f32,
     storage: &'a RabitqStorage<'a>,
+}
+
+/// Symmetric RaBitQ L2-style distance between two quantized nodes, using only
+/// their sign codes and stored self-norm terms (`f_add`). This keeps node-vs-node
+/// distances on the same scale as the query-vs-node estimator so the DiskANN
+/// pruning ratio is meaningful.
+pub(crate) fn symmetric_l2_distance(
+    code_a: &[RabitqVectorElement],
+    f_add_a: f32,
+    code_b: &[RabitqVectorElement],
+    f_add_b: f32,
+    dim: usize,
+) -> f32 {
+    let h = distance_xor_optimized(code_a, code_b) as f32;
+    let na = f_add_a.max(0.0).sqrt();
+    let nb = f_add_b.max(0.0).sqrt();
+    let d = dim.max(1) as f32;
+    let dot = (na * nb / d) * (d - 2.0 * h);
+    (f_add_a + f_add_b - 2.0 * dot).max(0.0)
 }
 
 impl<'a> RabitqNodeDistanceMeasure<'a> {
@@ -128,6 +148,7 @@ impl<'a> RabitqNodeDistanceMeasure<'a> {
         let code = cache.get(index_pointer, storage, stats);
         Self {
             vec: code.code.clone(),
+            f_add: code.f_add,
             storage,
         }
     }
@@ -143,8 +164,12 @@ impl NodeDistanceMeasure for RabitqNodeDistanceMeasure<'_> {
     ) -> f32 {
         let mut cache = self.storage.cache().as_ref().unwrap().borrow_mut();
         let code = cache.get(index_pointer, self.storage, stats);
-        // Node-vs-node distance uses the Hamming distance between sign codes
-        // (as in SBQ); search uses the more accurate continuous-query estimator.
-        distance_xor_optimized(&code.code, self.vec.as_slice()) as f32
+        symmetric_l2_distance(
+            &code.code,
+            code.f_add,
+            self.vec.as_slice(),
+            self.f_add,
+            self.storage.get_dim(),
+        )
     }
 }

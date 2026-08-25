@@ -50,8 +50,6 @@ pub struct RabitqQuantizer {
     /// Total bits per dimension: 1, 4, or 8. `ex_bits = num_bits - 1`.
     pub num_bits: u8,
     ex_bits: u8,
-    /// Squared norm of the global mean centroid.
-    centroid_norm_sq: f32,
 }
 
 impl RabitqQuantizer {
@@ -72,7 +70,6 @@ impl RabitqQuantizer {
             rotation_signs: vec![],
             num_bits,
             ex_bits: num_bits - 1,
-            centroid_norm_sq: 0.0,
         }
     }
 
@@ -82,7 +79,6 @@ impl RabitqQuantizer {
         self.rotation_signs = rotation_signs;
         self.num_bits = num_bits;
         self.ex_bits = num_bits - 1;
-        self.centroid_norm_sq = self.mean.iter().map(|m| m * m).sum();
     }
 
     pub fn set_rotation_signs(&mut self, signs: Vec<u8>) {
@@ -110,7 +106,6 @@ impl RabitqQuantizer {
 
     pub fn finish_training(&mut self) {
         self.training = false;
-        self.centroid_norm_sq = self.mean.iter().map(|m| m * m).sum();
     }
 
     /// Quantize a full (indexed) vector into its compact node representation.
@@ -132,12 +127,6 @@ impl RabitqQuantizer {
         let code = pack_sign_bits(&rotated);
         let l1_rot: f32 = rotated.iter().map(|v| v.abs()).sum();
         let denom = 0.5 * l1_rot;
-        // ⟨v - c, c⟩, computed in the unrotated (residual) space.
-        let ip_x_c: f32 = residual
-            .iter()
-            .zip(self.mean.iter())
-            .map(|(x, c)| x * c)
-            .sum();
 
         let (ex_code, ipnorm_inv) = if self.ex_bits > 0 {
             quantize_ex_code(&rotated, self.ex_bits)
@@ -145,8 +134,8 @@ impl RabitqQuantizer {
             (Vec::new(), 1.0f32)
         };
 
-        let (f_add, f_rescale) = self.one_bit_factors(l2_sqr, denom, ip_x_c);
-        let (f_add_ex, f_rescale_ex) = self.ex_factors(l2_sqr, ip_x_c, ipnorm_inv);
+        let (f_add, f_rescale) = self.one_bit_factors(l2_sqr, denom);
+        let (f_add_ex, f_rescale_ex) = self.ex_factors(l2_sqr, ipnorm_inv);
 
         RabitqCode {
             code,
@@ -170,20 +159,17 @@ impl RabitqQuantizer {
             .map(|(q, m)| q - m)
             .collect();
         let l2_sqr_q: f32 = residual.iter().map(|v| v * v).sum();
-        let ip_y_c: f32 = residual
-            .iter()
-            .zip(self.mean.iter())
-            .map(|(y, c)| y * c)
-            .sum();
 
         let mut rotated = vec![0.0f32; dim];
         apply_fast_rotation(&residual, &mut rotated, &self.rotation_signs);
         let sum_q: f32 = rotated.iter().sum();
 
+        // For graph traversal, always use a non-negative L2-style estimate.
+        // Inner-product uses the L2 estimate as a surrogate (the exact IP
+        // distance is computed in the resort phase); cosine is 0.5 * L2.
         let g_add = match self.distance_type {
-            DistanceType::L2 => l2_sqr_q,
+            DistanceType::L2 | DistanceType::InnerProduct => l2_sqr_q,
             DistanceType::Cosine => 0.5 * l2_sqr_q,
-            DistanceType::InnerProduct => -ip_y_c,
         };
 
         RabitqQueryMeasure {
@@ -194,10 +180,12 @@ impl RabitqQuantizer {
     }
 
     /// Estimate the distance between a query and a node from their quantized codes.
+    /// The result is clamped to be non-negative (estimates can undershoot slightly
+    /// below zero for near-identical vectors).
     #[inline]
     pub fn estimate_distance(&self, qm: &RabitqQueryMeasure, code: &RabitqCode) -> f32 {
         let binary_dot = binary_dot(&code.code, &qm.rotated_query);
-        if self.ex_bits == 0 {
+        let dist = if self.ex_bits == 0 {
             let binary_term = binary_dot + (-0.5) * qm.sum_q;
             qm.g_add + code.f_add + code.f_rescale * binary_term
         } else {
@@ -206,30 +194,29 @@ impl RabitqQuantizer {
             let code_scale = (1u32 << self.ex_bits) as f32;
             let total_term = code_scale * binary_dot + ex_dot + cb * qm.sum_q;
             qm.g_add + code.f_add_ex + code.f_rescale_ex * total_term
-        }
+        };
+        dist.max(0.0)
     }
 
-    fn one_bit_factors(&self, l2_sqr: f32, denom: f32, ip_x_c: f32) -> (f32, f32) {
+    fn one_bit_factors(&self, l2_sqr: f32, denom: f32) -> (f32, f32) {
         let rescale_denom = if denom.abs() <= f32::EPSILON {
             f32::INFINITY
         } else {
             denom
         };
         match self.distance_type {
-            DistanceType::L2 => (l2_sqr, -2.0 * l2_sqr / rescale_denom),
-            DistanceType::Cosine => (0.5 * l2_sqr, -l2_sqr / rescale_denom),
-            DistanceType::InnerProduct => {
-                (-ip_x_c - self.centroid_norm_sq, -l2_sqr / rescale_denom)
+            DistanceType::L2 | DistanceType::InnerProduct => {
+                (l2_sqr, -2.0 * l2_sqr / rescale_denom)
             }
+            DistanceType::Cosine => (0.5 * l2_sqr, -l2_sqr / rescale_denom),
         }
     }
 
-    fn ex_factors(&self, l2_sqr: f32, ip_x_c: f32, ipnorm_inv: f32) -> (f32, f32) {
+    fn ex_factors(&self, l2_sqr: f32, ipnorm_inv: f32) -> (f32, f32) {
         let l2_norm = l2_sqr.sqrt();
         match self.distance_type {
-            DistanceType::L2 => (l2_sqr, -2.0 * l2_norm * ipnorm_inv),
+            DistanceType::L2 | DistanceType::InnerProduct => (l2_sqr, -2.0 * l2_norm * ipnorm_inv),
             DistanceType::Cosine => (0.5 * l2_sqr, -l2_norm * ipnorm_inv),
-            DistanceType::InnerProduct => (-ip_x_c - self.centroid_norm_sq, -l2_norm * ipnorm_inv),
         }
     }
 }

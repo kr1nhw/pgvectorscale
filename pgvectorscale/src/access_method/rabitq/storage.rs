@@ -5,7 +5,7 @@ use pgrx::{pg_sys::AttrNumber, PgBox, PgRelation};
 use crate::{
     access_method::{
         build::QUANTIZED_VECTOR_CACHE_SIZE,
-        distance::{distance_xor_optimized, DistanceFn},
+        distance::DistanceFn,
         graph::{
             neighbor_store::GraphNeighborStore,
             neighbor_with_distance::{DistanceWithTieBreak, NeighborWithDistance},
@@ -30,7 +30,7 @@ use super::{
     cache::RabitqCodeCache,
     node::{ArchivedRabitqNode, RabitqNode},
     quantize::RabitqQuantizer,
-    RabitqMetadata, RabitqNodeDistanceMeasure, RabitqSearchDistanceMeasure,
+    symmetric_l2_distance, RabitqMetadata, RabitqNodeDistanceMeasure, RabitqSearchDistanceMeasure,
 };
 
 pub struct RabitqStorage<'a> {
@@ -230,6 +230,10 @@ impl<'a> RabitqStorage<'a> {
     pub fn cache(&self) -> Option<&RefCell<RabitqCodeCache>> {
         self.qv_cache.as_ref()
     }
+
+    pub fn get_dim(&self) -> usize {
+        self.quantizer.mean.len()
+    }
 }
 
 impl Storage for RabitqStorage<'_> {
@@ -333,6 +337,8 @@ impl Storage for RabitqStorage<'_> {
         let rn = unsafe { RabitqNode::read(self.index, neighbors_of, self.has_labels, stats) };
         let archived = rn.get_archived_node();
         let q = archived.get_code();
+        let q_f_add = archived.get_f_add();
+        let dim = self.get_dim();
 
         rn.get_archived_node()
             .iter_neighbors()
@@ -340,10 +346,10 @@ impl Storage for RabitqStorage<'_> {
                 let rn1 = unsafe { RabitqNode::read(self.index, n, self.has_labels, stats) };
                 let arch = rn1.get_archived_node();
                 stats.record_quantized_distance_comparison();
-                let dist = distance_xor_optimized(q, arch.get_code());
+                let dist = symmetric_l2_distance(q, q_f_add, arch.get_code(), arch.get_f_add(), dim);
                 NeighborWithDistance::new(
                     n,
-                    DistanceWithTieBreak::new(dist as f32, neighbors_of, n),
+                    DistanceWithTieBreak::new(dist, neighbors_of, n),
                     arch.get_labels().map(Into::into),
                 )
             })
