@@ -167,7 +167,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
 
     // Return next result if available
     if scan_state.result_index < scan_state.results.len() {
-        let (distance, heap_tid) = scan_state.results[scan_state.result_index];
+        let (_distance, heap_tid) = scan_state.results[scan_state.result_index];
         scan_state.result_index += 1;
 
         unsafe {
@@ -175,16 +175,10 @@ pub unsafe extern "C-unwind" fn amgettuple(
             heap_tid.to_item_pointer_data(&mut tid_data);
             (*scan).xs_heaptid = tid_data;
             (*scan).xs_recheck = false;
-
-            // Allocate memory for distance value
-            let distance_ptr = pg_sys::palloc(std::mem::size_of::<f32>()) as *mut f32;
-            if !distance_ptr.is_null() {
-                *distance_ptr = distance;
-                // Convert f32 pointer to Datum pointer
-                (*scan).xs_orderbyvals = distance_ptr as *mut pg_sys::Datum;
-            } else {
-                (*scan).xs_orderbyvals = std::ptr::null_mut();
-            }
+            // Distances are RaBitQ estimates, so let the executor recheck the
+            // order-by against the heap tuple for exact distances.
+            (*scan).xs_recheckorderby = true;
+            (*scan).xs_orderbyvals = std::ptr::null_mut();
         }
         true
     } else {
