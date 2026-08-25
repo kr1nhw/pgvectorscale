@@ -34,112 +34,47 @@ pub unsafe extern "C-unwind" fn ambuild(
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
-    warning!("IVF ambuild: STARTING - entering function");
-    
     let heap_rel = unsafe { PgRelation::from_pg(heap) };
     let index_rel = unsafe { PgRelation::from_pg(index) };
-    
-    warning!("IVF ambuild: created relations");
-    
+
     // Get index options
     let options = TSVIvfOptions::from_relation(&index_rel);
-    let num_lists = options.get_lists() as usize;
-    
-    warning!("IVF ambuild: got options, num_lists={}", num_lists);
-    
+
     // Determine distance type (default to L2 for now)
     let distance_type = DistanceType::L2;
-    
-    // Get number of dimensions from the index
-    let num_dimensions = index_rel.tuple_desc().get(0)
-        .map(|attr| atttypmod_to_dims(attr.type_mod()))
+
+    // Number of dimensions from the index's vector column typmod (the typmod is
+    // the dimension count directly, e.g. `vector(3)` has atttypmod 3).
+    let num_dimensions = index_rel
+        .tuple_desc()
+        .get(0)
+        .map(|attr| attr.atttypmod as usize)
         .unwrap_or(0);
-    
-    warning!("IVF ambuild: num_dimensions={}", num_dimensions);
-    
+
     if num_dimensions == 0 {
         panic!("Cannot determine vector dimensions from index");
     }
-    
-    // Phase 1: Scan heap and collect all vectors
+
+    // Phase 1: Scan heap and collect all vectors using the standard index build
+    // heap scan (this is more reliable than a manual table scan and matches the
+    // diskann access method).
     let mut build_state = IvfBuildState {
         vectors: Vec::new(),
         heap_tids: Vec::new(),
     };
-    
-    warning!("IVF ambuild: starting heap scan");
-    
-    // Use table_beginscan for table access method compatibility
-    let snapshot = pg_sys::GetActiveSnapshot();
-    let scan = unsafe {
-        pg_sys::table_beginscan(
-            heap,
-            snapshot,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-    
-    warning!("IVF ambuild: heap scan started");
-    
-    // Create a slot for fetching tuples
-    let slot = unsafe { pg_sys::MakeSingleTupleTableSlot((*heap).rd_att, &pg_sys::TTSOpsBufferHeapTuple) };
-    
-    loop {
-        // Reset the slot
-        unsafe { pg_sys::ExecClearTuple(slot) };
-        
-        // Get next tuple
-        let found = unsafe {
-            pg_sys::table_scan_getnextslot(
-                scan,
-                pg_sys::ScanDirection::ForwardScanDirection,
-                slot,
-            )
-        };
-        
-        if !found {
-            break;
-        }
-        
-        // Check if tuple is valid
-        if unsafe { (*slot).tts_tid.ip_blkid.bi_hi != 0 || (*slot).tts_tid.ip_blkid.bi_lo != 0 } {
-            // Extract the vector value
-            let mut is_null = false;
-            let datum = unsafe {
-                pg_sys::slot_getattr(slot, 1, &mut is_null)
-            };
-            
-            if !is_null && datum != pg_sys::Datum::from(0) {
-                // Get the heap TID
-                let tid = unsafe { (*slot).tts_tid };
-                let item_ptr = ItemPointer::with_item_pointer_data(tid);
-                
-                // Detoast the datum if needed
-                let datum_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
-                let detoasted_ptr = unsafe { pg_sys::pg_detoast_datum(datum_ptr) };
-                let detoasted_datum = pg_sys::Datum::from(detoasted_ptr);
-                
-                // Extract vector data from detoasted datum
-                let pg_vec_internal = detoasted_datum.cast_mut_ptr::<PgVectorInternal>();
-                let vec_slice = unsafe { (*pg_vec_internal).to_slice() };
-                let vec = vec_slice.to_vec();
-                
-                build_state.vectors.push(vec);
-                build_state.heap_tids.push(item_ptr);
-            }
-        }
-    }
-    
-    // Clean up
+
     unsafe {
-        pg_sys::ExecDropSingleTupleTableSlot(slot);
-        pg_sys::table_endscan(scan);
-    };
-    
+        pg_sys::IndexBuildHeapScan(
+            heap_rel.as_ptr(),
+            index_rel.as_ptr(),
+            index_info,
+            Some(build_callback),
+            &mut build_state,
+        );
+    }
+
     let reltuples = build_state.vectors.len() as f64;
-    warning!("IVF ambuild: scanned {} tuples", reltuples);
-    
+
     // Phase 2: Build the index
     let result = build_ivf_index_serial(
         &index_rel,
@@ -149,7 +84,7 @@ pub unsafe extern "C-unwind" fn ambuild(
         distance_type,
         num_dimensions as u32,
     );
-    
+
     // Return the build result
     let mut pg_result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
     pg_result.heap_tuples = reltuples;
@@ -157,7 +92,7 @@ pub unsafe extern "C-unwind" fn ambuild(
     pg_result.into_pg()
 }
 
-/// Callback function for table_index_build_scan
+/// Callback function for IndexBuildHeapScan.
 #[pg_guard]
 unsafe extern "C-unwind" fn build_callback(
     _index: pg_sys::Relation,
@@ -167,51 +102,31 @@ unsafe extern "C-unwind" fn build_callback(
     _tuple_is_alive: bool,
     state: *mut std::os::raw::c_void,
 ) {
-    warning!("IVF build_callback: entering");
-    
     let build_state = &mut *(state as *mut IvfBuildState);
-    
-    // Check if the vector is null
+
+    // Skip null vectors.
     if *isnull {
-        warning!("IVF build_callback: vector is null, skipping");
         return;
     }
-    
-    warning!("IVF build_callback: extracting vector");
-    
-    // Extract the vector datum (first column)
+
+    // Extract the vector datum (first column).
     let datum = *values;
-    
-    // Detoast the datum if needed - convert Datum to varlena pointer, detoast, then back to Datum
+
+    // Detoast the datum if needed.
     let datum_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
     let detoasted_ptr = pg_sys::pg_detoast_datum(datum_ptr);
     let detoasted_datum = pg_sys::Datum::from(detoasted_ptr);
-    
-    // Get the heap TID
+
+    // Get the heap TID.
     let item_ptr = ItemPointer::with_item_pointer_data(*tid);
-    
-    warning!("IVF build_callback: converting datum to vector");
-    
-    // Extract vector data from detoasted datum
+
+    // Extract vector data from the detoasted datum.
     let pg_vec_internal = detoasted_datum.cast_mut_ptr::<PgVectorInternal>();
     let vec_slice = unsafe { (*pg_vec_internal).to_slice() };
     let vec = vec_slice.to_vec();
-    
-    warning!("IVF build_callback: adding vector to state");
-    
+
     build_state.vectors.push(vec);
     build_state.heap_tids.push(item_ptr);
-    
-    warning!("IVF build_callback: completed");
-}
-
-/// Convert type modifier to number of dimensions
-fn atttypmod_to_dims(typmod: i32) -> usize {
-    if typmod < 0 {
-        0
-    } else {
-        (typmod - 4) as usize // VARHDRSZ = 4
-    }
 }
 
 /// Build an empty IVF index (for CREATE INDEX on empty table).
