@@ -37,6 +37,11 @@ pub enum PageType {
     Meta = 8,
     RabitqNode = 9,
     RabitqMetadata = 10,
+    IvfMeta = 11,
+    IvfListDirectory = 12,
+    IvfCentroids = 13,
+    IvfQuantizerMetadata = 14,
+    IvfEntry = 15,
 }
 
 impl PageType {
@@ -53,6 +58,11 @@ impl PageType {
             8 => PageType::Meta,
             9 => PageType::RabitqNode,
             10 => PageType::RabitqMetadata,
+            11 => PageType::IvfMeta,
+            12 => PageType::IvfListDirectory,
+            13 => PageType::IvfCentroids,
+            14 => PageType::IvfQuantizerMetadata,
+            15 => PageType::IvfEntry,
             _ => panic!("Unknown PageType number {}", value),
         }
     }
@@ -63,7 +73,10 @@ impl PageType {
     pub fn is_chained(self) -> bool {
         matches!(self, PageType::SbqMeans)
             || matches!(self, PageType::Meta)
-            || matches!(self, PageType::RabitqMetadata)
+            || matches!(self, PageType::IvfMeta)
+            || matches!(self, PageType::IvfListDirectory)
+            || matches!(self, PageType::IvfCentroids)
+            || matches!(self, PageType::IvfQuantizerMetadata)
     }
 }
 

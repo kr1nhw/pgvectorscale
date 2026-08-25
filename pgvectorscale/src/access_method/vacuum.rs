@@ -9,7 +9,7 @@ use crate::{
         plain::node::ArchivedPlainNode,
         plain::storage::PlainStorage,
         rabitq::node::{ArchivedClassicRabitqNode, ArchivedLabeledRabitqNode},
-        rabitq::storage::RabitqStorage,
+        rabitq::storage::RabitqSpeedupStorage,
         sbq::node::{ArchivedClassicSbqNode, ArchivedLabeledSbqNode},
         sbq::storage::SbqSpeedupStorage,
     },
@@ -66,26 +66,6 @@ pub extern "C-unwind" fn ambulkdelete(
                 );
             }
         },
-        StorageType::RabitqCompression => match meta_page.has_labels() {
-            true => {
-                bulk_delete_for_storage::<RabitqStorage, ArchivedLabeledRabitqNode>(
-                    &index_relation,
-                    nblocks,
-                    results,
-                    callback,
-                    callback_state,
-                );
-            }
-            false => {
-                bulk_delete_for_storage::<RabitqStorage, ArchivedClassicRabitqNode>(
-                    &index_relation,
-                    nblocks,
-                    results,
-                    callback,
-                    callback_state,
-                );
-            }
-        },
         StorageType::Plain => {
             bulk_delete_for_storage::<PlainStorage, ArchivedPlainNode>(
                 &index_relation,
@@ -95,6 +75,26 @@ pub extern "C-unwind" fn ambulkdelete(
                 callback_state,
             );
         }
+        StorageType::RabbitqCompression => match meta_page.has_labels() {
+            true => {
+                bulk_delete_for_storage::<RabitqSpeedupStorage, ArchivedLabeledRabitqNode>(
+                    &index_relation,
+                    nblocks,
+                    results,
+                    callback,
+                    callback_state,
+                );
+            }
+            false => {
+                bulk_delete_for_storage::<RabitqSpeedupStorage, ArchivedClassicRabitqNode>(
+                    &index_relation,
+                    nblocks,
+                    results,
+                    callback,
+                    callback_state,
+                );
+            }
+        },
     }
     results
 }

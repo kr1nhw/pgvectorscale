@@ -204,7 +204,7 @@ pub unsafe fn init() {
     pg_sys::add_string_reloption(
         RELOPT_KIND_TSV,
         "storage_layout".as_pg_cstr(),
-        "Storage layout: either memory_optimized, plain or rabitq".as_pg_cstr(),
+        "Storage layout: either memory_optimized or plain".as_pg_cstr(),
         super::storage::DEFAULT_STORAGE_TYPE_STR.as_pg_cstr(),
         Some(validate_storage_layout),
         pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
@@ -384,25 +384,6 @@ mod tests {
         assert_eq!(options.get_storage_type(), StorageType::SbqCompression);
         assert_eq!(options.num_dimensions, 20);
         assert_eq!(options.bq_num_bits_per_dimension, 5);
-        Ok(())
-    }
-
-    #[pg_test]
-    unsafe fn test_index_options_rabitq() -> spi::Result<()> {
-        Spi::run(
-            "CREATE TABLE test(encoding vector(3));
-        CREATE INDEX idxtest
-                  ON test
-               USING diskann(encoding)
-               WITH (storage_layout = rabitq, num_bits_per_dimension = 4);",
-        )?;
-
-        let index_oid =
-            Spi::get_one::<pg_sys::Oid>("SELECT 'idxtest'::regclass::oid")?.expect("oid was null");
-        let indexrel = PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid));
-        let options = TSVIndexOptions::from_relation(&indexrel);
-        assert_eq!(options.get_storage_type(), StorageType::RabitqCompression);
-        assert_eq!(options.bq_num_bits_per_dimension, 4);
         Ok(())
     }
 }

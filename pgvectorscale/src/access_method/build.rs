@@ -8,8 +8,6 @@ use pgrx::pg_sys::{
 };
 use pgrx::*;
 
-use rand::SeedableRng;
-
 use crate::access_method::distance::DistanceType;
 use crate::access_method::graph::neighbor_store::GraphNeighborStore;
 use crate::access_method::graph::Graph;
@@ -28,16 +26,15 @@ use self::ports::PROGRESS_CREATE_IDX_SUBPHASE;
 
 use super::graph::neighbor_store::BuilderNeighborCache;
 use super::labels::LabeledVector;
-use super::rabitq::quantize::RabitqQuantizer;
-use super::rabitq::rotation::random_fast_rotation_signs;
-use super::rabitq::storage::RabitqStorage;
 use super::sbq::quantize::SbqQuantizer;
 use super::sbq::storage::SbqSpeedupStorage;
 
 use super::meta_page::MetaPage;
 
 use super::plain::storage::PlainStorage;
-use super::rabitq::RabitqMetadata;
+use super::rabitq::RabitqQuantizerMetadata;
+use super::rabitq::storage::RabitqSpeedupStorage;
+use super::quantization::rabitq::RabitqQuantizer;
 use super::sbq::SbqMeans;
 use super::storage::{Storage, StorageType};
 
@@ -48,15 +45,19 @@ struct SbqTrainState<'a, 'b> {
     meta_page: &'b MetaPage,
 }
 
-struct RabitqTrainState<'a, 'b> {
-    quantizer: &'a mut RabitqQuantizer,
-    meta_page: &'b MetaPage,
+/// Accumulates per-dimension sums to train the RaBitQ global center
+/// (dataset mean) for L2 indexes.
+struct RabitqCenterTrainState<'a> {
+    sums: Vec<f64>,
+    count: u64,
+    num_dims: usize,
+    meta_page: &'a MetaPage,
 }
 
 enum StorageBuildState<'a, 'b, 'c, 'd> {
     SbqSpeedup(&'a mut SbqSpeedupStorage<'b>, &'c mut BuildState<'d>),
-    Rabitq(&'a mut RabitqStorage<'b>, &'c mut BuildState<'d>),
     Plain(&'a mut PlainStorage<'b>, &'c mut BuildState<'d>),
+    RabitqSpeedup(&'a mut RabitqSpeedupStorage<'b>, &'c mut BuildState<'d>),
 }
 
 /// Storage build state for parallel builds using shared state
@@ -65,8 +66,11 @@ enum StorageBuildStateParallel<'a, 'b, 'c> {
         &'a mut SbqSpeedupStorage<'b>,
         &'c mut BuildStateParallel<'b>,
     ),
-    Rabitq(&'a mut RabitqStorage<'b>, &'c mut BuildStateParallel<'b>),
     Plain(&'a mut PlainStorage<'b>, &'c mut BuildStateParallel<'b>),
+    RabitqSpeedup(
+        &'a mut RabitqSpeedupStorage<'b>,
+        &'c mut BuildStateParallel<'b>,
+    ),
 }
 
 struct BuildState<'a> {
@@ -335,10 +339,8 @@ pub extern "C-unwind" fn ambuild(
     let heap_tuples = unsafe { heap_relation.rd_rel.as_ref().unwrap().reltuples as usize };
     let workers = if cfg!(feature = "build_parallel")
         && !meta_page.has_labels()
-        && matches!(
-            meta_page.get_storage_type(),
-            StorageType::SbqCompression | StorageType::RabitqCompression
-        )
+        && (meta_page.get_storage_type() == StorageType::SbqCompression
+            || meta_page.get_storage_type() == StorageType::RabbitqCompression)
     {
         // Check if we have a forced worker count setting
         let forced_workers = crate::access_method::guc::TSV_FORCE_PARALLEL_WORKERS.get();
@@ -546,15 +548,15 @@ unsafe fn aminsert_internal(
                 &mut stats,
             );
         }
-        StorageType::RabitqCompression => {
-            let storage = RabitqStorage::load_for_insert(
+        StorageType::RabbitqCompression => {
+            let bq = RabitqSpeedupStorage::load_for_insert(
                 &heap_relation,
                 &index_relation,
                 &meta_page,
                 &mut stats.quantizer_stats,
             );
             insert_storage(
-                &storage,
+                &bq,
                 &index_relation,
                 vec,
                 heap_pointer,
@@ -641,38 +643,51 @@ fn maybe_train_quantizer(
                 meta_page.set_quantizer_metadata_pointer(index_pointer);
             }
         }
-        StorageType::RabitqCompression => {
+        StorageType::RabbitqCompression => {
+            // RaBitQ needs only a rotation seed; for L2 datasets with a
+            // large DC component (e.g. BIGANN u8 data) we also train a
+            // global center (dataset mean) so sign bits capture the
+            // discriminative deviation structure.  L2 is invariant under
+            // this translation.
             unsafe {
                 pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_TRAINING);
             }
             let num_bits = meta_page.get_bq_num_bits_per_dimension();
-            let mut quantizer = RabitqQuantizer::new(meta_page, num_bits);
-            quantizer.start_training(meta_page);
-
-            let mut state = RabitqTrainState {
-                quantizer: &mut quantizer,
-                meta_page,
-            };
-
-            unsafe {
-                pg_sys::IndexBuildHeapScan(
-                    heap_relation.as_ptr(),
-                    index_relation.as_ptr(),
-                    index_info,
-                    Some(build_callback_rabitq_train),
-                    &mut state,
+            let seed =
+                unsafe { (*index_relation.as_ptr()).rd_id.to_u32() } as u64 ^ 0x52AB_1700_0000_0000;
+            let dims = meta_page.get_num_dimensions_to_index() as usize;
+            let use_center = meta_page.get_distance_type() == DistanceType::L2;
+            let mut quantizer = RabitqQuantizer::new(num_bits, seed, dims);
+            if use_center {
+                let mut state = RabitqCenterTrainState {
+                    sums: vec![0f64; dims],
+                    count: 0u64,
+                    num_dims: dims,
+                    meta_page,
+                };
+                unsafe {
+                    pg_sys::IndexBuildHeapScan(
+                        heap_relation.as_ptr(),
+                        index_relation.as_ptr(),
+                        index_info,
+                        Some(build_callback_rabitq_train),
+                        &mut state,
+                    );
+                }
+                let mut center = vec![0f32; dims];
+                if state.count > 0 {
+                    for (c, s) in center.iter_mut().zip(state.sums.iter()) {
+                        *c = (*s / state.count as f64) as f32;
+                    }
+                }
+                quantizer = quantizer.with_center(center);
+                notice!(
+                    "RaBitQ center trained from {} vectors",
+                    state.count
                 );
             }
-            quantizer.finish_training();
-
-            // Generate the random rotation once and persist it with the quantizer.
-            let dim = meta_page.get_num_dimensions_to_index() as usize;
-            let mut rng = rand::rngs::SmallRng::seed_from_u64(0xC0FFEE);
-            let signs = random_fast_rotation_signs(dim, &mut rng);
-            quantizer.set_rotation_signs(signs);
-
             let index_pointer =
-                unsafe { RabitqMetadata::store(index_relation, &quantizer, &mut write_stats) };
+                unsafe { RabitqQuantizerMetadata::store(index_relation, &quantizer, &mut write_stats) };
             meta_page.set_quantizer_metadata_pointer(index_pointer);
         }
     }
@@ -885,9 +900,9 @@ fn do_heap_scan(
                 // Just need to handle any remaining cached nodes and update meta page
                 finalize_remaining_parallel_nodes(&mut bq, bs, index_relation, write_stats)
             }
-            StorageType::RabitqCompression => {
-                let mut storage = unsafe {
-                    RabitqStorage::new_for_build(
+            StorageType::RabbitqCompression => {
+                let mut bq = unsafe {
+                    RabitqSpeedupStorage::new_for_build(
                         index_relation,
                         heap_relation,
                         graph.get_meta_page(),
@@ -895,7 +910,7 @@ fn do_heap_scan(
                     )
                 };
 
-                let page_type = RabitqStorage::page_type();
+                let page_type = RabitqSpeedupStorage::page_type();
                 let mut bs = BuildStateParallel::new(
                     index_relation,
                     graph,
@@ -903,7 +918,7 @@ fn do_heap_scan(
                     shared_state,
                     parallel_info.is_initializing_worker,
                 );
-                let mut state = StorageBuildStateParallel::Rabitq(&mut storage, &mut bs);
+                let mut state = StorageBuildStateParallel::RabitqSpeedup(&mut bq, &mut bs);
 
                 unsafe {
                     IndexBuildHeapScanParallel(
@@ -923,7 +938,9 @@ fn do_heap_scan(
                     );
                 }
 
-                finalize_remaining_parallel_nodes(&mut storage, bs, index_relation, write_stats)
+                // In parallel mode, nodes are finalized during insertion via streaming
+                // Just need to handle any remaining cached nodes and update meta page
+                finalize_remaining_parallel_nodes(&mut bq, bs, index_relation, write_stats)
             }
         }
     } else {
@@ -993,9 +1010,9 @@ fn do_heap_scan(
 
                 finalize_index_build(&mut bq, bs, index_relation, write_stats)
             }
-            StorageType::RabitqCompression => {
-                let mut storage = unsafe {
-                    RabitqStorage::new_for_build(
+            StorageType::RabbitqCompression => {
+                let mut bq = unsafe {
+                    RabitqSpeedupStorage::new_for_build(
                         index_relation,
                         heap_relation,
                         graph.get_meta_page(),
@@ -1003,9 +1020,9 @@ fn do_heap_scan(
                     )
                 };
 
-                let page_type = RabitqStorage::page_type();
+                let page_type = RabitqSpeedupStorage::page_type();
                 let mut bs = BuildState::new(index_relation, graph, page_type);
-                let mut state = StorageBuildState::Rabitq(&mut storage, &mut bs);
+                let mut state = StorageBuildState::RabitqSpeedup(&mut bq, &mut bs);
 
                 unsafe {
                     pg_sys::IndexBuildHeapScan(
@@ -1024,7 +1041,7 @@ fn do_heap_scan(
                     );
                 }
 
-                finalize_index_build(&mut storage, bs, index_relation, write_stats)
+                finalize_index_build(&mut bq, bs, index_relation, write_stats)
             }
         }
     }
@@ -1099,6 +1116,26 @@ fn finalize_index_build<S: Storage>(
 }
 
 #[pg_guard]
+unsafe extern "C-unwind" fn build_callback_rabitq_train(
+    _index: pg_sys::Relation,
+    _ctid: pg_sys::ItemPointer,
+    values: *mut pg_sys::Datum,
+    isnull: *mut bool,
+    _tuple_is_alive: bool,
+    state: *mut std::os::raw::c_void,
+) {
+    let state = (state as *mut RabitqCenterTrainState).as_mut().unwrap();
+    let vec = PgVector::from_pg_parts(values, isnull, 0, state.meta_page, true, false);
+    if let Some(vec) = vec {
+        let slice = vec.to_index_slice();
+        for (s, &v) in state.sums.iter_mut().zip(slice.iter()) {
+            *s += v as f64;
+        }
+        state.count += 1;
+    }
+}
+
+#[pg_guard]
 unsafe extern "C-unwind" fn build_callback_bq_train(
     _index: pg_sys::Relation,
     _ctid: pg_sys::ItemPointer,
@@ -1108,22 +1145,6 @@ unsafe extern "C-unwind" fn build_callback_bq_train(
     state: *mut std::os::raw::c_void,
 ) {
     let state = (state as *mut SbqTrainState).as_mut().unwrap();
-    let vec = PgVector::from_pg_parts(values, isnull, 0, state.meta_page, true, false);
-    if let Some(vec) = vec {
-        state.quantizer.add_sample(vec.to_index_slice());
-    }
-}
-
-#[pg_guard]
-unsafe extern "C-unwind" fn build_callback_rabitq_train(
-    _index: pg_sys::Relation,
-    _ctid: pg_sys::ItemPointer,
-    values: *mut pg_sys::Datum,
-    isnull: *mut bool,
-    _tuple_is_alive: bool,
-    state: *mut std::os::raw::c_void,
-) {
-    let state = (state as *mut RabitqTrainState).as_mut().unwrap();
     let vec = PgVector::from_pg_parts(values, isnull, 0, state.meta_page, true, false);
     if let Some(vec) = vec {
         state.quantizer.add_sample(vec.to_index_slice());
@@ -1155,10 +1176,10 @@ unsafe extern "C-unwind" fn build_callback(
                 build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *plain);
             }
         }
-        StorageBuildState::Rabitq(storage, state) => {
+        StorageBuildState::RabitqSpeedup(bq, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *storage);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *bq);
             }
         }
     }
@@ -1209,7 +1230,7 @@ unsafe extern "C-unwind" fn build_callback_parallel(
                 );
             }
         }
-        StorageBuildStateParallel::Rabitq(storage, state) => {
+        StorageBuildStateParallel::RabitqSpeedup(bq, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
                 let spare_vec =
@@ -1221,7 +1242,7 @@ unsafe extern "C-unwind" fn build_callback_parallel(
                     vec,
                     spare_vec,
                     state,
-                    *storage,
+                    *bq,
                 );
             }
         }

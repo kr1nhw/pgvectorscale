@@ -12,14 +12,22 @@ use crate::access_method::{
     graph::neighbor_with_distance::NeighborWithDistance,
     labels::{ArchivedLabelSet, LabelSet},
     meta_page::MetaPage,
-    rabitq::RabitqVectorElement,
     stats::{StatsNodeModify, StatsNodeRead, StatsNodeWrite},
     storage::{ArchivedData, NodeVacuum},
 };
 
-use super::quantize::RabitqCode;
+/// The quantized payload of a RaBitQ node: packed sign-bit code plus the
+/// norm metadata needed by the estimator.
+#[derive(Clone, Copy, Debug)]
+pub struct RabitqNodeData<'a> {
+    pub code: &'a [u8],
+    pub l1_of_rotated: f32,
+    pub sum_of_x2: f32,
+    /// ⟨rot_c, code⟩ — the rotated-center correction, precomputed at build.
+    pub cent_dot: f32,
+}
 
-/// A node in the RaBitQ index.
+/// A node in a RaBitQ-compressed index.
 pub enum RabitqNode {
     Classic(ClassicRabitqNode),
     Labeled(LabeledRabitqNode),
@@ -27,27 +35,25 @@ pub enum RabitqNode {
 
 #[derive(Archive, Deserialize, Serialize, Readable, Writeable)]
 #[archive(check_bytes)]
+#[repr(C)]
 pub struct ClassicRabitqNode {
     pub heap_item_pointer: HeapPointer,
-    pub code: Vec<u64>,   // 1-bit sign codes packed LSB-first
-    pub ex_code: Vec<u8>, // error-correction codes (empty for 1-bit)
-    pub f_add: f32,
-    pub f_rescale: f32,
-    pub f_add_ex: f32,
-    pub f_rescale_ex: f32,
+    pub code: Vec<u8>,
+    pub l1_of_rotated: f32,
+    pub sum_of_x2: f32,
+    pub cent_dot: f32,
     neighbor_index_pointers: Vec<ItemPointer>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Readable, Writeable)]
 #[archive(check_bytes)]
+#[repr(C)]
 pub struct LabeledRabitqNode {
     heap_item_pointer: HeapPointer,
-    code: Vec<u64>,
-    ex_code: Vec<u8>,
-    f_add: f32,
-    f_rescale: f32,
-    f_add_ex: f32,
-    f_rescale_ex: f32,
+    code: Vec<u8>,
+    l1_of_rotated: f32,
+    sum_of_x2: f32,
+    cent_dot: f32,
     neighbor_index_pointers: Vec<ItemPointer>,
     labels: LabelSet,
 }
@@ -56,7 +62,10 @@ impl RabitqNode {
     pub fn with_meta(
         heap_pointer: HeapPointer,
         meta_page: &MetaPage,
-        code: &RabitqCode,
+        code: &[u8],
+        l1_of_rotated: f32,
+        sum_of_x2: f32,
+        cent_dot: f32,
         labels: Option<LabelSet>,
     ) -> Self {
         Self::new(
@@ -64,18 +73,25 @@ impl RabitqNode {
             meta_page.get_num_neighbors() as usize,
             meta_page.has_labels(),
             code,
+            l1_of_rotated,
+            sum_of_x2,
+            cent_dot,
             labels,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         heap_pointer: HeapPointer,
         num_neighbors: usize,
         has_labels: bool,
-        code: &RabitqCode,
+        code: &[u8],
+        l1_of_rotated: f32,
+        sum_of_x2: f32,
+        cent_dot: f32,
         labels: Option<LabelSet>,
     ) -> Self {
-        // Always use vectors of num_neighbors in length so the serialized size never changes.
+        // always use vectors of num_neighbors in length because we never want the serialized size of a Node to change
         let neighbor_index_pointers: Vec<_> = (0..num_neighbors)
             .map(|_| ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber))
             .collect();
@@ -83,24 +99,20 @@ impl RabitqNode {
         if has_labels {
             RabitqNode::Labeled(LabeledRabitqNode {
                 heap_item_pointer: heap_pointer,
-                code: code.code.clone(),
-                ex_code: code.ex_code.clone(),
-                f_add: code.f_add,
-                f_rescale: code.f_rescale,
-                f_add_ex: code.f_add_ex,
-                f_rescale_ex: code.f_rescale_ex,
+                code: code.to_vec(),
+                l1_of_rotated,
+                sum_of_x2,
+                cent_dot,
                 neighbor_index_pointers,
                 labels: labels.unwrap_or_default(),
             })
         } else {
             RabitqNode::Classic(ClassicRabitqNode {
                 heap_item_pointer: heap_pointer,
-                code: code.code.clone(),
-                ex_code: code.ex_code.clone(),
-                f_add: code.f_add,
-                f_rescale: code.f_rescale,
-                f_add_ex: code.f_add_ex,
-                f_rescale_ex: code.f_rescale_ex,
+                code: code.to_vec(),
+                l1_of_rotated,
+                sum_of_x2,
+                cent_dot,
                 neighbor_index_pointers,
             })
         }
@@ -146,6 +158,7 @@ impl NodeVacuum for ArchivedClassicRabitqNode {
     }
 
     fn delete(self: Pin<&mut Self>) {
+        //TODO: actually optimize the deletes by removing index tuples. For now just mark it.
         let mut heap_pointer = unsafe { self.map_unchecked_mut(|s| &mut s.heap_item_pointer) };
         heap_pointer.offset = InvalidOffsetNumber;
         heap_pointer.block_number = InvalidBlockNumber;
@@ -285,14 +298,18 @@ impl Debug for ArchivedRabitqNode<'_> {
 
 impl ArchivedRabitqNode<'_> {
     pub fn num_neighbors(&self) -> usize {
-        let neighbor_index_pointers = match self {
-            ArchivedRabitqNode::Classic(node) => &node.neighbor_index_pointers,
-            ArchivedRabitqNode::Labeled(node) => &node.neighbor_index_pointers,
-        };
-        neighbor_index_pointers
-            .iter()
-            .position(|f| f.block_number == InvalidBlockNumber)
-            .unwrap_or(neighbor_index_pointers.len())
+        match self {
+            ArchivedRabitqNode::Classic(node) => node
+                .neighbor_index_pointers
+                .iter()
+                .position(|f| f.block_number == InvalidBlockNumber)
+                .unwrap_or(node.neighbor_index_pointers.len()),
+            ArchivedRabitqNode::Labeled(node) => node
+                .neighbor_index_pointers
+                .iter()
+                .position(|f| f.block_number == InvalidBlockNumber)
+                .unwrap_or(node.neighbor_index_pointers.len()),
+        }
     }
 
     pub fn iter_neighbors(&self) -> impl Iterator<Item = ItemPointer> + '_ {
@@ -310,63 +327,27 @@ impl ArchivedRabitqNode<'_> {
         self.iter_neighbors().collect()
     }
 
+    pub fn get_rabitq_data(&self) -> RabitqNodeData<'_> {
+        match self {
+            ArchivedRabitqNode::Classic(node) => RabitqNodeData {
+                code: &node.code,
+                l1_of_rotated: node.l1_of_rotated,
+                sum_of_x2: node.sum_of_x2,
+                cent_dot: node.cent_dot,
+            },
+            ArchivedRabitqNode::Labeled(node) => RabitqNodeData {
+                code: &node.code,
+                l1_of_rotated: node.l1_of_rotated,
+                sum_of_x2: node.sum_of_x2,
+                cent_dot: node.cent_dot,
+            },
+        }
+    }
+
     pub fn get_heap_item_pointer(&self) -> HeapPointer {
         match self {
             ArchivedRabitqNode::Classic(node) => node.heap_item_pointer.deserialize_item_pointer(),
             ArchivedRabitqNode::Labeled(node) => node.heap_item_pointer.deserialize_item_pointer(),
-        }
-    }
-
-    pub fn get_code(&self) -> &[RabitqVectorElement] {
-        match self {
-            ArchivedRabitqNode::Classic(node) => &node.code,
-            ArchivedRabitqNode::Labeled(node) => &node.code,
-        }
-    }
-
-    pub fn get_ex_code(&self) -> &[u8] {
-        match self {
-            ArchivedRabitqNode::Classic(node) => &node.ex_code,
-            ArchivedRabitqNode::Labeled(node) => &node.ex_code,
-        }
-    }
-
-    pub fn get_f_add(&self) -> f32 {
-        match self {
-            ArchivedRabitqNode::Classic(node) => node.f_add,
-            ArchivedRabitqNode::Labeled(node) => node.f_add,
-        }
-    }
-
-    pub fn get_f_rescale(&self) -> f32 {
-        match self {
-            ArchivedRabitqNode::Classic(node) => node.f_rescale,
-            ArchivedRabitqNode::Labeled(node) => node.f_rescale,
-        }
-    }
-
-    pub fn get_f_add_ex(&self) -> f32 {
-        match self {
-            ArchivedRabitqNode::Classic(node) => node.f_add_ex,
-            ArchivedRabitqNode::Labeled(node) => node.f_add_ex,
-        }
-    }
-
-    pub fn get_f_rescale_ex(&self) -> f32 {
-        match self {
-            ArchivedRabitqNode::Classic(node) => node.f_rescale_ex,
-            ArchivedRabitqNode::Labeled(node) => node.f_rescale_ex,
-        }
-    }
-
-    pub fn get_rabitq_code(&self) -> RabitqCode {
-        RabitqCode {
-            code: self.get_code().to_vec(),
-            ex_code: self.get_ex_code().to_vec(),
-            f_add: self.get_f_add(),
-            f_rescale: self.get_f_rescale(),
-            f_add_ex: self.get_f_add_ex(),
-            f_rescale_ex: self.get_f_rescale_ex(),
         }
     }
 
@@ -405,6 +386,8 @@ impl Debug for ArchivedClassicRabitqNode {
             )
             .field("heap_item_pointer.offset", &self.heap_item_pointer.offset)
             .field("code.len()", &self.code.len())
+            .field("l1_of_rotated", &self.l1_of_rotated)
+            .field("sum_of_x2", &self.sum_of_x2)
             .field(
                 "neighbor_index_pointers.len()",
                 &self.neighbor_index_pointers.len(),
@@ -422,6 +405,8 @@ impl Debug for ArchivedLabeledRabitqNode {
             )
             .field("heap_item_pointer.offset", &self.heap_item_pointer.offset)
             .field("code.len()", &self.code.len())
+            .field("l1_of_rotated", &self.l1_of_rotated)
+            .field("sum_of_x2", &self.sum_of_x2)
             .field(
                 "neighbor_index_pointers.len()",
                 &self.neighbor_index_pointers.len(),
@@ -453,6 +438,7 @@ impl<'a> ArchivedMutRabitqNode<'a> {
             a_index_pointer.block_number = ip.block_number;
             a_index_pointer.offset = ip.offset;
         }
+        //set the marker that the list ended
         if neighbors.len() < num_neighbors as _ {
             let mut past_last_index_pointers = neighbor_index_pointer.index_pin(neighbors.len());
             past_last_index_pointers.block_number = InvalidBlockNumber;
@@ -461,14 +447,18 @@ impl<'a> ArchivedMutRabitqNode<'a> {
     }
 
     pub fn num_neighbors(&self) -> usize {
-        let neighbor_index_pointers = match self {
-            ArchivedMutRabitqNode::Classic(node) => &node.neighbor_index_pointers,
-            ArchivedMutRabitqNode::Labeled(node) => &node.neighbor_index_pointers,
-        };
-        neighbor_index_pointers
-            .iter()
-            .position(|f| f.block_number == InvalidBlockNumber)
-            .unwrap_or(neighbor_index_pointers.len())
+        match self {
+            ArchivedMutRabitqNode::Classic(node) => node
+                .neighbor_index_pointers
+                .iter()
+                .position(|f| f.block_number == InvalidBlockNumber)
+                .unwrap_or(node.neighbor_index_pointers.len()),
+            ArchivedMutRabitqNode::Labeled(node) => node
+                .neighbor_index_pointers
+                .iter()
+                .position(|f| f.block_number == InvalidBlockNumber)
+                .unwrap_or(node.neighbor_index_pointers.len()),
+        }
     }
 
     pub fn iter_neighbors(&self) -> impl Iterator<Item = ItemPointer> + '_ {
@@ -476,6 +466,7 @@ impl<'a> ArchivedMutRabitqNode<'a> {
             ArchivedMutRabitqNode::Classic(node) => &node.neighbor_index_pointers,
             ArchivedMutRabitqNode::Labeled(node) => &node.neighbor_index_pointers,
         };
+
         neighbor_index_pointers
             .iter()
             .take(self.num_neighbors())

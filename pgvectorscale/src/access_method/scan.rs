@@ -19,9 +19,8 @@ use super::{
         PlainDistanceMeasure,
     },
     rabitq::{
-        quantize::RabitqQuantizer,
-        storage::{RabitqStorage, RabitqStorageLsnPrivateData},
-        RabitqMetadata, RabitqSearchDistanceMeasure,
+        storage::{RabitqSpeedupStorage, RabitqSpeedupStorageLsnPrivateData},
+        RabitqQuantizerMetadata, RabitqSearchDistanceMeasure,
     },
     sbq::{
         quantize::SbqQuantizer, storage::SbqSpeedupStorageLsnPrivateData, SbqMeans,
@@ -38,9 +37,9 @@ enum StorageState {
         SbqQuantizer,
         TSVResponseIterator<SbqSearchDistanceMeasure, SbqSpeedupStorageLsnPrivateData>,
     ),
-    Rabitq(
-        RabitqQuantizer,
-        TSVResponseIterator<RabitqSearchDistanceMeasure, RabitqStorageLsnPrivateData>,
+    RabitqSpeedup(
+        crate::access_method::quantization::rabitq::RabitqQuantizer,
+        TSVResponseIterator<RabitqSearchDistanceMeasure, RabitqSpeedupStorageLsnPrivateData>,
     ),
     Plain(TSVResponseIterator<PlainDistanceMeasure, PlainStorageLsnPrivateData>),
 }
@@ -90,19 +89,18 @@ impl TSVScanState {
                     TSVResponseIterator::new(&bq, index, query, search_list_size, meta_page, stats);
                 StorageState::SbqSpeedup(quantizer, it)
             }
-            StorageType::RabitqCompression => {
+            StorageType::RabbitqCompression => {
                 let mut stats = QuantizerStats::default();
-                let quantizer = unsafe { RabitqMetadata::load(index, &meta_page, &mut stats) };
-                let storage = RabitqStorage::load_for_search(index, heap, &quantizer, &meta_page);
-                let it = TSVResponseIterator::new(
-                    &storage,
-                    index,
-                    query,
-                    search_list_size,
-                    meta_page,
-                    stats,
-                );
-                StorageState::Rabitq(quantizer, it)
+                let quantizer = unsafe {
+                    let qip = meta_page.get_quantizer_metadata_pointer().unwrap_or_else(|| {
+                        pgrx::error!("No RaBitQ metadata pointer found in meta page")
+                    });
+                    RabitqQuantizerMetadata::load(index, qip, &mut stats)
+                };
+                let bq = RabitqSpeedupStorage::load_for_search(index, heap, &quantizer, &meta_page);
+                let it =
+                    TSVResponseIterator::new(&bq, index, query, search_list_size, meta_page, stats);
+                StorageState::RabitqSpeedup(quantizer, it)
             }
         };
 
@@ -412,10 +410,14 @@ pub extern "C-unwind" fn amgettuple(
             let next = iter.next_with_resort(&scan, &indexrel, &bq);
             get_tuple(state, next, scan)
         }
-        StorageState::Rabitq(quantizer, iter) => {
-            let storage =
-                RabitqStorage::load_for_search(&indexrel, &heaprel, quantizer, &state.meta_page);
-            let next = iter.next_with_resort(&scan, &indexrel, &storage);
+        StorageState::RabitqSpeedup(quantizer, iter) => {
+            let bq = RabitqSpeedupStorage::load_for_search(
+                &indexrel,
+                &heaprel,
+                quantizer,
+                &state.meta_page,
+            );
+            let next = iter.next_with_resort(&scan, &indexrel, &bq);
             get_tuple(state, next, scan)
         }
         StorageState::Plain(iter) => {
@@ -479,7 +481,7 @@ pub extern "C-unwind" fn amendscan(scan: pg_sys::IndexScanDesc) {
         let mut storage = unsafe { state.storage.as_mut() }.expect("no storage in state");
         match &mut storage {
             StorageState::SbqSpeedup(_bq, iter) => end_scan::<SbqSpeedupStorage>(iter),
-            StorageState::Rabitq(_bq, iter) => end_scan::<RabitqStorage>(iter),
+            StorageState::RabitqSpeedup(_bq, iter) => end_scan::<RabitqSpeedupStorage>(iter),
             StorageState::Plain(iter) => end_scan::<PlainStorage>(iter),
         }
     }
