@@ -33,12 +33,8 @@ pub unsafe extern "C-unwind" fn aminsert(
 
     let index_rel = unsafe { PgRelation::from_pg(index) };
     let meta = IvfMetaPage::fetch(&index_rel);
-    let centroid_page = IvfCentroidPage::load(&index_rel);
+    let mut centroid_page = IvfCentroidPage::load(&index_rel);
     let mut list_directory = IvfListDirectory::load(&index_rel);
-
-    if centroid_page.centroids.is_empty() {
-        return false;
-    }
 
     // Extract the vector.
     let datum = *values;
@@ -46,6 +42,15 @@ pub unsafe extern "C-unwind" fn aminsert(
     let pg_vec = detoasted.cast::<PgVectorInternal>();
     let vector = (*pg_vec).to_slice().to_vec();
     pg_sys::pfree(detoasted.cast());
+
+    // If the index has no centroids yet (built empty), seed the first centroid
+    // from this vector so subsequent inserts and scans have a list to use.
+    if centroid_page.centroids.is_empty() {
+        centroid_page = IvfCentroidPage::new(vec![vector.clone()]);
+        unsafe {
+            centroid_page.store(&index_rel, false);
+        }
+    }
 
     // Find the nearest centroid.
     let nearest = find_nearest_centroids(
