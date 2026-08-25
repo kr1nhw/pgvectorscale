@@ -11,6 +11,7 @@ use crate::access_method::ivf::centroid::{kmeans_plus_plus_init, lloyds_algorith
 use crate::access_method::ivf::centroid_page::IvfCentroidPage;
 use crate::access_method::ivf::entry::{IvfEntry, IvfEntryWriter};
 use crate::access_method::ivf::list_directory::IvfListDirectory;
+use crate::access_method::ivf::meta_page::IvfMetaPage;
 use crate::access_method::ivf::options::TSVIvfOptions;
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::access_method::quantization::rabitq::RabitqQuantizer;
@@ -132,8 +133,40 @@ unsafe extern "C-unwind" fn build_callback(
 
 /// Build an empty IVF index (for CREATE INDEX on empty table).
 #[pg_guard]
-pub extern "C-unwind" fn ambuildempty(_index: pg_sys::Relation) {
-    // TODO: Implement empty index build
+pub extern "C-unwind" fn ambuildempty(index: pg_sys::Relation) {
+    unsafe {
+        let index_rel = PgRelation::from_pg(index);
+        let options = TSVIvfOptions::from_relation(&index_rel);
+        let num_lists = options.get_lists() as usize;
+        let num_dimensions = index_rel
+            .tuple_desc()
+            .get(0)
+            .map(|attr| attr.atttypmod as usize)
+            .unwrap_or(0);
+        if num_dimensions == 0 {
+            panic!("Cannot determine vector dimensions from index");
+        }
+
+        let mut rng = SmallRng::from_entropy();
+        let rotation_seed: u64 = rng.gen();
+
+        // Meta page (block 0), empty list directory (block 1), empty centroids (block 2).
+        let _meta = IvfMetaPage::create(
+            &index_rel,
+            num_dimensions as u32,
+            DistanceType::L2,
+            num_lists as u16,
+            crate::access_method::storage::StorageType::RabbitqCompression,
+            1, // num_bits
+            rotation_seed,
+        );
+
+        let list_directory = IvfListDirectory::new(num_lists as u16);
+        list_directory.store(&index_rel, true);
+
+        let centroid_page = IvfCentroidPage::new(Vec::new());
+        centroid_page.store(&index_rel, true);
+    }
 }
 
 /// Sample vectors using reservoir sampling for K-means training.

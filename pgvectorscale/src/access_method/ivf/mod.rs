@@ -18,6 +18,10 @@ pub mod vacuum;
 
 use pgrx::*;
 
+use crate::access_method::distance::{
+    distance_type_cosine, distance_type_inner_product, distance_type_l2,
+};
+
 /// IVF access method support function numbers.
 /// Matches pgvector's IVF support function layout:
 ///   1 = distance function
@@ -92,6 +96,72 @@ fn ivf_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRout
 
     amroutine.into_pg_boxed()
 }
+
+/// Register the operator classes for the IVF access method (idempotent, so the
+/// same SQL works for install and upgrade).
+extension_sql!(
+    r#"
+DO $$
+DECLARE
+    have_cos_ops int;
+    have_l2_ops int;
+    have_ip_ops int;
+BEGIN
+    -- Has cosine operator class been installed for IVF?
+    SELECT count(*)
+    INTO have_cos_ops
+    FROM pg_catalog.pg_opclass c
+    WHERE c.opcname = 'vector_cosine_ops'
+    AND c.opcmethod = (SELECT oid FROM pg_catalog.pg_am am WHERE am.amname = 'ivf')
+    AND c.opcnamespace = (SELECT oid FROM pg_catalog.pg_namespace where nspname='@extschema@');
+
+    -- Has L2 operator class been installed for IVF?
+    SELECT count(*)
+    INTO have_l2_ops
+    FROM pg_catalog.pg_opclass c
+    WHERE c.opcname = 'vector_l2_ops'
+    AND c.opcmethod = (SELECT oid FROM pg_catalog.pg_am am WHERE am.amname = 'ivf')
+    AND c.opcnamespace = (SELECT oid FROM pg_catalog.pg_namespace where nspname='@extschema@');
+
+    -- Has inner product operator class been installed for IVF?
+    SELECT count(*)
+    INTO have_ip_ops
+    FROM pg_catalog.pg_opclass c
+    WHERE c.opcname = 'vector_ip_ops'
+    AND c.opcmethod = (SELECT oid FROM pg_catalog.pg_am am WHERE am.amname = 'ivf')
+    AND c.opcnamespace = (SELECT oid FROM pg_catalog.pg_namespace where nspname='@extschema@');
+
+    IF have_cos_ops = 0 THEN
+        CREATE OPERATOR CLASS vector_cosine_ops
+        FOR TYPE vector USING ivf AS
+            OPERATOR 1 <=> (vector, vector) FOR ORDER BY float_ops,
+            FUNCTION 1 distance_type_cosine();
+    END IF;
+
+    IF have_l2_ops = 0 THEN
+        CREATE OPERATOR CLASS vector_l2_ops
+        FOR TYPE vector USING ivf AS
+            OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
+            FUNCTION 1 distance_type_l2();
+    END IF;
+
+    IF have_ip_ops = 0 THEN
+        CREATE OPERATOR CLASS vector_ip_ops
+        FOR TYPE vector USING ivf AS
+            OPERATOR 1 <#> (vector, vector) FOR ORDER BY float_ops,
+            FUNCTION 1 distance_type_inner_product();
+    END IF;
+END;
+$$;
+"#,
+    name = "ivf_operator_classes",
+    requires = [
+        ivf_amhandler,
+        distance_type_cosine,
+        distance_type_l2,
+        distance_type_inner_product
+    ]
+);
 
 /// Validate the operator class. Always returns true for now.
 #[pg_guard]
