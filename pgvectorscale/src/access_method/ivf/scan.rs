@@ -178,28 +178,29 @@ pub unsafe extern "C-unwind" fn amgettuple(
         let mut heap: BinaryHeap<DistTid> = BinaryHeap::with_capacity(top_k.min(1024));
         for list_id in nearest {
             if let Some(list_meta) = list_directory.get_list(list_id as u16) {
-                if list_meta.start_page != pg_sys::InvalidBlockNumber {
+                if list_meta.start_page != pg_sys::InvalidBlockNumber && list_meta.num_blocks > 0 {
                     let centroid = &centroid_page.centroids[list_id as usize];
                     let rq = quantizer.rotate_query_residual(centroid, &scan_state.query);
-                    reader.for_each_entry(list_meta.start_page, |entry| {
-                        let code = &entry.code;
-                        let d = quantizer.estimate_l2_fields(
-                            code.num_bits,
-                            code.dim,
-                            &code.packed_code,
-                            code.sum_of_x2,
-                            code.l1_of_rotated,
-                            &rq,
-                        );
-                        let candidate = DistTid {
-                            dist: d,
-                            tid: entry.heap_tid.deserialize_item_pointer(),
-                        };
-                        if heap.len() < top_k {
-                            heap.push(candidate);
-                        } else if let Some(mut worst) = heap.peek_mut() {
-                            if candidate.dist < worst.dist {
-                                *worst = candidate;
+                    reader.for_each_slice(list_meta.start_page, list_meta.num_blocks, |view| {
+                        for i in 0..view.len() {
+                            let d = quantizer.estimate_l2_fields(
+                                view.num_bits(),
+                                view.dim() as u32,
+                                view.code(i),
+                                view.sum_of_x2(i),
+                                view.l1(i),
+                                &rq,
+                            );
+                            let candidate = DistTid {
+                                dist: d,
+                                tid: view.tid(i),
+                            };
+                            if heap.len() < top_k {
+                                heap.push(candidate);
+                            } else if let Some(mut worst) = heap.peek_mut() {
+                                if candidate.dist < worst.dist {
+                                    *worst = candidate;
+                                }
                             }
                         }
                     });

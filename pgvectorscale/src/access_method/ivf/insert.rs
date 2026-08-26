@@ -75,14 +75,16 @@ pub unsafe extern "C-unwind" fn aminsert(
     let entry = IvfEntry::new(ItemPointer::with_item_pointer_data(*heap_tid), code);
 
     // Append the entry to the list: read existing entries, push the new one,
-    // and rewrite the list's chained entry page.
+    // and rewrite the list as a contiguous entry block run.
     let reader = IvfEntryReader::new(&index_rel);
-    let mut entries = match list_directory
+    let (start_page, num_blocks) = list_directory
         .get_list(list_id)
-        .map(|m| m.start_page)
-    {
-        Some(pg_sys::InvalidBlockNumber) | None => Vec::new(),
-        Some(start_page) => reader.read_entries(start_page),
+        .map(|m| (m.start_page, m.num_blocks))
+        .unwrap_or((pg_sys::InvalidBlockNumber, 0));
+    let mut entries = if start_page != pg_sys::InvalidBlockNumber && num_blocks > 0 {
+        reader.read_entries(start_page, num_blocks)
+    } else {
+        Vec::new()
     };
     entries.push(entry);
 
@@ -90,16 +92,20 @@ pub unsafe extern "C-unwind" fn aminsert(
     for e in &entries {
         writer.add_entry(e.clone());
     }
-    let (start_page, count) = writer.finish();
+    let (start_page, num_blocks, count) = writer.finish();
 
     if let Some(list_meta) = list_directory.get_list_mut(list_id) {
         list_meta.start_page = start_page.unwrap_or(pg_sys::InvalidBlockNumber);
+        list_meta.num_blocks = num_blocks;
         list_meta.insert_page = list_meta.start_page;
         list_meta.num_tuples = count as u64;
     }
 
     unsafe {
         list_directory.store(&index_rel, false);
+        // The scan bulk-reads entry blocks via smgr (bypassing shared_buffers),
+        // so flush the newly written blocks to disk before they are visible.
+        pg_sys::FlushRelationBuffers(index);
     }
 
     false

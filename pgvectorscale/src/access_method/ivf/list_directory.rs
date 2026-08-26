@@ -20,8 +20,10 @@ const LIST_DIRECTORY_OFFSET: pgrx::pg_sys::OffsetNumber = 1;
 #[derive(Clone, Debug, PartialEq, Archive, Deserialize, Serialize, Readable, Writeable)]
 #[archive(check_bytes)]
 pub struct IvfListMetadata {
-    /// First page of entries in this list (linked list head)
+    /// First page of the contiguous entry block run for this list
     pub start_page: BlockNumber,
+    /// Number of contiguous blocks in the entry run
+    pub num_blocks: u32,
     /// Current page being appended to (for inserts)
     pub insert_page: BlockNumber,
     /// Offset into centroids page for this list's centroid
@@ -35,6 +37,7 @@ impl IvfListMetadata {
     pub fn new(centroid_offset: u32) -> Self {
         Self {
             start_page: pgrx::pg_sys::InvalidBlockNumber,
+            num_blocks: 0,
             insert_page: pgrx::pg_sys::InvalidBlockNumber,
             centroid_offset,
             num_tuples: 0,

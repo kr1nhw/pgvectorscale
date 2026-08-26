@@ -34,15 +34,15 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     let mut total_dead = 0u64;
 
     for list_id in 0..list_directory.num_lists() {
-        let start_page = list_directory
+        let (start_page, num_blocks) = list_directory
             .get_list(list_id as u16)
-            .map(|m| m.start_page)
-            .unwrap_or(pg_sys::InvalidBlockNumber);
-        if start_page == pg_sys::InvalidBlockNumber {
+            .map(|m| (m.start_page, m.num_blocks))
+            .unwrap_or((pg_sys::InvalidBlockNumber, 0));
+        if start_page == pg_sys::InvalidBlockNumber || num_blocks == 0 {
             continue;
         }
 
-        let entries = reader.read_entries(start_page);
+        let entries = reader.read_entries(start_page, num_blocks);
         let mut live_entries = Vec::new();
         for entry in entries {
             let is_dead = if let Some(cb) = callback {
@@ -65,9 +65,10 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         for e in &live_entries {
             writer.add_entry(e.clone());
         }
-        let (new_start, count) = writer.finish();
+        let (new_start, new_blocks, count) = writer.finish();
         if let Some(list_meta) = list_directory.get_list_mut(list_id as u16) {
             list_meta.start_page = new_start.unwrap_or(pg_sys::InvalidBlockNumber);
+            list_meta.num_blocks = new_blocks;
             list_meta.insert_page = list_meta.start_page;
             list_meta.num_tuples = count as u64;
         }
@@ -75,6 +76,8 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
 
     unsafe {
         list_directory.store(&index_rel, false);
+        // Bulk smgr scans need the rewritten blocks on disk first.
+        pg_sys::FlushRelationBuffers(index_rel.as_ptr());
         (*results).pages_deleted = total_dead as u32;
         (*results).num_index_tuples = total_live as f64;
     }

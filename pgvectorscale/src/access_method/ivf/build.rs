@@ -353,7 +353,7 @@ pub fn build_ivf_index_serial(
             }
         }
 
-        let (start_page, _) = writer.finish();
+        let (start_page, num_blocks, _) = writer.finish();
 
         // Update list directory
         if let Some(list_meta) = list_directory.get_list_mut(list_id as u16) {
@@ -361,6 +361,7 @@ pub fn build_ivf_index_serial(
                 list_meta.start_page = page;
                 list_meta.insert_page = page;
             }
+            list_meta.num_blocks = num_blocks;
             list_meta.num_tuples = count;
         }
     }
@@ -368,6 +369,8 @@ pub fn build_ivf_index_serial(
     // Step 8: Rewrite list directory in place at block 1 with the entry pointers.
     unsafe {
         list_directory.store(index, false);
+        // Bulk smgr scans need the built entry blocks on disk first.
+        pg_sys::FlushRelationBuffers(index.as_ptr());
     }
 
     IvfBuildResult {
