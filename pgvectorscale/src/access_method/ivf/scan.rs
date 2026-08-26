@@ -7,6 +7,7 @@
 //! - amendscan: Clean up scan state
 
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 use pgrx::*;
 
@@ -15,11 +16,37 @@ use crate::access_method::ivf::centroid_page::IvfCentroidPage;
 use crate::access_method::ivf::entry::IvfEntryReader;
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::IvfMetaPage;
-use crate::access_method::ivf::options::IVF_PROBES;
+use crate::access_method::ivf::options::{IVF_PROBES, IVF_TOP_K};
 use crate::access_method::ivf::simd::find_nearest_centroids;
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::access_method::quantization::rabitq::RabitqQuantizer;
 use crate::util::ItemPointer;
+
+/// A (distance, heap tid) candidate pair ordered by distance, used as the
+/// element type of the bounded top-k max-heap.
+#[derive(PartialEq)]
+struct DistTid {
+    dist: f32,
+    tid: ItemPointer,
+}
+
+impl Eq for DistTid {}
+
+impl PartialOrd for DistTid {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DistTid {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // total_cmp gives a total order on f32 (incl. NaN); tiebreak by tid so
+        // Ord stays consistent with the derived PartialEq/Eq.
+        self.dist
+            .total_cmp(&other.dist)
+            .then_with(|| self.tid.cmp(&other.tid))
+    }
+}
 
 /// Scan state for IVF index scans
 pub struct IvfScanState {
@@ -140,28 +167,51 @@ pub unsafe extern "C-unwind" fn amgettuple(
             scan_state.probes,
         );
 
-        // Step 2: scan each probed list, estimating distances with RaBitQ
+        // Step 2: scan each probed list, estimating distances with RaBitQ.
+        // Iterate zero-copy over archived entries and keep only the top-K
+        // candidates (by estimate) in a bounded max-heap.
         let num_bits = meta.get_bq_num_bits_per_dimension();
         let rotation_seed = meta.get_rotation_seed();
         let quantizer = RabitqQuantizer::new(num_bits, rotation_seed, meta.get_num_dimensions() as usize);
         let reader = IvfEntryReader::new(&index_rel);
-        let mut results: Vec<(f32, ItemPointer)> = Vec::new();
+        let top_k = (IVF_TOP_K.get() as usize).max(1);
+        let mut heap: BinaryHeap<DistTid> = BinaryHeap::with_capacity(top_k.min(1024));
         for list_id in nearest {
             if let Some(list_meta) = list_directory.get_list(list_id as u16) {
                 if list_meta.start_page != pg_sys::InvalidBlockNumber {
                     let centroid = &centroid_page.centroids[list_id as usize];
                     let rq = quantizer.rotate_query_residual(centroid, &scan_state.query);
-                    for entry in reader.read_entries(list_meta.start_page) {
-                        let d = quantizer.estimate_l2(&entry.code, &rq);
-                        results.push((d, entry.heap_tid));
-                    }
+                    reader.for_each_entry(list_meta.start_page, |entry| {
+                        let code = &entry.code;
+                        let d = quantizer.estimate_l2_fields(
+                            code.num_bits,
+                            code.dim,
+                            &code.packed_code,
+                            code.sum_of_x2,
+                            code.l1_of_rotated,
+                            &rq,
+                        );
+                        let candidate = DistTid {
+                            dist: d,
+                            tid: entry.heap_tid.deserialize_item_pointer(),
+                        };
+                        if heap.len() < top_k {
+                            heap.push(candidate);
+                        } else if let Some(mut worst) = heap.peek_mut() {
+                            if candidate.dist < worst.dist {
+                                *worst = candidate;
+                            }
+                        }
+                    });
                 }
             }
         }
 
-        // Step 3: sort by distance ascending
-        results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-        scan_state.results = results;
+        // Step 3: emit the top-K candidates in ascending estimate order.  The
+        // executor rechecks exact distances (xs_recheckorderby), so `top_k`
+        // must be >= the query's LIMIT (see ivf.top_k).
+        let results = heap.into_sorted_vec();
+        scan_state.results = results.into_iter().map(|c| (c.dist, c.tid)).collect();
         scan_state.results_computed = true;
     }
 

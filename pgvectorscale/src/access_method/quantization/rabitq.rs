@@ -138,6 +138,51 @@ pub fn code_hamming(a: &[u8], b: &[u8]) -> usize {
         .sum()
 }
 
+/// Dot of a stored code with a full-precision rotated vector `rot`, given the
+/// primitive fields directly.
+///
+/// This mirrors `RabitqVector::dot_with_rotated` but operates on borrowed
+/// slices so the zero-copy (archived) scan path never allocates an owned
+/// `RabitqVector` per entry.
+#[inline]
+pub fn dot_with_rotated_fields(num_bits: u8, dim: u32, packed_code: &[u8], rot: &[f32]) -> f32 {
+    match num_bits {
+        4 => {
+            let code_scale = 8.0;
+            let code_bias = -7.5;
+            let mut binary_ip = 0.0f32;
+            let mut ex_dist = 0.0f32;
+            for (bi, &b) in packed_code.iter().enumerate() {
+                let lo = b & 0x0F;
+                let hi = b >> 4;
+                for (k, nib) in [lo, hi].into_iter().enumerate() {
+                    let r = rot[bi * 2 + k];
+                    binary_ip += if nib & 0x08 != 0 { r } else { -r };
+                    ex_dist += (nib & 0x07) as f32 * r;
+                }
+            }
+            code_scale * binary_ip
+                + ex_dist
+                + code_bias * rot[..dim as usize].iter().sum::<f32>()
+        }
+        8 => {
+            let code_scale = 128.0;
+            let code_bias = -127.5;
+            let mut binary_ip = 0.0f32;
+            let mut ex_dist = 0.0f32;
+            for (i, &b) in packed_code.iter().enumerate() {
+                let r = rot[i];
+                binary_ip += if b & 0x80 != 0 { r } else { -r };
+                ex_dist += (b & 0x7F) as f32 * r;
+            }
+            code_scale * binary_ip
+                + ex_dist
+                + code_bias * rot[..dim as usize].iter().sum::<f32>()
+        }
+        _ => code_dot_with_rotated(packed_code, rot, rot[..dim as usize].iter().sum()),
+    }
+}
+
 /// A RaBitQ-quantized vector.
 ///
 /// Two modes, selected by `num_bits`:
@@ -171,45 +216,7 @@ impl RabitqVector {
     /// For 4/8-bit: `full_dot = code_scale·binary_ip + ex_dist + code_bias·Σrot`.
     #[inline]
     pub fn dot_with_rotated(&self, rot: &[f32]) -> f32 {
-        match self.num_bits {
-            4 => {
-                let code_scale = 8.0;
-                let code_bias = -7.5;
-                let mut binary_ip = 0.0f32;
-                let mut ex_dist = 0.0f32;
-                for (bi, &b) in self.packed_code.iter().enumerate() {
-                    let lo = b & 0x0F;
-                    let hi = b >> 4;
-                    for (k, nib) in [lo, hi].into_iter().enumerate() {
-                        let r = rot[bi * 2 + k];
-                        binary_ip += if nib & 0x08 != 0 { r } else { -r };
-                        ex_dist += (nib & 0x07) as f32 * r;
-                    }
-                }
-                code_scale * binary_ip
-                    + ex_dist
-                    + code_bias * rot[..self.dim as usize].iter().sum::<f32>()
-            }
-            8 => {
-                let code_scale = 128.0;
-                let code_bias = -127.5;
-                let mut binary_ip = 0.0f32;
-                let mut ex_dist = 0.0f32;
-                for (i, &b) in self.packed_code.iter().enumerate() {
-                    let r = rot[i];
-                    binary_ip += if b & 0x80 != 0 { r } else { -r };
-                    ex_dist += (b & 0x7F) as f32 * r;
-                }
-                code_scale * binary_ip
-                    + ex_dist
-                    + code_bias * rot[..self.dim as usize].iter().sum::<f32>()
-            }
-            _ => code_dot_with_rotated(
-                &self.packed_code,
-                rot,
-                rot[..self.dim as usize].iter().sum(),
-            ),
-        }
+        dot_with_rotated_fields(self.num_bits, self.dim, &self.packed_code, rot)
     }
 
     /// Code-to-code signed agreement count `m12 = Σ sign(c1)ᵢ·sign(c2)ᵢ`
@@ -506,11 +513,33 @@ pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
     /// margin `2·‖ro‖·‖rq‖/√D` is subtracted to make it a lower bound.
     #[inline]
     pub fn estimate_l2(&self, qv: &RabitqVector, rq: &RabitqQuery) -> f32 {
-        let full_dot = qv.dot_with_rotated(&rq.rotated);
-        let res_dot = qv.l1_of_rotated.max(1e-9);
-        let scale = -2.0 * qv.sum_of_x2 / res_dot;
-        let est = full_dot * scale + qv.sum_of_x2 + rq.sum_of_x2;
-        let margin = 2.0 * qv.sum_of_x2.max(0.0).sqrt() * rq.sum_of_x2.max(0.0).sqrt()
+        self.estimate_l2_fields(
+            qv.num_bits,
+            qv.dim,
+            &qv.packed_code,
+            qv.sum_of_x2,
+            qv.l1_of_rotated,
+            rq,
+        )
+    }
+
+    /// Lance-style L2 estimate given the primitive fields directly (used by the
+    /// zero-copy archived scan path).  See `estimate_l2` for the derivation.
+    #[inline]
+    pub fn estimate_l2_fields(
+        &self,
+        num_bits: u8,
+        dim: u32,
+        packed_code: &[u8],
+        sum_of_x2: f32,
+        l1_of_rotated: f32,
+        rq: &RabitqQuery,
+    ) -> f32 {
+        let full_dot = dot_with_rotated_fields(num_bits, dim, packed_code, &rq.rotated);
+        let res_dot = l1_of_rotated.max(1e-9);
+        let scale = -2.0 * sum_of_x2 / res_dot;
+        let est = full_dot * scale + sum_of_x2 + rq.sum_of_x2;
+        let margin = 2.0 * sum_of_x2.max(0.0).sqrt() * rq.sum_of_x2.max(0.0).sqrt()
             / (self.dim as f32).sqrt().max(1.0);
         (est - margin).max(0.0)
     }

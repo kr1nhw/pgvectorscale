@@ -81,6 +81,7 @@ impl TSVIvfOptions {
 pub static IVF_PROBES: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(1);
 pub static IVF_ITERATIVE_SCAN: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
 pub static IVF_MAX_PROBES: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(32768);
+pub static IVF_TOP_K: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(1000);
 
 static mut RELOPT_KIND_IVF: pg_sys::relopt_kind::Type = 0;
 
@@ -139,6 +140,27 @@ pub unsafe fn init() {
         &IVF_MAX_PROBES,
         1,
         32768,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("ivf.top_k".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "The number of top candidates kept per IVF search".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Bounds the search to the top K candidates by estimate before exact recheck; \
+                 must be at least the query's LIMIT. Higher values preserve recall."
+                    .as_pg_cstr(),
+            )
+        },
+        &IVF_TOP_K,
+        1,
+        1_000_000,
         pgrx::GucContext::Userset,
         pgrx::GucFlags::default(),
     );

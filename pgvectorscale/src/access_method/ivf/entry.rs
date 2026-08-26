@@ -147,4 +147,31 @@ impl<'a> IvfEntryReader<'a> {
             page.entries
         }
     }
+
+    /// Read a list's entries zero-copy and invoke `f` for each archived entry.
+    ///
+    /// The serialized bytes are accumulated into an aligned buffer and
+    /// accessed as `ArchivedIvfEntryPage`, so no owned `IvfEntry` (or per-entry
+    /// `Vec<u8>` code) is allocated.  Each entry reference is valid only for
+    /// the duration of the callback.
+    pub fn for_each_entry<F: FnMut(&ArchivedIvfEntry)>(&self, start_page: BlockNumber, mut f: F) {
+        unsafe {
+            let mut stats = crate::access_method::stats::WriteStats::default();
+            let mut reader = ChainItemReader::new(self.index, PageType::IvfEntry, &mut stats);
+
+            let mut buf = rkyv::util::AlignedVec::new();
+            for item in reader.read(ItemPointer::new(start_page, 1)) {
+                buf.extend_from_slice(item.get_data_slice());
+            }
+
+            if buf.is_empty() {
+                return;
+            }
+
+            let page = rkyv::archived_root::<IvfEntryPage>(&buf);
+            for entry in page.entries.iter() {
+                f(entry);
+            }
+        }
+    }
 }
