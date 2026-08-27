@@ -183,22 +183,50 @@ pub unsafe extern "C-unwind" fn amgettuple(
                     let rq = quantizer.rotate_query_residual(centroid, &scan_state.query);
                     let fastscan = RabitqFastScan::new(&rq, num_bits, quantizer.dim());
                     reader.for_each_slice(list_meta.start_page, list_meta.num_blocks, |view| {
-                        for i in 0..view.len() {
-                            let d = fastscan.estimate(
-                                view.code(i),
-                                view.sum_of_x2(i),
-                                view.scale(i),
-                                view.margin_factor(i),
-                            );
-                            let candidate = DistTid {
-                                dist: d,
-                                tid: view.tid(i),
-                            };
-                            if heap.len() < top_k {
-                                heap.push(candidate);
-                            } else if let Some(mut worst) = heap.peek_mut() {
-                                if candidate.dist < worst.dist {
-                                    *worst = candidate;
+                        if num_bits == 1 {
+                            // 1-bit: SIMD FastScan over 32-row transposed batches.
+                            let mut sums = [0u16; 32];
+                            for batch in 0..view.num_batches() {
+                                fastscan.sum_batch(view.code_batch(batch), &mut sums);
+                                let base = batch * 32;
+                                let count = (view.len() - base).min(32);
+                                for r in 0..count {
+                                    let i = base + r;
+                                    let full_dot =
+                                        fastscan.full_dot_1bit(fastscan.dequantize_sum(sums[r]));
+                                    let d = fastscan.estimate_from_full_dot(
+                                        full_dot,
+                                        view.sum_of_x2(i),
+                                        view.scale(i),
+                                        view.margin_factor(i),
+                                    );
+                                    let candidate = DistTid { dist: d, tid: view.tid(i) };
+                                    if heap.len() < top_k {
+                                        heap.push(candidate);
+                                    } else if let Some(mut worst) = heap.peek_mut() {
+                                        if candidate.dist < worst.dist {
+                                            *worst = candidate;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // 4/8-bit: SIMD ex-dot per entry (row-major).
+                            for i in 0..view.len() {
+                                let full_dot = fastscan.full_dot_multi(view.code(i));
+                                let d = fastscan.estimate_from_full_dot(
+                                    full_dot,
+                                    view.sum_of_x2(i),
+                                    view.scale(i),
+                                    view.margin_factor(i),
+                                );
+                                let candidate = DistTid { dist: d, tid: view.tid(i) };
+                                if heap.len() < top_k {
+                                    heap.push(candidate);
+                                } else if let Some(mut worst) = heap.peek_mut() {
+                                    if candidate.dist < worst.dist {
+                                        *worst = candidate;
+                                    }
                                 }
                             }
                         }

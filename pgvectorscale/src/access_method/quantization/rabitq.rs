@@ -775,8 +775,12 @@ pub struct RabitqFastScan<'a> {
     rq: &'a RabitqQuery,
     num_bits: u8,
     dim: u32,
-    /// `d/4 × 16` table for 1-bit: `table[i*16 + j] = Σ_{k: j&(1<<k)} rot[i*4+k]`.
-    table: Vec<f32>,
+    /// u8-quantized `d/4 × 16` table for 1-bit FastScan (flat `d/4·16` bytes).
+    table_u8: Vec<u8>,
+    /// Dequantization: `sum_f32 = sum_u16·range_scale + num_chunks·qmin`.
+    qmin: f32,
+    range_scale: f32,
+    num_chunks: usize,
     sum_rot: f32,
     rq_sum_of_x2: f32,
     /// `sqrt(max(rq.sum_of_x2, 0))` — the query-side half of the error margin.
@@ -785,16 +789,23 @@ pub struct RabitqFastScan<'a> {
 
 impl<'a> RabitqFastScan<'a> {
     pub fn new(rq: &'a RabitqQuery, num_bits: u8, dim: usize) -> Self {
-        let table = if num_bits == 1 {
-            Self::build_table(&rq.rotated)
+        let (table_u8, qmin, range_scale, num_chunks) = if num_bits == 1 {
+            let f32_table = Self::build_table(&rq.rotated);
+            let (q, qmin, rs) = crate::access_method::quantization::rabitq_fastscan::quantize_table(
+                &f32_table,
+            );
+            (q, qmin, rs, f32_table.len() / 16)
         } else {
-            Vec::new()
+            (Vec::new(), 0.0, 0.0, 0)
         };
         Self {
             rq,
             num_bits,
             dim: dim as u32,
-            table,
+            table_u8,
+            qmin,
+            range_scale,
+            num_chunks,
             sum_rot: rq.sum_q,
             rq_sum_of_x2: rq.sum_of_x2,
             rq_margin: rq.sum_of_x2.max(0.0).sqrt(),
@@ -819,37 +830,52 @@ impl<'a> RabitqFastScan<'a> {
         table
     }
 
-    /// `Σ_{set bits} rot[d]` via 4-bit table lookups (1-bit code, LSB-first).
+    /// Bytes per 1-bit code (`dim / 8`).
     #[inline]
-    fn sum_set(&self, code: &[u8]) -> f32 {
-        let mut s = 0.0f32;
-        for (b, &byte) in code.iter().enumerate() {
-            let lo = (byte & 0x0F) as usize;
-            let hi = (byte >> 4) as usize;
-            s += self.table[b * 32 + lo];
-            s += self.table[b * 32 + 16 + hi];
-        }
-        s
+    pub fn code_len(&self) -> usize {
+        self.dim as usize / 8
     }
 
-    /// The binary inner product `<code, rotated_query>` for the given code.
+    /// Sum the quantized table for one 32-row transposed batch (1-bit).
     #[inline]
-    pub fn full_dot(&self, code: &[u8]) -> f32 {
-        if self.num_bits == 1 {
-            2.0 * self.sum_set(code) - self.sum_rot
-        } else {
-            let code_bias = -((1u32 << (self.num_bits - 1)) as f32 - 0.5);
-            dot_full_code(self.num_bits, code, &self.rq.rotated) + code_bias * self.sum_rot
-        }
+    pub fn sum_batch(&self, batch_codes: &[u8], out: &mut [u16]) {
+        crate::access_method::quantization::rabitq_fastscan::sum_batch(
+            batch_codes,
+            self.code_len(),
+            &self.table_u8,
+            out,
+        );
     }
 
-    /// Lower-bounded L2 estimate from the precomputed per-entry factors.
-    ///
-    /// Equivalent to `estimate_l2_fields` with `scale` and `margin_factor`
-    /// precomputed at build time; no division or sqrt in the hot loop.
+    /// Dequantize a u16 FastScan sum to the f32 `Σ_{set bits} rot`.
     #[inline]
-    pub fn estimate(&self, code: &[u8], sum_of_x2: f32, scale: f32, margin_factor: f32) -> f32 {
-        let full_dot = self.full_dot(code);
+    pub fn dequantize_sum(&self, q: u16) -> f32 {
+        q as f32 * self.range_scale + self.num_chunks as f32 * self.qmin
+    }
+
+    /// Full binary dot for a dequantized 1-bit `sum_set`.
+    #[inline]
+    pub fn full_dot_1bit(&self, sum_set: f32) -> f32 {
+        2.0 * sum_set - self.sum_rot
+    }
+
+    /// Full binary dot for a 4/8-bit code (row-major).
+    #[inline]
+    pub fn full_dot_multi(&self, code: &[u8]) -> f32 {
+        let code_bias = -((1u32 << (self.num_bits - 1)) as f32 - 0.5);
+        dot_full_code(self.num_bits, code, &self.rq.rotated) + code_bias * self.sum_rot
+    }
+
+    /// Lower-bounded L2 estimate from a full dot and the precomputed per-entry
+    /// factors.  No division or sqrt in the hot loop.
+    #[inline]
+    pub fn estimate_from_full_dot(
+        &self,
+        full_dot: f32,
+        sum_of_x2: f32,
+        scale: f32,
+        margin_factor: f32,
+    ) -> f32 {
         let est = full_dot * scale + sum_of_x2 + self.rq_sum_of_x2;
         (est - margin_factor * self.rq_margin).max(0.0)
     }
@@ -935,11 +961,22 @@ mod tests {
         let rq = q.rotate_query(&v);
         let fastscan = RabitqFastScan::new(&rq, 1, q.dim());
 
-        // The 1-bit FastScan full_dot must equal the scalar set-bit walk.
+        // The 1-bit FastScan (transposed batch sum + dequantize) full_dot must
+        // equal the scalar set-bit walk.
+        let transposed = crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
+            &qv.packed_code,
+            1,
+            fastscan.code_len(),
+        );
+        let mut sums = [0u16; 32];
+        fastscan.sum_batch(&transposed, &mut sums);
+        let sum_set = fastscan.dequantize_sum(sums[0]);
         let expected_dot = qv.dot_with_rotated(&rq.rotated);
-        let actual_dot = fastscan.full_dot(&qv.packed_code);
+        let actual_dot = fastscan.full_dot_1bit(sum_set);
+        // The u8 table quantization introduces a small sum error (bounded by
+        // num_chunks·range/255/2), so use an absolute tolerance.
         assert!(
-            (actual_dot - expected_dot).abs() <= 1e-3 * expected_dot.abs().max(1.0),
+            (actual_dot - expected_dot).abs() <= 0.5,
             "dot {} vs {}",
             actual_dot,
             expected_dot
@@ -949,9 +986,14 @@ mod tests {
         let scale = -2.0 * qv.sum_of_x2 / qv.l1_of_rotated.max(1e-9);
         let margin_factor = 2.0 * qv.sum_of_x2.max(0.0).sqrt() / (q.dim() as f32).sqrt().max(1.0);
         let expected = q.estimate_l2(&qv, &rq);
-        let actual = fastscan.estimate(&qv.packed_code, qv.sum_of_x2, scale, margin_factor);
+        let actual = fastscan.estimate_from_full_dot(
+            actual_dot,
+            qv.sum_of_x2,
+            scale,
+            margin_factor,
+        );
         assert!(
-            (actual - expected).abs() <= 1e-3 * expected.abs().max(1.0),
+            (actual - expected).abs() <= 1.0,
             "estimate {} vs {}",
             actual,
             expected
@@ -1008,7 +1050,7 @@ mod tests {
             let qv = q.quantize(&v);
             let rq = q.rotate_query(&v);
             let fastscan = RabitqFastScan::new(&rq, num_bits, q.dim());
-            let actual = fastscan.full_dot(&qv.packed_code);
+            let actual = fastscan.full_dot_multi(&qv.packed_code);
             let expected =
                 dot_with_rotated_fields(num_bits, dim as u32, &qv.packed_code, &rq.rotated);
             assert!(

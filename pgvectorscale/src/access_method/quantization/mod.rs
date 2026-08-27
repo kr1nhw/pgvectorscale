@@ -15,6 +15,7 @@
 use super::{distance::DistanceType, meta_page::MetaPage};
 
 pub mod rabitq;
+pub mod rabitq_fastscan;
 
 /// Identifies which quantization scheme a vector (or an index) uses.
 ///

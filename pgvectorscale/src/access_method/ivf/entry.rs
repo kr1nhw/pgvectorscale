@@ -78,8 +78,19 @@ pub fn serialize_entries(entries: &[IvfEntry]) -> Vec<u8> {
         buf.extend_from_slice(&e.heap_tid.block_number.to_le_bytes());
         buf.extend_from_slice(&e.heap_tid.offset.to_le_bytes());
     }
-    for e in entries {
-        buf.extend_from_slice(&e.code.packed_code);
+    if num_bits == 1 {
+        // 1-bit codes are stored transposed (32-row batches) for SIMD FastScan.
+        let mut row_major = Vec::with_capacity(n * code_len);
+        for e in entries {
+            row_major.extend_from_slice(&e.code.packed_code);
+        }
+        let transposed =
+            crate::access_method::quantization::rabitq_fastscan::transpose_1bit(&row_major, n, code_len);
+        buf.extend_from_slice(&transposed);
+    } else {
+        for e in entries {
+            buf.extend_from_slice(&e.code.packed_code);
+        }
     }
     for e in entries {
         buf.extend_from_slice(&e.code.sum_of_x2.to_le_bytes());
@@ -121,7 +132,13 @@ impl<'a> IvfEntrySlice<'a> {
 
         let tid_off = ENTRY_HEADER_SIZE;
         let code_off = tid_off + num_entries * TID_SIZE;
-        let sum_off = code_off + num_entries * code_len;
+        // 1-bit codes are stored transposed (batched by 32, zero-padded).
+        let codes_len = if num_bits == 1 {
+            num_entries.div_ceil(32) * 32 * code_len
+        } else {
+            num_entries * code_len
+        };
+        let sum_off = code_off + codes_len;
         let scale_off = sum_off + num_entries * 4;
         let margin_off = scale_off + num_entries * 4;
         let end = margin_off + num_entries * 4;
@@ -175,10 +192,29 @@ impl<'a> IvfEntrySlice<'a> {
         )
     }
 
-    /// Packed RaBitQ code of entry `i`.
+    /// Packed RaBitQ code of entry `i` (4/8-bit, row-major).
     #[inline]
     pub fn code(&self, i: usize) -> &'a [u8] {
         &self.codes[i * self.code_len..(i + 1) * self.code_len]
+    }
+
+    /// Raw code bytes (transposed for 1-bit, row-major for 4/8-bit).
+    #[inline]
+    pub fn codes(&self) -> &'a [u8] {
+        self.codes
+    }
+
+    /// Number of 32-row transposed batches (1-bit only).
+    #[inline]
+    pub fn num_batches(&self) -> usize {
+        self.num_entries.div_ceil(32)
+    }
+
+    /// Transposed 32-row code batch `batch` (1-bit only).
+    #[inline]
+    pub fn code_batch(&self, batch: usize) -> &'a [u8] {
+        let b = 32 * self.code_len;
+        &self.codes[batch * b..(batch + 1) * b]
     }
 
     /// `sum_of_x2` (residual norm squared) of entry `i`.
@@ -340,6 +376,17 @@ impl<'a> IvfEntryReader<'a> {
             return Vec::new();
         }
         let view = IvfEntrySlice::parse(&buf);
+        // 1-bit codes are stored transposed; recover row-major for the
+        // in-memory IvfEntry (the rewrite path re-transposes on serialize).
+        let row_major: Vec<u8> = if view.num_bits() == 1 {
+            crate::access_method::quantization::rabitq_fastscan::untranspose_1bit(
+                view.codes(),
+                view.len(),
+                view.code_len(),
+            )
+        } else {
+            Vec::new()
+        };
         (0..view.len())
             .map(|i| IvfEntry {
                 heap_tid: view.tid(i),
@@ -347,7 +394,11 @@ impl<'a> IvfEntryReader<'a> {
                     dim: view.dim() as u32,
                     sum_of_x2: view.sum_of_x2(i),
                     l1_of_rotated: view.l1_reconstructed(i),
-                    packed_code: view.code(i).to_vec(),
+                    packed_code: if view.num_bits() == 1 {
+                        row_major[i * view.code_len()..(i + 1) * view.code_len()].to_vec()
+                    } else {
+                        view.code(i).to_vec()
+                    },
                     num_bits: view.num_bits(),
                     cent_dot: 0.0,
                 },
