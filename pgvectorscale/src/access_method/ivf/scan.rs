@@ -19,7 +19,7 @@ use crate::access_method::ivf::meta_page::IvfMetaPage;
 use crate::access_method::ivf::options::{IVF_PROBES, IVF_TOP_K};
 use crate::access_method::ivf::simd::find_nearest_centroids;
 use crate::access_method::pg_vector::PgVectorInternal;
-use crate::access_method::quantization::rabitq::RabitqQuantizer;
+use crate::access_method::quantization::rabitq::{RabitqFastScan, RabitqQuantizer};
 use crate::util::ItemPointer;
 
 /// A (distance, heap tid) candidate pair ordered by distance, used as the
@@ -181,15 +181,14 @@ pub unsafe extern "C-unwind" fn amgettuple(
                 if list_meta.start_page != pg_sys::InvalidBlockNumber && list_meta.num_blocks > 0 {
                     let centroid = &centroid_page.centroids[list_id as usize];
                     let rq = quantizer.rotate_query_residual(centroid, &scan_state.query);
+                    let fastscan = RabitqFastScan::new(&rq, num_bits, quantizer.dim());
                     reader.for_each_slice(list_meta.start_page, list_meta.num_blocks, |view| {
                         for i in 0..view.len() {
-                            let d = quantizer.estimate_l2_fields(
-                                view.num_bits(),
-                                view.dim() as u32,
+                            let d = fastscan.estimate(
                                 view.code(i),
                                 view.sum_of_x2(i),
-                                view.l1(i),
-                                &rq,
+                                view.scale(i),
+                                view.margin_factor(i),
                             );
                             let candidate = DistTid {
                                 dist: d,

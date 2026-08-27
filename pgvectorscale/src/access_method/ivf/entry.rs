@@ -46,8 +46,13 @@ impl IvfEntry {
 ///
 /// Layout (all little-endian):
 /// ```text
-/// [16-byte header][tids: n*6][codes: n*code_len][sum_of_x2: n*4][l1: n*4]
+/// [16-byte header][tids: n*6][codes: n*code_len][sum_of_x2: n*4]
+/// [scale: n*4][margin_factor: n*4]
 /// ```
+///
+/// `scale = -2*sum_of_x2/l1` and `margin_factor = 2*sqrt(sum_of_x2)/sqrt(dim)`
+/// are precomputed at build time so the query-time estimate needs no division
+/// or sqrt per entry.
 pub fn serialize_entries(entries: &[IvfEntry]) -> Vec<u8> {
     let (num_bits, dim, code_len) = match entries.first() {
         Some(e) => (
@@ -58,7 +63,7 @@ pub fn serialize_entries(entries: &[IvfEntry]) -> Vec<u8> {
         None => (1u8, 0u16, 0usize),
     };
     let n = entries.len();
-    let mut buf = Vec::with_capacity(ENTRY_HEADER_SIZE + n * (TID_SIZE + code_len + 8));
+    let mut buf = Vec::with_capacity(ENTRY_HEADER_SIZE + n * (TID_SIZE + code_len + 12));
     buf.extend_from_slice(&IVF_ENTRY_MAGIC.to_le_bytes());
     buf.extend_from_slice(&(n as u32).to_le_bytes());
     buf.extend_from_slice(&(code_len as u16).to_le_bytes());
@@ -66,6 +71,8 @@ pub fn serialize_entries(entries: &[IvfEntry]) -> Vec<u8> {
     buf.extend_from_slice(&dim.to_le_bytes());
     buf.extend_from_slice(&[0u8; 3]); // pad header to 16 bytes
     debug_assert_eq!(buf.len(), ENTRY_HEADER_SIZE);
+
+    let inv_sqrt_dim = 1.0 / (dim as f32).sqrt().max(1.0);
 
     for e in entries {
         buf.extend_from_slice(&e.heap_tid.block_number.to_le_bytes());
@@ -78,7 +85,12 @@ pub fn serialize_entries(entries: &[IvfEntry]) -> Vec<u8> {
         buf.extend_from_slice(&e.code.sum_of_x2.to_le_bytes());
     }
     for e in entries {
-        buf.extend_from_slice(&e.code.l1_of_rotated.to_le_bytes());
+        let scale = -2.0 * e.code.sum_of_x2 / e.code.l1_of_rotated.max(1e-9);
+        buf.extend_from_slice(&scale.to_le_bytes());
+    }
+    for e in entries {
+        let margin_factor = 2.0 * e.code.sum_of_x2.max(0.0).sqrt() * inv_sqrt_dim;
+        buf.extend_from_slice(&margin_factor.to_le_bytes());
     }
     buf
 }
@@ -92,7 +104,8 @@ pub struct IvfEntrySlice<'a> {
     tids: &'a [u8],
     codes: &'a [u8],
     sums: &'a [u8],
-    l1s: &'a [u8],
+    scales: &'a [u8],
+    margin_factors: &'a [u8],
 }
 
 impl<'a> IvfEntrySlice<'a> {
@@ -109,8 +122,9 @@ impl<'a> IvfEntrySlice<'a> {
         let tid_off = ENTRY_HEADER_SIZE;
         let code_off = tid_off + num_entries * TID_SIZE;
         let sum_off = code_off + num_entries * code_len;
-        let l1_off = sum_off + num_entries * 4;
-        let end = l1_off + num_entries * 4;
+        let scale_off = sum_off + num_entries * 4;
+        let margin_off = scale_off + num_entries * 4;
+        let end = margin_off + num_entries * 4;
         assert!(bytes.len() >= end, "entry buffer truncated");
 
         Self {
@@ -120,8 +134,9 @@ impl<'a> IvfEntrySlice<'a> {
             dim,
             tids: &bytes[tid_off..code_off],
             codes: &bytes[code_off..sum_off],
-            sums: &bytes[sum_off..l1_off],
-            l1s: &bytes[l1_off..end],
+            sums: &bytes[sum_off..scale_off],
+            scales: &bytes[scale_off..margin_off],
+            margin_factors: &bytes[margin_off..end],
         }
     }
 
@@ -172,10 +187,29 @@ impl<'a> IvfEntrySlice<'a> {
         f32::from_le_bytes(self.sums[i * 4..(i + 1) * 4].try_into().unwrap())
     }
 
-    /// `l1_of_rotated` of entry `i`.
+    /// Precomputed `scale = -2*sum_of_x2/l1` of entry `i`.
     #[inline]
-    pub fn l1(&self, i: usize) -> f32 {
-        f32::from_le_bytes(self.l1s[i * 4..(i + 1) * 4].try_into().unwrap())
+    pub fn scale(&self, i: usize) -> f32 {
+        f32::from_le_bytes(self.scales[i * 4..(i + 1) * 4].try_into().unwrap())
+    }
+
+    /// Precomputed `margin_factor = 2*sqrt(sum_of_x2)/sqrt(dim)` of entry `i`.
+    #[inline]
+    pub fn margin_factor(&self, i: usize) -> f32 {
+        f32::from_le_bytes(self.margin_factors[i * 4..(i + 1) * 4].try_into().unwrap())
+    }
+
+    /// Reconstruct `l1_of_rotated` from the precomputed `scale` (for the
+    /// insert/vacuum rewrite round-trip).  `l1` is not stored; it is only
+    /// needed to recompute `scale` when a list is rewritten.
+    #[inline]
+    pub fn l1_reconstructed(&self, i: usize) -> f32 {
+        let sx2 = self.sum_of_x2(i);
+        if sx2.abs() > f32::EPSILON {
+            -2.0 * sx2 / self.scale(i)
+        } else {
+            0.0
+        }
     }
 }
 
@@ -312,7 +346,7 @@ impl<'a> IvfEntryReader<'a> {
                 code: RabitqVector {
                     dim: view.dim() as u32,
                     sum_of_x2: view.sum_of_x2(i),
-                    l1_of_rotated: view.l1(i),
+                    l1_of_rotated: view.l1_reconstructed(i),
                     packed_code: view.code(i).to_vec(),
                     num_bits: view.num_bits(),
                     cent_dot: 0.0,

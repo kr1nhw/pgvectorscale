@@ -554,6 +554,97 @@ pub struct RabitqQuery {
     pub l1: f32,
 }
 
+/// Precomputed per-(query, centroid) scan state.
+///
+/// For the 1-bit path it builds a FastScan distance table (`d/4 × 16`) so each
+/// candidate's binary inner product is `d/4` 4-bit table lookups instead of a
+/// scalar set-bit walk.  It also carries the query-side constants so the
+/// per-entry L2 estimate (`estimate`) uses the build-time-precomputed `scale`
+/// and `margin_factor` and performs no per-entry division or sqrt.
+pub struct RabitqFastScan<'a> {
+    rq: &'a RabitqQuery,
+    num_bits: u8,
+    dim: u32,
+    /// `d/4 × 16` table for 1-bit: `table[i*16 + j] = Σ_{k: j&(1<<k)} rot[i*4+k]`.
+    table: Vec<f32>,
+    sum_rot: f32,
+    rq_sum_of_x2: f32,
+    /// `sqrt(max(rq.sum_of_x2, 0))` — the query-side half of the error margin.
+    rq_margin: f32,
+}
+
+impl<'a> RabitqFastScan<'a> {
+    pub fn new(rq: &'a RabitqQuery, num_bits: u8, dim: usize) -> Self {
+        let table = if num_bits == 1 {
+            Self::build_table(&rq.rotated)
+        } else {
+            Vec::new()
+        };
+        let sum_rot = if num_bits == 1 { rq.sum_q } else { 0.0 };
+        Self {
+            rq,
+            num_bits,
+            dim: dim as u32,
+            table,
+            sum_rot,
+            rq_sum_of_x2: rq.sum_of_x2,
+            rq_margin: rq.sum_of_x2.max(0.0).sqrt(),
+        }
+    }
+
+    fn build_table(rot: &[f32]) -> Vec<f32> {
+        let n_chunks = rot.len() / 4;
+        let mut table = vec![0.0f32; n_chunks * 16];
+        for i in 0..n_chunks {
+            let base = i * 16;
+            for j in 0..16u32 {
+                let mut s = 0.0f32;
+                for k in 0..4 {
+                    if j & (1 << k) != 0 {
+                        s += rot[i * 4 + k];
+                    }
+                }
+                table[base + j as usize] = s;
+            }
+        }
+        table
+    }
+
+    /// `Σ_{set bits} rot[d]` via 4-bit table lookups (1-bit code, LSB-first).
+    #[inline]
+    fn sum_set(&self, code: &[u8]) -> f32 {
+        let mut s = 0.0f32;
+        for (b, &byte) in code.iter().enumerate() {
+            let lo = (byte & 0x0F) as usize;
+            let hi = (byte >> 4) as usize;
+            s += self.table[b * 32 + lo];
+            s += self.table[b * 32 + 16 + hi];
+        }
+        s
+    }
+
+    /// The binary inner product `<code, rotated_query>` for the given code.
+    #[inline]
+    pub fn full_dot(&self, code: &[u8]) -> f32 {
+        if self.num_bits == 1 {
+            2.0 * self.sum_set(code) - self.sum_rot
+        } else {
+            dot_with_rotated_fields(self.num_bits, self.dim, code, &self.rq.rotated)
+        }
+    }
+
+    /// Lower-bounded L2 estimate from the precomputed per-entry factors.
+    ///
+    /// Equivalent to `estimate_l2_fields` with `scale` and `margin_factor`
+    /// precomputed at build time; no division or sqrt in the hot loop.
+    #[inline]
+    pub fn estimate(&self, code: &[u8], sum_of_x2: f32, scale: f32, margin_factor: f32) -> f32 {
+        let full_dot = self.full_dot(code);
+        let est = full_dot * scale + sum_of_x2 + self.rq_sum_of_x2;
+        (est - margin_factor * self.rq_margin).max(0.0)
+    }
+}
+
 #[cfg(test)]
 /// Lance-style L2 estimate of (o, q) used by the unit tests: mirrors the
 /// search measure's `calculate_bq_distance`.
@@ -624,6 +715,37 @@ mod tests {
         let v = q.quantize(&vec![0.5f32; 128]);
         assert_eq!(v.quantized_size_bytes(), 16 + 8);
         assert_eq!(v.dim, 128);
+    }
+
+    #[test]
+    fn fastscan_matches_estimate_l2_fields() {
+        let q = RabitqQuantizer::new(1, 42, 128);
+        let v: Vec<f32> = (0..128).map(|i| ((i % 7) as f32) - 3.0).collect();
+        let qv = q.quantize(&v);
+        let rq = q.rotate_query(&v);
+        let fastscan = RabitqFastScan::new(&rq, 1, q.dim());
+
+        // The 1-bit FastScan full_dot must equal the scalar set-bit walk.
+        let expected_dot = qv.dot_with_rotated(&rq.rotated);
+        let actual_dot = fastscan.full_dot(&qv.packed_code);
+        assert!(
+            (actual_dot - expected_dot).abs() <= 1e-3 * expected_dot.abs().max(1.0),
+            "dot {} vs {}",
+            actual_dot,
+            expected_dot
+        );
+
+        // The precomputed-factors estimate must equal estimate_l2_fields.
+        let scale = -2.0 * qv.sum_of_x2 / qv.l1_of_rotated.max(1e-9);
+        let margin_factor = 2.0 * qv.sum_of_x2.max(0.0).sqrt() / (q.dim() as f32).sqrt().max(1.0);
+        let expected = q.estimate_l2(&qv, &rq);
+        let actual = fastscan.estimate(&qv.packed_code, qv.sum_of_x2, scale, margin_factor);
+        assert!(
+            (actual - expected).abs() <= 1e-3 * expected.abs().max(1.0),
+            "estimate {} vs {}",
+            actual,
+            expected
+        );
     }
 
     #[test]
