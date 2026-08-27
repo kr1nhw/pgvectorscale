@@ -157,7 +157,9 @@ pub fn dot_with_rotated_fields(num_bits: u8, dim: u32, packed_code: &[u8], rot: 
                 let hi = b >> 4;
                 for (k, nib) in [lo, hi].into_iter().enumerate() {
                     let r = rot[bi * 2 + k];
-                    binary_ip += if nib & 0x08 != 0 { r } else { -r };
+                    // The sign bit is unsigned 0/1 in the Lance full_dot
+                    // formula: `2^ex_bits * Σ sign·rot + Σ ex·rot + bias·Σrot`.
+                    binary_ip += if nib & 0x08 != 0 { r } else { 0.0 };
                     ex_dist += (nib & 0x07) as f32 * r;
                 }
             }
@@ -172,7 +174,8 @@ pub fn dot_with_rotated_fields(num_bits: u8, dim: u32, packed_code: &[u8], rot: 
             let mut ex_dist = 0.0f32;
             for (i, &b) in packed_code.iter().enumerate() {
                 let r = rot[i];
-                binary_ip += if b & 0x80 != 0 { r } else { -r };
+                // Sign bit is unsigned 0/1 (see 4-bit branch comment).
+                binary_ip += if b & 0x80 != 0 { r } else { 0.0 };
                 ex_dist += (b & 0x7F) as f32 * r;
             }
             code_scale * binary_ip
@@ -746,6 +749,45 @@ mod tests {
             actual,
             expected
         );
+    }
+
+    /// The multi-bit full_dot must equal Σ (unpacked_code − bias) · rot, i.e. the
+    /// binary sign bit is unsigned 0/1 (not ±1).  This guards the bug that made
+    /// 4/8-bit ranking collapse.
+    #[test]
+    fn multi_bit_dot_matches_unpacked_reference() {
+        for num_bits in [4u8, 8u8] {
+            let ex_bits = (num_bits - 1) as u32;
+            let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
+            let dim = 128usize;
+            let q = RabitqQuantizer::new(num_bits, 7, dim);
+            let v: Vec<f32> = (0..dim).map(|i| ((i % 11) as f32) - 5.0).collect();
+            let qv = q.quantize(&v);
+            let rot: Vec<f32> = (0..dim).map(|i| ((i % 9) as f32) - 4.0).collect();
+
+            let full_dot = dot_with_rotated_fields(num_bits, dim as u32, &qv.packed_code, &rot);
+
+            // Unpack the code and compute the reference Σ (full_code + bias)·rot.
+            let mut reference = 0.0f32;
+            for (i, &b) in qv.packed_code.iter().enumerate() {
+                if num_bits == 4 {
+                    let lo = (b & 0x0F) as f32;
+                    let hi = (b >> 4) as f32;
+                    reference += (lo + code_bias) * rot[i * 2];
+                    reference += (hi + code_bias) * rot[i * 2 + 1];
+                } else {
+                    // 8-bit: one dim per byte, full_code = b (0..255).
+                    reference += (b as f32 + code_bias) * rot[i];
+                }
+            }
+            assert!(
+                (full_dot - reference).abs() <= 1e-3 * reference.abs().max(1.0),
+                "num_bits={} dot {} vs {}",
+                num_bits,
+                full_dot,
+                reference
+            );
+        }
     }
 
     #[test]

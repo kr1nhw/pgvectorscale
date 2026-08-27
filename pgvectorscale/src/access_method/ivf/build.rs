@@ -165,7 +165,7 @@ fn write_empty_index(index: &PgRelation, options: &TSVIvfOptions, num_dimensions
             DistanceType::L2,
             num_lists as u16,
             crate::access_method::storage::StorageType::RabbitqCompression,
-            1, // num_bits
+            options.get_num_bits(),
             rotation_seed,
         )
     };
@@ -283,8 +283,9 @@ pub fn build_ivf_index_serial(
     let num_lists = options.get_lists() as usize;
     let sample_size = DEFAULT_SAMPLE_SIZE.min(vectors.len());
 
-    // RaBitQ quantization: 1 bit per dim by default, deterministic rotation seed.
-    let num_bits: u8 = 1;
+    // RaBitQ quantization: bits per dim from the reloption (1/4/8), random
+    // deterministic rotation seed.
+    let num_bits: u8 = options.get_num_bits();
     let mut rng = SmallRng::from_entropy();
     let rotation_seed: u64 = rng.gen();
     let quantizer = RabitqQuantizer::new(num_bits, rotation_seed, num_dimensions as usize);

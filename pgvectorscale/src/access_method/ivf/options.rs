@@ -9,6 +9,9 @@ use crate::access_method::storage::StorageType;
 /// Default number of inverted lists (centroids) for IVF index.
 const DEFAULT_LISTS: i32 = 100;
 
+/// Default RaBitQ bits-per-dimension for the IVF index.
+const DEFAULT_NUM_BITS: i32 = 1;
+
 /// Default storage type string for IVF index.
 const IVF_DEFAULT_STORAGE_TYPE_STR: &str = "plain";
 
@@ -22,6 +25,7 @@ pub struct TSVIvfOptions {
 
     pub storage_layout_offset: i32,
     pub lists: i32,
+    pub num_bits: i32,
 }
 
 impl TSVIvfOptions {
@@ -34,6 +38,7 @@ impl TSVIvfOptions {
             let mut ops = unsafe { PgBox::<TSVIvfOptions>::alloc0() };
             ops.storage_layout_offset = 0;
             ops.lists = DEFAULT_LISTS;
+            ops.num_bits = DEFAULT_NUM_BITS;
             unsafe {
                 set_varsize_4b(
                     ops.as_ptr().cast(),
@@ -61,6 +66,14 @@ impl TSVIvfOptions {
             panic!("lists must be between 1 and 32768");
         }
         self.lists
+    }
+
+    /// Get the RaBitQ bits-per-dimension.
+    pub fn get_num_bits(&self) -> u8 {
+        if self.num_bits < 1 || self.num_bits > 8 {
+            panic!("num_bits must be between 1 and 8");
+        }
+        self.num_bits as u8
     }
 
     /// Helper to extract a string option from the options struct.
@@ -186,6 +199,16 @@ pub unsafe fn init() {
         32768,
         pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
     );
+
+    pg_sys::add_int_reloption(
+        RELOPT_KIND_IVF,
+        "num_bits".as_pg_cstr(),
+        "RaBitQ bits-per-dimension (1/4/8)".as_pg_cstr(),
+        DEFAULT_NUM_BITS,
+        1,
+        8,
+        pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
+    );
 }
 
 #[pg_guard]
@@ -234,7 +257,7 @@ pub unsafe extern "C-unwind" fn amoptions(
         }
     }
 
-    let tab: [pg_sys::relopt_parse_elt; 2] = [
+    let tab: [pg_sys::relopt_parse_elt; 3] = [
         make_relopt_parse_elt(
             "storage_layout",
             pg_sys::relopt_type::RELOPT_TYPE_STRING,
@@ -244,6 +267,11 @@ pub unsafe extern "C-unwind" fn amoptions(
             "lists",
             pg_sys::relopt_type::RELOPT_TYPE_INT,
             offset_of!(TSVIvfOptions, lists) as i32,
+        ),
+        make_relopt_parse_elt(
+            "num_bits",
+            pg_sys::relopt_type::RELOPT_TYPE_INT,
+            offset_of!(TSVIvfOptions, num_bits) as i32,
         ),
     ];
 
