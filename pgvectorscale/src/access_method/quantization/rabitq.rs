@@ -186,6 +186,127 @@ pub fn dot_with_rotated_fields(num_bits: u8, dim: u32, packed_code: &[u8], rot: 
     }
 }
 
+/// `Σ full_code·rot` for multi-bit codes (our sequential layout: 8-bit is one
+/// byte per dim, 4-bit is two nibbles per byte).  The caller reconstructs the
+/// full dot as `dot_full_code + code_bias·Σrot`.
+#[inline]
+pub fn dot_full_code(num_bits: u8, code: &[u8], rot: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: only selected when AVX2 and FMA were detected.
+            return unsafe { ex_dot_simd::dot_full_code_avx2(num_bits, code, rot) };
+        }
+    }
+    dot_full_code_scalar(num_bits, code, rot)
+}
+
+#[inline]
+fn dot_full_code_scalar(num_bits: u8, code: &[u8], rot: &[f32]) -> f32 {
+    match num_bits {
+        4 => {
+            let mut s = 0.0f32;
+            for (i, &b) in code.iter().enumerate() {
+                s += (b & 0x0F) as f32 * rot[i * 2];
+                s += (b >> 4) as f32 * rot[i * 2 + 1];
+            }
+            s
+        }
+        8 => {
+            let mut s = 0.0f32;
+            for (i, &b) in code.iter().enumerate() {
+                s += b as f32 * rot[i];
+            }
+            s
+        }
+        _ => 0.0,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod ex_dot_simd {
+    use std::arch::x86_64::*;
+
+    /// Dispatch to the per-width kernel.
+    #[inline]
+    pub(super) unsafe fn dot_full_code_avx2(num_bits: u8, code: &[u8], rot: &[f32]) -> f32 {
+        match num_bits {
+            4 => dot_u4_full_avx2(code, rot),
+            8 => dot_u8_full_avx2(code, rot),
+            _ => super::dot_full_code_scalar(num_bits, code, rot),
+        }
+    }
+
+    /// Unpack 8 bytes (16 sequential 4-bit codes, dims 2i and 2i+1 per byte)
+    /// into 16 bytes in natural dim order.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn unpack_u4_sequential(ptr: *const u8) -> __m128i {
+        let word = (ptr as *const u64).read_unaligned();
+        let mask = 0x0f0f_0f0f_0f0f_0f0fu64;
+        let lo = word & mask;
+        let hi = (word >> 4) & mask;
+        _mm_unpacklo_epi8(_mm_set_epi64x(0, lo as i64), _mm_set_epi64x(0, hi as i64))
+    }
+
+    /// FMA 16 u8 codes against 16 query floats (AVX2: two 8-float halves).
+    #[inline]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn fma16_avx2(codes: __m128i, query: *const f32, acc: &mut [__m256; 2]) {
+        let lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(codes));
+        acc[0] = _mm256_fmadd_ps(lo, _mm256_loadu_ps(query), acc[0]);
+        let hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(codes)));
+        acc[1] = _mm256_fmadd_ps(hi, _mm256_loadu_ps(query.add(8)), acc[1]);
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn reduce_add_avx2(v: __m256) -> f32 {
+        let halves = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+        let pairs = _mm_add_ps(halves, _mm_movehl_ps(halves, halves));
+        let total = _mm_add_ss(pairs, _mm_shuffle_ps::<1>(pairs, pairs));
+        _mm_cvtss_f32(total)
+    }
+
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn dot_u8_full_avx2(code: &[u8], rot: &[f32]) -> f32 {
+        let mut acc = [_mm256_setzero_ps(); 2];
+        let n = code.len();
+        let full = n - (n % 16);
+        let mut i = 0;
+        while i < full {
+            let codes = _mm_loadu_si128(code.as_ptr().add(i) as *const __m128i);
+            fma16_avx2(codes, rot.as_ptr().add(i), &mut acc);
+            i += 16;
+        }
+        let mut sum = reduce_add_avx2(_mm256_add_ps(acc[0], acc[1]));
+        for j in i..n {
+            sum += code[j] as f32 * rot[j];
+        }
+        sum
+    }
+
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn dot_u4_full_avx2(code: &[u8], rot: &[f32]) -> f32 {
+        let mut acc = [_mm256_setzero_ps(); 2];
+        let n_bytes = code.len();
+        let full_bytes = n_bytes - (n_bytes % 8);
+        let mut i = 0;
+        while i < full_bytes {
+            let unpacked = unpack_u4_sequential(code.as_ptr().add(i));
+            fma16_avx2(unpacked, rot.as_ptr().add(i * 2), &mut acc);
+            i += 8;
+        }
+        let mut sum = reduce_add_avx2(_mm256_add_ps(acc[0], acc[1]));
+        for j in i..n_bytes {
+            sum += (code[j] & 0x0F) as f32 * rot[j * 2];
+            sum += (code[j] >> 4) as f32 * rot[j * 2 + 1];
+        }
+        sum
+    }
+}
+
 /// A RaBitQ-quantized vector.
 ///
 /// Two modes, selected by `num_bits`:
@@ -583,13 +704,12 @@ impl<'a> RabitqFastScan<'a> {
         } else {
             Vec::new()
         };
-        let sum_rot = if num_bits == 1 { rq.sum_q } else { 0.0 };
         Self {
             rq,
             num_bits,
             dim: dim as u32,
             table,
-            sum_rot,
+            sum_rot: rq.sum_q,
             rq_sum_of_x2: rq.sum_of_x2,
             rq_margin: rq.sum_of_x2.max(0.0).sqrt(),
         }
@@ -632,7 +752,8 @@ impl<'a> RabitqFastScan<'a> {
         if self.num_bits == 1 {
             2.0 * self.sum_set(code) - self.sum_rot
         } else {
-            dot_with_rotated_fields(self.num_bits, self.dim, code, &self.rq.rotated)
+            let code_bias = -((1u32 << (self.num_bits - 1)) as f32 - 0.5);
+            dot_full_code(self.num_bits, code, &self.rq.rotated) + code_bias * self.sum_rot
         }
     }
 
@@ -786,6 +907,30 @@ mod tests {
                 num_bits,
                 full_dot,
                 reference
+            );
+        }
+    }
+
+    /// The SIMD/dispatched `dot_full_code` (via `RabitqFastScan::full_dot`)
+    /// must agree with the scalar `dot_with_rotated_fields` for multi-bit codes.
+    #[test]
+    fn fastscan_multi_bit_full_dot_matches_scalar() {
+        for num_bits in [4u8, 8u8] {
+            let dim = 128usize;
+            let q = RabitqQuantizer::new(num_bits, 7, dim);
+            let v: Vec<f32> = (0..dim).map(|i| ((i % 11) as f32) - 5.0).collect();
+            let qv = q.quantize(&v);
+            let rq = q.rotate_query(&v);
+            let fastscan = RabitqFastScan::new(&rq, num_bits, q.dim());
+            let actual = fastscan.full_dot(&qv.packed_code);
+            let expected =
+                dot_with_rotated_fields(num_bits, dim as u32, &qv.packed_code, &rq.rotated);
+            assert!(
+                (actual - expected).abs() <= 1e-3 * expected.abs().max(1.0),
+                "num_bits={} {} vs {}",
+                num_bits,
+                actual,
+                expected
             );
         }
     }
