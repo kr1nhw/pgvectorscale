@@ -199,6 +199,12 @@ pub fn dot_full_code(num_bits: u8, code: &[u8], rot: &[f32]) -> f32 {
             return unsafe { ex_dot_simd::dot_full_code_avx2(num_bits, code, rot) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is part of the aarch64 baseline (no runtime detection needed).
+        // SAFETY: NEON is guaranteed on aarch64.
+        return unsafe { ex_dot_neon::dot_full_code_neon(num_bits, code, rot) };
+    }
     dot_full_code_scalar(num_bits, code, rot)
 }
 
@@ -299,6 +305,86 @@ mod ex_dot_simd {
             i += 8;
         }
         let mut sum = reduce_add_avx2(_mm256_add_ps(acc[0], acc[1]));
+        for j in i..n_bytes {
+            sum += (code[j] & 0x0F) as f32 * rot[j * 2];
+            sum += (code[j] >> 4) as f32 * rot[j * 2 + 1];
+        }
+        sum
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod ex_dot_neon {
+    use std::arch::aarch64::*;
+
+    /// Dispatch to the per-width NEON kernel (NEON is baseline on aarch64).
+    #[inline]
+    pub(super) unsafe fn dot_full_code_neon(num_bits: u8, code: &[u8], rot: &[f32]) -> f32 {
+        match num_bits {
+            4 => dot_u4_full_neon(code, rot),
+            8 => dot_u8_full_neon(code, rot),
+            _ => super::dot_full_code_scalar(num_bits, code, rot),
+        }
+    }
+
+    /// FMA 16 u8 codes against 16 query floats over four 4-float lanes.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn fma16_neon(codes: uint8x16_t, query: *const f32, acc: &mut [float32x4_t; 4]) {
+        let lo = vmovl_u8(vget_low_u8(codes));
+        let hi = vmovl_u8(vget_high_u8(codes));
+        let c0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo)));
+        let c1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo)));
+        let c2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi)));
+        let c3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi)));
+        acc[0] = vfmaq_f32(acc[0], c0, vld1q_f32(query));
+        acc[1] = vfmaq_f32(acc[1], c1, vld1q_f32(query.add(4)));
+        acc[2] = vfmaq_f32(acc[2], c2, vld1q_f32(query.add(8)));
+        acc[3] = vfmaq_f32(acc[3], c3, vld1q_f32(query.add(12)));
+    }
+
+    #[inline]
+    unsafe fn reduce_add_neon(acc: [float32x4_t; 4]) -> f32 {
+        vaddvq_f32(vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3])))
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn dot_u8_full_neon(code: &[u8], rot: &[f32]) -> f32 {
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        let n = code.len();
+        let full = n - (n % 16);
+        let mut i = 0;
+        while i < full {
+            let codes = vld1q_u8(code.as_ptr().add(i));
+            fma16_neon(codes, rot.as_ptr().add(i), &mut acc);
+            i += 16;
+        }
+        let mut sum = reduce_add_neon(acc);
+        for j in i..n {
+            sum += code[j] as f32 * rot[j];
+        }
+        sum
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn dot_u4_full_neon(code: &[u8], rot: &[f32]) -> f32 {
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        let n_bytes = code.len();
+        let full_bytes = n_bytes - (n_bytes % 16);
+        let mask = vdupq_n_u8(0x0f);
+        let mut i = 0;
+        while i < full_bytes {
+            let raw = vld1q_u8(code.as_ptr().add(i));
+            let lo = vandq_u8(raw, mask);
+            let hi = vshrq_n_u8::<4>(raw);
+            // Interleave lo/hi nibbles into natural dim order (byte i holds
+            // dims 2i and 2i+1).
+            let zipped = vzipq_u8(lo, hi);
+            fma16_neon(zipped.0, rot.as_ptr().add(i * 2), &mut acc);
+            fma16_neon(zipped.1, rot.as_ptr().add(i * 2 + 16), &mut acc);
+            i += 16;
+        }
+        let mut sum = reduce_add_neon(acc);
         for j in i..n_bytes {
             sum += (code[j] & 0x0F) as f32 * rot[j * 2];
             sum += (code[j] >> 4) as f32 * rot[j * 2 + 1];
