@@ -785,6 +785,9 @@ pub struct RabitqFastScan<'a> {
     rq_sum_of_x2: f32,
     /// `sqrt(max(rq.sum_of_x2, 0))` — the query-side half of the error margin.
     rq_margin: f32,
+    /// Fused dequantize constants: `full_dot = a_full·sum + b_full`.
+    a_full: f32,
+    b_full: f32,
 }
 
 impl<'a> RabitqFastScan<'a> {
@@ -798,6 +801,10 @@ impl<'a> RabitqFastScan<'a> {
         } else {
             (Vec::new(), 0.0, 0.0, 0)
         };
+        // `full_dot = 2·(sum_u16·range_scale + num_chunks·qmin) − sum_rot`
+        //        = (2·range_scale)·sum + (2·num_chunks·qmin − sum_rot).
+        let a_full = 2.0 * range_scale;
+        let b_full = 2.0 * num_chunks as f32 * qmin - rq.sum_q;
         Self {
             rq,
             num_bits,
@@ -809,6 +816,8 @@ impl<'a> RabitqFastScan<'a> {
             sum_rot: rq.sum_q,
             rq_sum_of_x2: rq.sum_of_x2,
             rq_margin: rq.sum_of_x2.max(0.0).sqrt(),
+            a_full,
+            b_full,
         }
     }
 
@@ -844,6 +853,32 @@ impl<'a> RabitqFastScan<'a> {
             self.code_len(),
             &self.table_u8,
             out,
+        );
+    }
+
+    /// Fused estimate for a batch of 1-bit rows (dequantize + full_dot + L2),
+    /// SIMD over 4/8 rows.
+    #[inline]
+    pub fn estimate_batch(
+        &self,
+        sums: &[u16],
+        scales: &[f32],
+        sx2: &[f32],
+        mf: &[f32],
+        out: &mut [f32],
+        n: usize,
+    ) {
+        crate::access_method::quantization::rabitq_fastscan::estimate_batch(
+            sums,
+            scales,
+            sx2,
+            mf,
+            self.a_full,
+            self.b_full,
+            self.rq_sum_of_x2,
+            self.rq_margin,
+            out,
+            n,
         );
     }
 

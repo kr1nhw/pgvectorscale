@@ -95,6 +95,142 @@ pub fn untranspose_1bit(transposed: &[u8], n_rows: usize, code_len: usize) -> Ve
     out
 }
 
+/// Fused L2 estimate for a batch of rows, from the precomputed FastScan sums.
+///
+/// With `full_dot = a_full·sum + b_full`, the lower-bounded estimate is
+/// `(a_full·scale·sum + b_full·scale + sum_of_x2 + rq_sum − margin_factor·rq_margin).max(0)`.
+/// `sums` is `n` u16 FastScan sums; `scales`/`sx2`/`mf` are the per-entry
+/// precomputed factors; `out` receives `n` estimates.
+#[inline]
+pub fn estimate_batch(
+    sums: &[u16],
+    scales: &[f32],
+    sx2: &[f32],
+    mf: &[f32],
+    a_full: f32,
+    b_full: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: only selected when AVX2 was detected.
+            unsafe {
+                estimate_batch_avx2(sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n);
+                return;
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64.
+        unsafe {
+            estimate_batch_neon(sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n);
+            return;
+        }
+    }
+    estimate_batch_scalar(sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n);
+}
+
+#[inline]
+fn estimate_batch_scalar(
+    sums: &[u16],
+    scales: &[f32],
+    sx2: &[f32],
+    mf: &[f32],
+    a_full: f32,
+    b_full: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) {
+    for i in 0..n {
+        let sum = sums[i] as f32;
+        let scale = scales[i];
+        let d = (a_full * scale * sum + b_full * scale + rq_sum + sx2[i] - mf[i] * rq_margin)
+            .max(0.0);
+        out[i] = d;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn estimate_batch_neon(
+    sums: &[u16],
+    scales: &[f32],
+    sx2: &[f32],
+    mf: &[f32],
+    a_full: f32,
+    b_full: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) {
+    use std::arch::aarch64::*;
+    let rq_sum_v = vdupq_n_f32(rq_sum);
+    let rq_margin_v = vdupq_n_f32(rq_margin);
+    let a_v = vdupq_n_f32(a_full);
+    let b_v = vdupq_n_f32(b_full);
+    let zero = vdupq_n_f32(0.0);
+    let mut i = 0;
+    while i + 4 <= n {
+        let sums_v = vcvtq_f32_u32(vmovl_u16(vld1_u16(sums.as_ptr().add(i))));
+        let scale_v = vld1q_f32(scales.as_ptr().add(i));
+        let sx2_v = vld1q_f32(sx2.as_ptr().add(i));
+        let mf_v = vld1q_f32(mf.as_ptr().add(i));
+        let mut acc = vmlaq_n_f32(rq_sum_v, scale_v, b_full);
+        acc = vaddq_f32(acc, sx2_v);
+        acc = vmlsq_n_f32(acc, mf_v, rq_margin);
+        acc = vmlaq_f32(acc, vmulq_f32(sums_v, scale_v), a_v);
+        vst1q_f32(out.as_mut_ptr().add(i), vmaxq_f32(acc, zero));
+        i += 4;
+    }
+    estimate_batch_scalar(&sums[i..], &scales[i..], &sx2[i..], &mf[i..], a_full, b_full, rq_sum, rq_margin, &mut out[i..], n - i);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn estimate_batch_avx2(
+    sums: &[u16],
+    scales: &[f32],
+    sx2: &[f32],
+    mf: &[f32],
+    a_full: f32,
+    b_full: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) {
+    use std::arch::x86_64::*;
+    let rq_sum_v = _mm256_set1_ps(rq_sum);
+    let rq_margin_v = _mm256_set1_ps(rq_margin);
+    let a_v = _mm256_set1_ps(a_full);
+    let b_v = _mm256_set1_ps(b_full);
+    let zero = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let sums_v = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_loadu_si128(
+            sums.as_ptr().add(i) as *const __m128i,
+        )));
+        let scale_v = _mm256_loadu_ps(scales.as_ptr().add(i));
+        let sx2_v = _mm256_loadu_ps(sx2.as_ptr().add(i));
+        let mf_v = _mm256_loadu_ps(mf.as_ptr().add(i));
+        let mut acc = _mm256_fmadd_ps(scale_v, b_v, rq_sum_v);
+        acc = _mm256_add_ps(acc, sx2_v);
+        acc = _mm256_fnmadd_ps(mf_v, rq_margin_v, acc);
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(sums_v, scale_v), a_v, acc);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_max_ps(acc, zero));
+        i += 8;
+    }
+    estimate_batch_scalar(&sums[i..], &scales[i..], &sx2[i..], &mf[i..], a_full, b_full, rq_sum, rq_margin, &mut out[i..], n - i);
+}
+
 /// Sum the quantized table for one 32-row transposed batch.
 ///
 /// `codes` is `code_len × 32` transposed bytes, `table` is the flat
@@ -295,6 +431,33 @@ mod tests {
         // Round-trip: transpose then untranspose must reproduce the input.
         let recovered = untranspose_1bit(&transposed, n_rows, code_len);
         assert_eq!(recovered, codes, "untranspose must invert transpose");
+
+        // Fused SIMD estimate must match the scalar estimate bit-exactly
+        // (the formula is a fixed linear combination, no FMA reordering across
+        // the accumulation).  Tolerance guards the 1-ulp u16->f32 conversion.
+        {
+            use rand::rngs::SmallRng;
+            use rand::{Rng, SeedableRng};
+            let mut rng = SmallRng::seed_from_u64(7);
+            let n = 100usize;
+            let sums: Vec<u16> = (0..n).map(|_| rng.gen::<u16>()).collect();
+            let scales: Vec<f32> = (0..n).map(|_| rng.gen_range(-2.0..2.0)).collect();
+            let sx2: Vec<f32> = (0..n).map(|_| rng.gen_range(0.0..1e6)).collect();
+            let mf: Vec<f32> = (0..n).map(|_| rng.gen_range(0.0..1e3)).collect();
+            let (a_full, b_full, rq_sum, rq_margin) = (0.01, -2.5, 5e5, 700.0);
+            let mut out_simd = vec![0.0f32; n];
+            let mut out_scalar = vec![0.0f32; n];
+            estimate_batch(&sums, &scales, &sx2, &mf, a_full, b_full, rq_sum, rq_margin, &mut out_simd, n);
+            estimate_batch_scalar(&sums, &scales, &sx2, &mf, a_full, b_full, rq_sum, rq_margin, &mut out_scalar, n);
+            for i in 0..n {
+                assert!(
+                    (out_simd[i] - out_scalar[i]).abs() <= 1e-3 * out_scalar[i].abs().max(1.0),
+                    "i={i} simd {} vs scalar {}",
+                    out_simd[i],
+                    out_scalar[i]
+                );
+            }
+        }
 
         // Now verify the batched SIMD/scalar sum matches, batch by batch.
         let n_batches = n_rows.div_ceil(BATCH_SIZE);

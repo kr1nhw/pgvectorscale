@@ -184,23 +184,25 @@ pub unsafe extern "C-unwind" fn amgettuple(
                     let fastscan = RabitqFastScan::new(&rq, num_bits, quantizer.dim());
                     reader.for_each_slice(list_meta.start_page, list_meta.num_blocks, |view| {
                         if num_bits == 1 {
-                            // 1-bit: SIMD FastScan over 32-row transposed batches.
+                            // 1-bit: SIMD FastScan sum + fused SIMD estimate over
+                            // 32-row transposed batches.
                             let mut sums = [0u16; 32];
+                            let mut dists = [0f32; 32];
                             for batch in 0..view.num_batches() {
                                 fastscan.sum_batch(view.code_batch(batch), &mut sums);
                                 let base = batch * 32;
                                 let count = (view.len() - base).min(32);
+                                fastscan.estimate_batch(
+                                    &sums[..count],
+                                    &view.scale_slice()[base..base + count],
+                                    &view.sum_of_x2_slice()[base..base + count],
+                                    &view.margin_factor_slice()[base..base + count],
+                                    &mut dists[..count],
+                                    count,
+                                );
                                 for r in 0..count {
-                                    let i = base + r;
-                                    let full_dot =
-                                        fastscan.full_dot_1bit(fastscan.dequantize_sum(sums[r]));
-                                    let d = fastscan.estimate_from_full_dot(
-                                        full_dot,
-                                        view.sum_of_x2(i),
-                                        view.scale(i),
-                                        view.margin_factor(i),
-                                    );
-                                    let candidate = DistTid { dist: d, tid: view.tid(i) };
+                                    let candidate =
+                                        DistTid { dist: dists[r], tid: view.tid(base + r) };
                                     if heap.len() < top_k {
                                         heap.push(candidate);
                                     } else if let Some(mut worst) = heap.peek_mut() {

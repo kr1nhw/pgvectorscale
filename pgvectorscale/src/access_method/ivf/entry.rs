@@ -223,6 +223,29 @@ impl<'a> IvfEntrySlice<'a> {
         f32::from_le_bytes(self.sums[i * 4..(i + 1) * 4].try_into().unwrap())
     }
 
+    /// The `sum_of_x2` array as `f32` (little-endian; x86/ARM only).
+    #[inline]
+    pub fn sum_of_x2_slice(&self) -> &'a [f32] {
+        unsafe { std::slice::from_raw_parts(self.sums.as_ptr() as *const f32, self.num_entries) }
+    }
+
+    /// The precomputed `scale` array as `f32`.
+    #[inline]
+    pub fn scale_slice(&self) -> &'a [f32] {
+        unsafe { std::slice::from_raw_parts(self.scales.as_ptr() as *const f32, self.num_entries) }
+    }
+
+    /// The precomputed `margin_factor` array as `f32`.
+    #[inline]
+    pub fn margin_factor_slice(&self) -> &'a [f32] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.margin_factors.as_ptr() as *const f32,
+                self.num_entries,
+            )
+        }
+    }
+
     /// Precomputed `scale = -2*sum_of_x2/l1` of entry `i`.
     #[inline]
     pub fn scale(&self, i: usize) -> f32 {
@@ -342,9 +365,10 @@ impl<'a> IvfEntryReader<'a> {
 
             let n = num_blocks as usize;
             let blksz = pg_sys::BLCKSZ as usize;
-            // One contiguous raw buffer (avoids n per-block allocations), with
-            // `smgrreadv` filling it block-by-block.
-            let mut raw = vec![0u8; n * blksz];
+            // One contiguous raw buffer, *uninitialized*: `smgrreadv` overwrites
+            // every byte, so zero-filling it would be pure wasted memset.
+            let mut raw: Vec<u8> = Vec::with_capacity(n * blksz);
+            raw.set_len(n * blksz);
             let mut ptrs: Vec<*mut std::os::raw::c_void> = (0..n)
                 .map(|i| raw.as_mut_ptr().add(i * blksz) as *mut std::os::raw::c_void)
                 .collect();
