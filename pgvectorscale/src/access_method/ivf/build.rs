@@ -165,7 +165,7 @@ fn write_empty_index(index: &PgRelation, options: &TSVIvfOptions, num_dimensions
             num_dimensions,
             DistanceType::L2,
             num_lists as u16,
-            crate::access_method::storage::StorageType::RabbitqCompression,
+            options.get_storage_type(),
             options.get_num_bits(),
             rotation_seed,
         )
@@ -318,7 +318,7 @@ pub fn build_ivf_index_serial(
         .collect();
 
     // Step 4: Write meta page first (block 0).
-    let storage_type = crate::access_method::storage::StorageType::RabbitqCompression;
+    let storage_type = options.get_storage_type();
     let mut meta_page = unsafe {
         crate::access_method::ivf::meta_page::IvfMetaPage::create(
             index,

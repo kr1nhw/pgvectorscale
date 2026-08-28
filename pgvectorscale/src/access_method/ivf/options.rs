@@ -12,8 +12,9 @@ const DEFAULT_LISTS: i32 = 100;
 /// Default RaBitQ bits-per-dimension for the IVF index.
 const DEFAULT_NUM_BITS: i32 = 1;
 
-/// Default storage type string for IVF index.
-const IVF_DEFAULT_STORAGE_TYPE_STR: &str = "plain";
+/// Default storage type string for IVF index.  The IVF access method is a
+/// RaBitQ index, so its (only) storage layout is `rabitq_compression`.
+const IVF_DEFAULT_STORAGE_TYPE_STR: &str = "rabitq_compression";
 
 // DO NOT derive Clone for this struct. The storage layout string comes at the end and wouldn't be copied properly.
 #[derive(Debug, PartialEq)]
@@ -184,7 +185,7 @@ pub unsafe fn init() {
     pg_sys::add_string_reloption(
         RELOPT_KIND_IVF,
         "storage_layout".as_pg_cstr(),
-        "Storage layout: either plain or memory_optimized".as_pg_cstr(),
+        "Storage layout: rabitq_compression (IVF is a RaBitQ index)".as_pg_cstr(),
         IVF_DEFAULT_STORAGE_TYPE_STR.as_pg_cstr(),
         Some(validate_storage_layout),
         pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
@@ -309,7 +310,7 @@ mod tests {
         let indexrel = PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid));
         let options = TSVIvfOptions::from_relation(&indexrel);
         assert_eq!(options.get_lists(), DEFAULT_LISTS);
-        assert_eq!(options.get_storage_type(), StorageType::Plain);
+        assert_eq!(options.get_storage_type(), StorageType::RabbitqCompression);
         Ok(())
     }
 
