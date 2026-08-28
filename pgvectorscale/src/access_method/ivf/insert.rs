@@ -33,7 +33,10 @@ pub unsafe extern "C-unwind" fn aminsert(
 
     let index_rel = unsafe { PgRelation::from_pg(index) };
     let meta = IvfMetaPage::fetch(&index_rel);
-    let mut centroid_page = IvfCentroidPage::load(&index_rel);
+    let mut centroid_page = match meta.get_centroids_pointer() {
+        Some(p) => IvfCentroidPage::load(&index_rel, p),
+        None => IvfCentroidPage::new(Vec::new()),
+    };
     let mut list_directory = IvfListDirectory::load(&index_rel);
 
     // Extract the vector.
@@ -47,8 +50,9 @@ pub unsafe extern "C-unwind" fn aminsert(
     // from this vector so subsequent inserts and scans have a list to use.
     if centroid_page.centroids.is_empty() {
         centroid_page = IvfCentroidPage::new(vec![vector.clone()]);
+        let existing = meta.get_centroids_pointer().map(|p| p.block_number);
         unsafe {
-            centroid_page.store(&index_rel, false);
+            centroid_page.store(&index_rel, existing);
         }
     }
 

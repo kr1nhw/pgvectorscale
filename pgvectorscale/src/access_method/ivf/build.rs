@@ -157,8 +157,9 @@ fn write_empty_index(index: &PgRelation, options: &TSVIvfOptions, num_dimensions
     let mut rng = SmallRng::from_entropy();
     let rotation_seed: u64 = rng.gen();
 
-    // Meta page (block 0), empty list directory (block 1), empty centroids (block 2).
-    let _meta = unsafe {
+    // Meta page (block 0), empty list directory (block 1), empty centroids
+    // (dynamic block recorded in the meta).
+    let mut meta = unsafe {
         IvfMetaPage::create(
             index,
             num_dimensions,
@@ -176,8 +177,11 @@ fn write_empty_index(index: &PgRelation, options: &TSVIvfOptions, num_dimensions
     }
 
     let centroid_page = IvfCentroidPage::new(Vec::new());
+    let centroid_ptr = unsafe { centroid_page.store(index, None) };
     unsafe {
-        centroid_page.store(index, true);
+        meta.set_list_directory_pointer(ItemPointer::new(1, 1));
+        meta.set_centroids_pointer(centroid_ptr);
+        meta.store(index, false);
     }
 }
 
@@ -315,7 +319,7 @@ pub fn build_ivf_index_serial(
 
     // Step 4: Write meta page first (block 0).
     let storage_type = crate::access_method::storage::StorageType::RabbitqCompression;
-    let _meta_page = unsafe {
+    let mut meta_page = unsafe {
         crate::access_method::ivf::meta_page::IvfMetaPage::create(
             index,
             num_dimensions,
@@ -327,17 +331,20 @@ pub fn build_ivf_index_serial(
         )
     };
 
-    // Step 5: Write an empty list directory at block 1 first, so the centroid
-    // page lands at block 2 (the fixed-block layout the loaders expect).
+    // Step 5: Write an empty list directory at block 1.
     let mut list_directory = IvfListDirectory::new(num_lists as u16);
     unsafe {
         list_directory.store(index, true);
     }
 
-    // Step 6: Write centroid page (block 2).
+    // Step 6: Write the centroid page (a dynamic block after the directory) and
+    // record its pointer in the meta page.
     let centroid_page = IvfCentroidPage::new(centroids.clone());
+    let centroid_ptr = unsafe { centroid_page.store(index, None) };
     unsafe {
-        centroid_page.store(index, true);
+        meta_page.set_list_directory_pointer(ItemPointer::new(1, 1));
+        meta_page.set_centroids_pointer(centroid_ptr);
+        meta_page.store(index, false);
     }
 
     // Step 7: Write entry pages for each list (block 3+).  The per-list append

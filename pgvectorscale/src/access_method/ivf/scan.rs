@@ -156,7 +156,10 @@ pub unsafe extern "C-unwind" fn amgettuple(
         let index_rel = unsafe { PgRelation::from_pg((*scan).indexRelation) };
         let meta = IvfMetaPage::fetch(&index_rel);
         let distance_type = meta.get_distance_type();
-        let centroid_page = IvfCentroidPage::load(&index_rel);
+        let centroid_page = match meta.get_centroids_pointer() {
+            Some(p) => IvfCentroidPage::load(&index_rel, p),
+            None => IvfCentroidPage::new(Vec::new()),
+        };
         let list_directory = IvfListDirectory::load(&index_rel);
 
         // Step 1: find nearest centroids (which lists to probe)

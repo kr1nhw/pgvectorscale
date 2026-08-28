@@ -11,11 +11,8 @@ use crate::util::chain::{ChainItemReader, ChainTapeWriter};
 use crate::util::page::PageType;
 use crate::util::*;
 
-const CENTROID_PAGE_BLOCK_NUMBER: pg_sys::BlockNumber = 2;
-const CENTROID_PAGE_OFFSET: pgrx::pg_sys::OffsetNumber = 1;
-
-/// IVF centroid page containing all centroids.
-/// Stored on Page 2.
+/// IVF centroid page containing all centroids, stored as a chained item at a
+/// dynamically-assigned block recorded in the meta page.
 #[derive(Clone, Debug, PartialEq, Archive, Deserialize, Serialize, Readable, Writeable)]
 #[archive(check_bytes)]
 pub struct IvfCentroidPage {
@@ -39,39 +36,32 @@ impl IvfCentroidPage {
         self.centroids.get(index)
     }
 
-    /// Store the centroid page to the index.
-    pub unsafe fn store(&self, index: &PgRelation, first_time: bool) {
+    /// Store the centroid page and return the `ItemPointer` to its first chunk.
+    /// `existing_block` reinitializes an already-allocated chain (insert path);
+    /// `None` allocates a fresh chain (build path).
+    pub unsafe fn store(
+        &self,
+        index: &PgRelation,
+        existing_block: Option<pg_sys::BlockNumber>,
+    ) -> ItemPointer {
         let mut stats = crate::access_method::stats::WriteStats::default();
-        let mut tape = if first_time {
-            ChainTapeWriter::new(index, PageType::IvfCentroids, &mut stats)
-        } else {
-            ChainTapeWriter::reinit(
-                index,
-                PageType::IvfCentroids,
-                &mut stats,
-                CENTROID_PAGE_BLOCK_NUMBER,
-            )
+        let mut tape = match existing_block {
+            None => ChainTapeWriter::new(index, PageType::IvfCentroids, &mut stats),
+            Some(b) => ChainTapeWriter::reinit(index, PageType::IvfCentroids, &mut stats, b),
         };
 
         let bytes = self.serialize_to_vec();
-        let off = tape.write(&bytes);
-        assert_eq!(
-            off,
-            ItemPointer::new(CENTROID_PAGE_BLOCK_NUMBER, CENTROID_PAGE_OFFSET)
-        );
+        tape.write(&bytes)
     }
 
-    /// Load the centroid page from the index.
-    pub fn load(index: &PgRelation) -> IvfCentroidPage {
+    /// Load the centroid page from the given pointer.
+    pub fn load(index: &PgRelation, pointer: ItemPointer) -> IvfCentroidPage {
         unsafe {
             let mut stats = crate::access_method::stats::WriteStats::default();
             let mut tape = ChainItemReader::new(index, PageType::IvfCentroids, &mut stats);
 
             let mut buf: Vec<u8> = Vec::new();
-            for item in tape.read(ItemPointer::new(
-                CENTROID_PAGE_BLOCK_NUMBER,
-                CENTROID_PAGE_OFFSET,
-            )) {
+            for item in tape.read(pointer) {
                 buf.extend_from_slice(item.get_data_slice());
             }
             rkyv::from_bytes::<IvfCentroidPage>(&buf).unwrap()

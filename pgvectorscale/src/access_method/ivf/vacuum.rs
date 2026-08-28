@@ -25,8 +25,11 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     };
 
     let index_rel = unsafe { PgRelation::from_pg((*info).index) };
-    let _meta = IvfMetaPage::fetch(&index_rel);
-    let _centroid_page = IvfCentroidPage::load(&index_rel);
+    let meta = IvfMetaPage::fetch(&index_rel);
+    let _centroid_page = match meta.get_centroids_pointer() {
+        Some(p) => IvfCentroidPage::load(&index_rel, p),
+        None => IvfCentroidPage::new(Vec::new()),
+    };
     let mut list_directory = IvfListDirectory::load(&index_rel);
 
     let reader = IvfEntryReader::new(&index_rel);
