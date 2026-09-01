@@ -112,7 +112,8 @@ impl IvfSegmentList {
             for item in tape.read(pointer) {
                 buf.extend_from_slice(item.get_data_slice());
             }
-            rkyv::from_bytes::<IvfSegmentList>(&buf).unwrap()
+            rkyv::from_bytes::<IvfSegmentList>(&buf)
+                .unwrap_or_else(|e| panic!("IVF: segment-list parse failed ({} bytes): {:?}", buf.len(), e))
         }
     }
 }
@@ -156,7 +157,8 @@ impl IvfFreeList {
             for item in tape.read(pointer) {
                 buf.extend_from_slice(item.get_data_slice());
             }
-            rkyv::from_bytes::<IvfFreeList>(&buf).unwrap()
+            rkyv::from_bytes::<IvfFreeList>(&buf)
+                .unwrap_or_else(|e| panic!("IVF: free-list parse failed: {:?}", e))
         }
     }
 }
@@ -207,7 +209,8 @@ impl IvfListHeader {
             let page = ReadablePage::read(index, pointer.block_number);
             assert!(page.get_type() == PageType::IvfListHeader);
             let item = page.get_item_unchecked(pointer.offset);
-            rkyv::from_bytes::<IvfListHeader>(item.get_data_slice()).unwrap()
+            rkyv::from_bytes::<IvfListHeader>(item.get_data_slice())
+                .unwrap_or_else(|e| panic!("IVF: list-header parse failed: {:?}", e))
         }
     }
 
@@ -219,7 +222,7 @@ impl IvfListHeader {
         let item = PageGetItem(page, item_id);
         let len = (*item_id).lp_len() as usize;
         rkyv::from_bytes::<IvfListHeader>(std::slice::from_raw_parts(item as *const u8, len))
-            .unwrap()
+            .unwrap_or_else(|e| panic!("IVF: list-header buffer parse failed ({} bytes): {:?}", len, e))
     }
 
     /// Read-modify-write the header page of list `block` atomically.

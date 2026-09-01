@@ -31,3 +31,6 @@ __pycache__/
 .Python
 .pytest_cache/
 .design/.pgrx-home/
+.design/
+target-old/
+.pgrx-home/

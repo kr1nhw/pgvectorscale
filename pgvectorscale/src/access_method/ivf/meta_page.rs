@@ -215,7 +215,8 @@ impl IvfMetaPage {
             let page = ReadablePage::read(index, META_BLOCK_NUMBER);
             assert!(page.get_type() == PageType::IvfMeta);
             let item = page.get_item_unchecked(META_OFFSET);
-            let result = rkyv::from_bytes::<IvfMetaPage>(item.get_data_slice()).unwrap();
+            let result = rkyv::from_bytes::<IvfMetaPage>(item.get_data_slice())
+                .unwrap_or_else(|e| panic!("IVF: meta fetch parse failed: {:?}", e));
 
             // Verify magic number and version
             assert_eq!(result.magic_number, IVF_MAGIC_NUMBER);
@@ -237,7 +238,7 @@ impl IvfMetaPage {
         let len = (*item_id).lp_len() as usize;
         let mut meta =
             rkyv::from_bytes::<IvfMetaPage>(std::slice::from_raw_parts(item as *const u8, len))
-                .unwrap();
+                .unwrap_or_else(|e| panic!("IVF: meta update parse failed: {:?}", e));
         assert_eq!(meta.magic_number, IVF_MAGIC_NUMBER);
         assert_eq!(meta.version, IVF_VERSION);
 

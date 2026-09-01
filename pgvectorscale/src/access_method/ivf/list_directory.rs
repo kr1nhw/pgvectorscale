@@ -112,7 +112,8 @@ impl IvfListDirectory {
             )) {
                 buf.extend_from_slice(item.get_data_slice());
             }
-            rkyv::from_bytes::<IvfListDirectory>(&buf).unwrap()
+            rkyv::from_bytes::<IvfListDirectory>(&buf)
+                .unwrap_or_else(|e| panic!("IVF: list-directory parse failed ({} bytes): {:?}", buf.len(), e))
         }
     }
 }
