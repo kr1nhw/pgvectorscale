@@ -159,13 +159,16 @@ pub unsafe extern "C-unwind" fn aminsert(
                         _ => seal_entries(&index_rel, entries),
                     };
                     if !sealed.is_empty() {
+                        let sealed_start = sealed.start_page;
+                        let sealed_blocks = sealed.num_blocks;
                         let mut segments =
                             IvfSegmentList::load(&index_rel, header.segment_list).segments;
                         segments.push(sealed);
                         let new_sl = IvfSegmentList::new(segments);
                         let (new_ptr, new_blocks) = new_sl.store(&index_rel);
-                        // The old segment-list item becomes garbage; retire it
-                        // (the old segments stay referenced by the new item).
+                        // The old segment-list item and the now-sealed active
+                        // buffer pages become garbage; retire them (the old
+                        // published segments stay referenced by the new item).
                         // segment_list_blocks == 0 marks the shared empty item
                         // used by never-sealed lists — never retire it.
                         if header.segment_list_blocks > 0 {
@@ -174,14 +177,31 @@ pub unsafe extern "C-unwind" fn aminsert(
                                 num_blocks: header.segment_list_blocks,
                             });
                         }
+                        for &page in &active.pages {
+                            retired.push(IvfFreeRange {
+                                start_block: page,
+                                num_blocks: 1,
+                            });
+                        }
+                        // The sealed blocks must be on disk before the header
+                        // swap becomes visible to smgrreadv scans.  Flush only
+                        // the freshly written blocks, inside the closure (i.e.
+                        // BEFORE the header page itself is rewritten): a full
+                        // FlushRelationBuffers here would try to flush the
+                        // header page we hold exclusively and self-deadlock.
+                        crate::util::page::flush_block_range(
+                            &index_rel,
+                            sealed_start,
+                            sealed_blocks,
+                        );
+                        crate::util::page::flush_block_range(
+                            &index_rel,
+                            new_ptr.block_number,
+                            new_blocks,
+                        );
                         header.segment_list = new_ptr;
                         header.segment_list_blocks = new_blocks;
                         header.version += 1;
-                        // The sealed blocks must be on disk before the header
-                        // swap becomes visible to smgrreadv scans.  Flush
-                        // inside the closure — i.e. BEFORE the header page
-                        // itself is rewritten on update() exit.
-                        pg_sys::FlushRelationBuffers(index_rel.as_ptr());
                     }
                     header.active = None;
                 }

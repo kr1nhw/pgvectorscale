@@ -21,7 +21,7 @@ use crate::access_method::ivf::segment::{IvfListHeader, IvfSegmentList};
 use crate::access_method::ivf::simd::find_nearest_centroids;
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::access_method::quantization::rabitq::{RabitqFastScan, RabitqQuantizer};
-use crate::util::buffer::RelationLockGuard;
+use crate::util::buffer::AdvisoryLockGuard;
 use crate::util::ItemPointer;
 
 /// A (distance, heap tid) candidate pair ordered by distance, used as the
@@ -156,13 +156,14 @@ pub unsafe extern "C-unwind" fn amgettuple(
     // Compute results on first call
     if !scan_state.results_computed {
         let index_rel = unsafe { PgRelation::from_pg((*scan).indexRelation) };
-        // Read-burst protocol: hold the relation ShareLock across the header /
-        // segment-list reads and the smgrreadv bursts.  Reclamation takes the
-        // ExclusiveLock, so it cannot free (and reuse) blocks while this scan
-        // is still reading them; ShareLock is self-compatible, so concurrent
-        // scans do not contend.
-        let _read_guard =
-            RelationLockGuard::new(index_rel.as_ptr(), pg_sys::ShareLock as pg_sys::LOCKMODE);
+        // Read-burst protocol: hold the shared advisory lock across the header
+        // / segment-list reads and the smgrreadv bursts.  Reclamation takes the
+        // exclusive advisory lock, so it cannot free (and reuse) blocks while
+        // this scan is still reading them; the shared lock is self-compatible,
+        // so concurrent scans do not contend, and it never conflicts with the
+        // executor's relation locks on the index.
+        let (k1, k2) = crate::access_method::ivf::meta_page::advisory_keys(&index_rel);
+        let _read_guard = AdvisoryLockGuard::acquire_shared(k1, k2);
         let meta = IvfMetaPage::fetch(&index_rel);
         let distance_type = meta.get_distance_type();
         let centroid_page = match meta.get_centroids_pointer() {
@@ -195,7 +196,9 @@ pub unsafe extern "C-unwind" fn amgettuple(
                 }
                 let header = IvfListHeader::load(&index_rel, list_meta.header);
                 let segment_list = IvfSegmentList::load(&index_rel, header.segment_list);
-                if segment_list.segments.is_empty() {
+                // A list with no published segments can still have entries in
+                // its (unsealed) active buffer, so only skip when both empty.
+                if segment_list.segments.is_empty() && header.active.is_none() {
                     continue;
                 }
                 let centroid = &centroid_page.centroids[list_id as usize];
@@ -204,8 +207,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
                 for segment in &segment_list.segments {
                     if segment.start_page == pg_sys::InvalidBlockNumber || segment.num_blocks == 0 {
                         continue;
-                    }
-                    reader.for_each_slice(segment.start_page, segment.num_blocks, |view| {
+                    }                    reader.for_each_slice(segment.start_page, segment.num_blocks, |view| {
                         if num_bits == 1 {
                             // 1-bit: SIMD FastScan sum + fused SIMD estimate over
                             // 32-row transposed batches.
@@ -256,6 +258,36 @@ pub unsafe extern "C-unwind" fn amgettuple(
                             }
                         }
                     });
+                }
+                // Open (append) buffer: entries not yet sealed into a
+                // published segment are still visible — read them through the
+                // buffer manager (append-only pages, one row-major item per
+                // entry) with the scalar estimator.  This is the slow path;
+                // sealed segments use the SIMD FastScan path above.
+                if let Some(active) = header.active.as_ref() {
+                    let entries =
+                        crate::access_method::ivf::entry::read_active_entries(&index_rel, active);
+                    for e in &entries {
+                        let d = quantizer.estimate_l2_fields(
+                            e.code.num_bits,
+                            e.code.dim,
+                            &e.code.packed_code,
+                            e.code.sum_of_x2,
+                            e.code.l1_of_rotated,
+                            &rq,
+                        );
+                        let candidate = DistTid {
+                            dist: d,
+                            tid: e.heap_tid,
+                        };
+                        if heap.len() < top_k {
+                            heap.push(candidate);
+                        } else if let Some(mut worst) = heap.peek_mut() {
+                            if candidate.dist < worst.dist {
+                                *worst = candidate;
+                            }
+                        }
+                    }
                 }
             }
         }

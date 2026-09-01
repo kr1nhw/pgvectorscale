@@ -55,13 +55,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                 let segment_list = IvfSegmentList::load(&index_rel, header.segment_list);
 
                 let mut live_entries = Vec::new();
-                for segment in &segment_list.segments {
-                    if segment.start_page == pg_sys::InvalidBlockNumber
-                        || segment.num_blocks == 0
-                    {
-                        continue;
-                    }
-                    let entries = reader.read_entries(segment.start_page, segment.num_blocks);
+                let mut process = |entries: Vec<crate::access_method::ivf::entry::IvfEntry>| {
                     for entry in entries {
                         let is_dead = if let Some(cb) = callback {
                             let mut tid_data = pg_sys::ItemPointerData::default();
@@ -77,13 +71,37 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                             total_live += 1;
                         }
                     }
+                };
+                for segment in &segment_list.segments {
+                    if segment.start_page == pg_sys::InvalidBlockNumber
+                        || segment.num_blocks == 0
+                    {
+                        continue;
+                    }
+                    let entries = reader.read_entries(segment.start_page, segment.num_blocks);
+                    process(entries);
+                }
+                // The unpublished active buffer must be merged too: entries
+                // for deleted rows left there would otherwise be published by a
+                // later seal as stale TIDs (physically removed heap tuples),
+                // which breaks index-only heap fetches downstream.
+                let active_present = header.active.is_some();
+                let mut active_pages: Vec<pg_sys::BlockNumber> = Vec::new();
+                if let Some(active) = header.active.as_ref() {
+                    let entries =
+                        crate::access_method::ivf::entry::read_active_entries(&index_rel, active);
+                    process(entries);
+                    active_pages = active.pages.clone();
                 }
 
                 // Skip the rewrite when nothing died and there is nothing to
-                // merge (a single segment is already as compact as it gets).
+                // merge (a single published segment and no active buffer).
                 let current_total: u64 =
                     segment_list.segments.iter().map(|s| s.num_entries).sum();
-                if total_dead == dead_before && segment_list.segments.len() <= 1 {
+                if total_dead == dead_before
+                    && segment_list.segments.len() <= 1
+                    && !active_present
+                {
                     return (current_total, Vec::new());
                 }
 
@@ -92,7 +110,10 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                 // become garbage and are retired for reclamation.
                 let segment = seal_entries(&index_rel, live_entries);
                 let num_entries = segment.num_entries;
-                let segments = if segment.is_empty() {
+                let seg_start = segment.start_page;
+                let seg_blocks = segment.num_blocks;
+                let seg_empty = segment.is_empty();
+                let segments = if seg_empty {
                     Vec::new()
                 } else {
                     vec![segment]
@@ -100,9 +121,15 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                 let segment_list_new = IvfSegmentList::new(segments);
                 let (new_ptr, new_blocks) = segment_list_new.store(&index_rel);
                 // The merged blocks must be on disk before the header swap
-                // becomes visible to smgrreadv scans: flush inside the closure,
-                // i.e. BEFORE the header page itself is rewritten on exit.
-                pg_sys::FlushRelationBuffers(index_rel.as_ptr());
+                // becomes visible to smgrreadv scans: flush only the freshly
+                // written blocks, inside the closure (i.e. BEFORE the header
+                // page itself is rewritten on exit) — a full
+                // FlushRelationBuffers here would try to flush the header page
+                // we hold exclusively and self-deadlock.
+                if !seg_empty {
+                    crate::util::page::flush_block_range(&index_rel, seg_start, seg_blocks);
+                }
+                crate::util::page::flush_block_range(&index_rel, new_ptr.block_number, new_blocks);
 
                 // Retire the old segment-list item and the old segments.
                 // segment_list_blocks == 0 marks the shared empty item used by
@@ -122,14 +149,22 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                         });
                     }
                 }
+                // The merged active buffer's pages are garbage too.
+                for &page in &active_pages {
+                    retired.push(IvfFreeRange {
+                        start_block: page,
+                        num_blocks: 1,
+                    });
+                }
 
                 header.version += 1;
                 header.generation += 1;
                 header.segment_list = new_ptr;
                 header.segment_list_blocks = new_blocks;
-                // NOTE: header.active is left untouched — the active buffer's
-                // unsealed entries are unrelated to the published segments
-                // being merged, and clearing the pointer would orphan them.
+                // The active buffer's entries were just merged into the new
+                // segment, so clearing the pointer now is correct (they are
+                // no longer unreachable — nothing is orphaned).
+                header.active = None;
                 (num_entries, retired)
             })
         };

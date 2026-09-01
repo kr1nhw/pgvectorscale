@@ -192,33 +192,44 @@ impl Deref for LockedBufferShare<'_> {
     }
 }
 
-/// A heavyweight relation lock (lock manager) held for a lexical scope,
-/// released on drop.  Used by the IVF scan's read-burst (ShareLock) protocol:
-/// reclamation takes ExclusiveLock, so it waits for in-flight `smgrreadv`
-/// bursts that bypass the buffer manager.
-pub struct RelationLockGuard {
-    relation: pg_sys::Relation,
-    mode: pg_sys::LOCKMODE,
+/// A transaction-level advisory lock (LOCKTAG_ADVISORY) used by the IVF
+/// read-burst (shared) / reclamation (exclusive) protocol.
+///
+/// It serializes `smgrreadv` bursts against block reuse WITHOUT conflicting
+/// with the executor's relation locks: every INSERT holds RowExclusiveLock on
+/// the index relation for its whole statement, so a relation-level
+/// ShareLock/ExclusiveLock on the index would deadlock between concurrent
+/// inserters (each wanting to upgrade past the other's RowExclusiveLock).
+///
+/// Transaction-level: PostgreSQL releases it automatically at transaction
+/// end, so a mid-burst error can never leak the lock past the transaction.
+pub struct AdvisoryLockGuard {
+    _held: (),
 }
 
-impl RelationLockGuard {
-    pub fn new(relation: pg_sys::Relation, mode: pg_sys::LOCKMODE) -> Self {
+impl AdvisoryLockGuard {
+    /// Acquire the shared (read burst) lock.  Self-compatible: concurrent
+    /// scans do not contend.
+    pub fn acquire_shared(key1: i64, key2: i64) -> Self {
         unsafe {
-            pg_sys::LockRelation(relation, mode);
+            pgrx::direct_function_call::<()>(
+                pg_sys::pg_advisory_xact_lock_shared_int8,
+                &[key1.into_datum(), key2.into_datum()],
+            );
         }
-        Self { relation, mode }
+        Self { _held: () }
     }
-}
 
-impl Drop for RelationLockGuard {
-    fn drop(&mut self) {
-        // Only unlock while in a transaction state; on abort the lock manager
-        // releases everything itself.
-        if unsafe { pgrx::pg_sys::IsTransactionState() } {
-            unsafe {
-                pg_sys::UnlockRelation(self.relation, self.mode);
-            }
+    /// Acquire the exclusive (reclamation) lock: waits for all in-flight read
+    /// bursts before the caller frees/reuses retired blocks.
+    pub fn acquire_exclusive(key1: i64, key2: i64) -> Self {
+        unsafe {
+            pgrx::direct_function_call::<()>(
+                pg_sys::pg_advisory_xact_lock_int8,
+                &[key1.into_datum(), key2.into_datum()],
+            );
         }
+        Self { _held: () }
     }
 }
 

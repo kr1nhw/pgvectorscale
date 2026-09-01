@@ -3,7 +3,7 @@
 
 use pg_sys::Page;
 use pgrx::{
-    pg_sys::{BlockNumber, BufferGetPage, OffsetNumber, BLCKSZ},
+    pg_sys::{BlockNumber, BufferGetPage, OffsetNumber, ReadBufferMode, BLCKSZ},
     *,
 };
 use std::ops::Deref;
@@ -272,6 +272,30 @@ impl Drop for WritablePage<'_> {
                 pg_sys::GenericXLogAbort(self.state);
             };
         }
+    }
+}
+
+/// Flush a contiguous block range of the relation's main fork to the kernel
+/// (only dirty pages are written).  Unlike `FlushRelationBuffers`, this never
+/// touches buffers the caller holds content locks on, so it is safe inside a
+/// header/meta update closure (where `FlushRelationBuffers` would try to flush
+/// the locked page and self-deadlock on its content lock).
+pub unsafe fn flush_block_range(
+    index: &PgRelation,
+    start: pg_sys::BlockNumber,
+    count: u32,
+) {
+    for i in 0..count {
+        let block = start + i as pg_sys::BlockNumber;
+        let buf = pg_sys::ReadBufferExtended(
+            index.as_ptr(),
+            pg_sys::ForkNumber::MAIN_FORKNUM,
+            block,
+            ReadBufferMode::RBM_NORMAL,
+            std::ptr::null_mut(),
+        );
+        pg_sys::FlushOneBuffer(buf);
+        pg_sys::ReleaseBuffer(buf);
     }
 }
 

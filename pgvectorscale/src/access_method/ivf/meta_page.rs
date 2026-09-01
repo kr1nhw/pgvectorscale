@@ -14,9 +14,16 @@ use crate::access_method::distance::DistanceType;
 use crate::access_method::ivf::segment::{IvfFreeList, IvfFreeRange};
 use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::access_method::storage::StorageType;
-use crate::util::buffer::{LockedBufferExclusive, RelationLockGuard};
+use crate::util::buffer::{AdvisoryLockGuard, LockedBufferExclusive};
 use crate::util::page::{self, PageType, ReadablePage, WritablePage};
 use crate::util::*;
+
+/// Advisory-lock keys for the IVF read-burst (shared) / reclamation
+/// (exclusive) protocol.  key1 is a fixed magic so we never collide with
+/// other advisory-lock users; key2 is the index OID.
+pub fn advisory_keys(index: &PgRelation) -> (i64, i64) {
+    (0x4956_4630_i64, u32::from(index.oid()) as i64)
+}
 
 const IVF_MAGIC_NUMBER: u32 = 0x49564600; // "IVF\0"
 const IVF_VERSION: u32 = 2;
@@ -251,7 +258,8 @@ impl IvfMetaPage {
         if ranges.is_empty() {
             return;
         }
-        let _guard = RelationLockGuard::new(index.as_ptr(), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+        let (k1, k2) = advisory_keys(index);
+        let _guard = AdvisoryLockGuard::acquire_exclusive(k1, k2);
         Self::update(index, |meta| {
             let mut list = match meta.get_free_list_pointer() {
                 Some(p) => IvfFreeList::load(index, p),
@@ -280,7 +288,8 @@ impl IvfMetaPage {
         if Self::fetch(index).get_free_list_pointer().is_none() {
             return None;
         }
-        let _guard = RelationLockGuard::new(index.as_ptr(), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+        let (k1, k2) = advisory_keys(index);
+        let _guard = AdvisoryLockGuard::acquire_exclusive(k1, k2);
         Self::update(index, |meta| {
             let mut list = match meta.get_free_list_pointer() {
                 Some(p) => IvfFreeList::load(index, p),
@@ -312,7 +321,8 @@ impl IvfMetaPage {
         if num_blocks == 0 {
             return;
         }
-        let _guard = RelationLockGuard::new(index.as_ptr(), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+        let (k1, k2) = advisory_keys(index);
+        let _guard = AdvisoryLockGuard::acquire_exclusive(k1, k2);
         Self::update(index, |meta| {
             let mut list = match meta.get_free_list_pointer() {
                 Some(p) => IvfFreeList::load(index, p),

@@ -207,7 +207,22 @@ pub unsafe extern "C-unwind" fn ivf_amcostestimate(
 
     // Check if indexinfo is null
     if path_ref.indexinfo.is_null() {
-        warning!("IVF amcostestimate: indexinfo is null");
+        warning!("IVF amcostestimate: path.indexinfo is null");
+        return;
+    }
+
+    // The ivf index only answers ORDER BY (vector distance) searches: without
+    // orderby keys it would return at most ivf.top_k approximate candidates,
+    // which would undercount (e.g. count(*) or plain index-only scans) and may
+    // expose stale TIDs to index-only heap fetches.  Refuse to estimate so the
+    // planner never chooses it for non-ORDER-BY queries.
+    if path_ref.indexorderbys.is_null() || pg_sys::list_length(path_ref.indexorderbys) == 0 {
+        warning!("IVF amcostestimate: no orderby keys, refusing estimate");
+        *index_startup_cost = f64::MAX;
+        *index_total_cost = f64::MAX;
+        *index_selectivity = 1.0;
+        *index_correlation = 0.0;
+        *index_pages = 1.0;
         return;
     }
 
