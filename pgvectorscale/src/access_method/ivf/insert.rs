@@ -11,9 +11,10 @@ use pgrx::*;
 
 use crate::access_method::ivf::centroid_page::IvfCentroidPage;
 use crate::access_method::ivf::entry::{
-    append_active_entry, read_active_entries, seal_blocks_needed, seal_entries,
-    seal_entries_at, IvfEntry,
+    append_active_entry_bytes, read_active_entries, seal_blocks_needed, seal_entries,
+    seal_entries_at, serialize_active_entry, IvfEntry,
 };
+use crate::util::page::ReadablePage;
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::IvfMetaPage;
 use crate::access_method::ivf::options::IVF_SEAL_THRESHOLD;
@@ -102,21 +103,53 @@ pub unsafe extern "C-unwind" fn aminsert(
     let seal_threshold = IVF_SEAL_THRESHOLD.get().max(1) as u64;
     let num_bits = meta.get_bq_num_bits_per_dimension();
     let dim_padded = padded_dim(meta.get_num_dimensions() as usize) as u32;
+    let entry_bytes = serialize_active_entry(entry);
 
     // Peek the active buffer; if this insert will trigger a seal, reserve
     // reclaimed blocks from the free list BEFORE taking the header lock (the
-    // ExclusiveLock must never nest inside the header content lock).  None
-    // falls back to relation extension inside the closure.
-    let active_count = {
+    // advisory-exclusive lock must never nest inside the header content lock).
+    // The same goes for the active buffer's next page when the tail is full.
+    // None falls back to relation extension inside the closure.
+    let (active_count, tail_full) = {
         let peek = IvfListHeader::load(&index_rel, header_ptr);
-        peek.active.map(|a| a.num_entries).unwrap_or(0)
+        let count = peek.active.as_ref().map(|a| a.num_entries).unwrap_or(0);
+        let full = match &peek.active {
+            None => true,
+            Some(a) => {
+                if count >= seal_threshold {
+                    // This insert seals the buffer first, so the entry goes
+                    // into a FRESH buffer and needs a new page regardless of
+                    // the old tail's fill level.
+                    true
+                } else {
+                    let tail = *a.pages.last().expect("active buffer has pages");
+                    let page = ReadablePage::read(&index_rel, tail);
+                    let free = unsafe { pg_sys::PageGetFreeSpace(*page) } as usize;
+                    // Must mirror the closure's get_aligned_free_space() check
+                    // exactly, or the boundary append (free == entry len but
+                    // aligned free < entry len) extends without a reservation.
+                    let aligned = free - free % 8;
+                    aligned < entry_bytes.len()
+                }
+            }
+        };
+        (count, full)
     };
     let mut reserved: Option<(pg_sys::BlockNumber, u32)> = None;
+    let mut reserved_item: Option<pg_sys::BlockNumber> = None;
     if active_count >= seal_threshold {
+        // Two independent reservations: the sealed data blocks and one block
+        // for the new segment-list item.  Keeping them separate lets each
+        // match the fragmented free list (1-block and N-block ranges).
         let need = seal_blocks_needed(active_count as usize, num_bits, dim_padded);
         if let Some(start) = unsafe { IvfMetaPage::allocate_range(&index_rel, need) } {
             reserved = Some((start, need));
         }
+        reserved_item = unsafe { IvfMetaPage::allocate_range(&index_rel, 1) };
+    }
+    let mut reserved_page: Option<pg_sys::BlockNumber> = None;
+    if tail_full {
+        reserved_page = unsafe { IvfMetaPage::allocate_range(&index_rel, 1) };
     }
 
     // What the closure reports back for the post-lock bookkeeping (which needs
@@ -125,6 +158,9 @@ pub unsafe extern "C-unwind" fn aminsert(
         retired: Vec<IvfFreeRange>,
         reserved_used: bool,
         unused_tail: Option<(pg_sys::BlockNumber, u32)>,
+        reserved_page_used: bool,
+        item_block_used: bool,
+        unused_item_block: Option<pg_sys::BlockNumber>,
     }
 
     let outcome = unsafe {
@@ -132,6 +168,8 @@ pub unsafe extern "C-unwind" fn aminsert(
             let mut retired: Vec<IvfFreeRange> = Vec::new();
             let mut reserved_used = false;
             let mut unused_tail = None;
+            let mut reserved_page_used = false;
+            let mut item_block_used = false;
 
             // 1. If the active buffer reached the seal threshold, seal it into
             //    a published segment now (before appending the new entry).
@@ -165,7 +203,16 @@ pub unsafe extern "C-unwind" fn aminsert(
                             IvfSegmentList::load(&index_rel, header.segment_list).segments;
                         segments.push(sealed);
                         let new_sl = IvfSegmentList::new(segments);
-                        let (new_ptr, new_blocks) = new_sl.store(&index_rel);
+                        // Write the new segment-list item into the reserved
+                        // block right after the sealed data when it fits one
+                        // page; otherwise fall back to extension.
+                        let (new_ptr, new_blocks) = match reserved_item {
+                            Some(b) if new_sl.fits_one_page() => {
+                                item_block_used = true;
+                                new_sl.store_at(&index_rel, b)
+                            }
+                            _ => new_sl.store(&index_rel),
+                        };
                         // The old segment-list item and the now-sealed active
                         // buffer pages become garbage; retire them (the old
                         // published segments stay referenced by the new item).
@@ -208,16 +255,27 @@ pub unsafe extern "C-unwind" fn aminsert(
             }
 
             // 2. Append the entry to the (possibly fresh) active buffer.
-            header.active = Some(append_active_entry(
+            let (new_active, page_used) = append_active_entry_bytes(
                 &index_rel,
                 header.active.take(),
-                entry,
-            ));
+                &entry_bytes,
+                reserved_page,
+            );
+            reserved_page_used = page_used;
+            header.active = Some(new_active);
 
+            let unused_item_block = if item_block_used {
+                None
+            } else {
+                reserved_item
+            };
             Outcome {
                 retired,
                 reserved_used,
                 unused_tail,
+                reserved_page_used,
+                item_block_used,
+                unused_item_block,
             }
         })
     };
@@ -232,6 +290,14 @@ pub unsafe extern "C-unwind" fn aminsert(
             } else if let Some((tail_start, tail_blocks)) = outcome.unused_tail {
                 IvfMetaPage::push_back_range(&index_rel, tail_start, tail_blocks);
             }
+        }
+        if let Some(page) = reserved_page {
+            if !outcome.reserved_page_used {
+                IvfMetaPage::push_back_range(&index_rel, page, 1);
+            }
+        }
+        if let Some(block) = outcome.unused_item_block {
+            IvfMetaPage::push_back_range(&index_rel, block, 1);
         }
         IvfMetaPage::reclaim_ranges(&index_rel, outcome.retired);
     }

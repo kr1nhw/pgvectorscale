@@ -41,16 +41,32 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     let mut total_dead = 0u64;
 
     for list_id in 0..list_directory.num_lists() {
-        let header_block = match list_directory.get_list(list_id as u16) {
-            Some(m) if m.header.is_valid() => m.header.block_number,
+        let header_ptr = match list_directory.get_list(list_id as u16) {
+            Some(m) if m.header.is_valid() => m.header,
             _ => continue,
+        };
+        let header_block = header_ptr.block_number;
+
+        // Optimistically reserve a reclaimed block for the new segment-list
+        // item when this list looks like it will be rewritten (multiple
+        // segments or an active buffer).  The advisory-exclusive lock must
+        // not nest inside the header lock, so the reservation happens here.
+        let peek_rewrite = {
+            let peek = IvfListHeader::load(&index_rel, header_ptr);
+            let segs = IvfSegmentList::load(&index_rel, peek.segment_list).segments.len();
+            segs > 1 || peek.active.is_some()
+        };
+        let reserved_item: Option<pg_sys::BlockNumber> = if peek_rewrite {
+            unsafe { IvfMetaPage::allocate_range(&index_rel, 1) }
+        } else {
+            None
         };
 
         // Read-modify-write under the header's exclusive content lock so a
         // concurrent insert's seal cannot be clobbered (the header is always
         // re-parsed under the lock before publishing).
         let dead_before = total_dead;
-        let (num_entries, retired) = unsafe {
+        let (num_entries, retired, item_used, unused_item) = unsafe {
             IvfListHeader::update(&index_rel, header_block, |header| {
                 let segment_list = IvfSegmentList::load(&index_rel, header.segment_list);
 
@@ -102,7 +118,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                     && segment_list.segments.len() <= 1
                     && !active_present
                 {
-                    return (current_total, Vec::new());
+                    return (current_total, Vec::new(), false, reserved_item);
                 }
 
                 // Seal the survivors into one merged segment and swap the
@@ -119,7 +135,14 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                     vec![segment]
                 };
                 let segment_list_new = IvfSegmentList::new(segments);
-                let (new_ptr, new_blocks) = segment_list_new.store(&index_rel);
+                let mut item_used = false;
+                let (new_ptr, new_blocks) = match reserved_item {
+                    Some(b) if segment_list_new.fits_one_page() => {
+                        item_used = true;
+                        segment_list_new.store_at(&index_rel, b)
+                    }
+                    _ => segment_list_new.store(&index_rel),
+                };
                 // The merged blocks must be on disk before the header swap
                 // becomes visible to smgrreadv scans: flush only the freshly
                 // written blocks, inside the closure (i.e. BEFORE the header
@@ -165,13 +188,21 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                 // segment, so clearing the pointer now is correct (they are
                 // no longer unreachable — nothing is orphaned).
                 header.active = None;
-                (num_entries, retired)
+                (
+                    num_entries,
+                    retired,
+                    item_used,
+                    if item_used { None } else { reserved_item },
+                )
             })
         };
 
         // Reclaim under the ExclusiveLock only AFTER the header lock was
         // released (the ExclusiveLock must never nest inside it).
         unsafe {
+            if let Some(block) = unused_item {
+                IvfMetaPage::push_back_range(&index_rel, block, 1);
+            }
             IvfMetaPage::reclaim_ranges(&index_rel, retired);
         }
 

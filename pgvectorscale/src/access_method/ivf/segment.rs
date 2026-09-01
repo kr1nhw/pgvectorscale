@@ -102,6 +102,23 @@ impl IvfSegmentList {
         tape.write_counted(&self.serialize_to_vec())
     }
 
+    /// Write the item into a single reserved block (reclaimed block),
+    /// returning its pointer and block count (always 1).
+    pub unsafe fn store_at(&self, index: &PgRelation, block: BlockNumber) -> (ItemPointer, u32) {
+        let mut stats = crate::access_method::stats::WriteStats::default();
+        let mut tape = ChainTapeWriter::reinit(index, PageType::IvfSegmentList, &mut stats, block);
+        let (ptr, blocks) = tape.write_counted(&self.serialize_to_vec());
+        assert_eq!(blocks, 1, "segment-list item must fit one page");
+        (ptr, blocks)
+    }
+
+    /// Whether the serialized item fits a single page (for the reserved-block
+    /// path; callers fall back to `store` — relation extension — otherwise).
+    pub fn fits_one_page(&self) -> bool {
+        let bytes = self.serialize_to_vec();
+        bytes.len() < crate::util::page::tsv_fresh_page_capacity()
+    }
+
     /// Load a segment-list item from the given pointer.
     pub fn load(index: &PgRelation, pointer: ItemPointer) -> IvfSegmentList {
         unsafe {
@@ -141,11 +158,15 @@ impl IvfFreeList {
         Self { ranges: Vec::new() }
     }
 
-    pub unsafe fn store(&self, index: &PgRelation) -> ItemPointer {
+    /// Write a fresh free-list item, returning its pointer and the number of
+    /// contiguous blocks it occupies (so the previous item's blocks can be
+    /// retired into the new item).  The extension lock is held across the
+    /// write so the chain's pages are contiguous.
+    pub unsafe fn store_counted(&self, index: &PgRelation) -> (ItemPointer, u32) {
         let _ext_lock = crate::util::buffer::LockRelationForExtension::new(index);
         let mut stats = crate::access_method::stats::WriteStats::default();
         let mut tape = ChainTapeWriter::new(index, PageType::IvfFreeList, &mut stats);
-        tape.write(&self.serialize_to_vec())
+        tape.write_counted(&self.serialize_to_vec())
     }
 
     pub fn load(index: &PgRelation, pointer: ItemPointer) -> IvfFreeList {
@@ -158,7 +179,7 @@ impl IvfFreeList {
                 buf.extend_from_slice(item.get_data_slice());
             }
             rkyv::from_bytes::<IvfFreeList>(&buf)
-                .unwrap_or_else(|e| panic!("IVF: free-list parse failed: {:?}", e))
+                .unwrap_or_else(|e| panic!("IVF: free-list parse failed ({} bytes): {:?}", buf.len(), e))
         }
     }
 }

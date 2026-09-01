@@ -140,6 +140,7 @@ impl<'a> WritablePage<'a> {
     /// new creates a totally new page on a relation by extending the relation
     pub fn new(index: &'a PgRelation, page_type: PageType) -> Self {
         let buffer = LockedBufferExclusive::new(index);
+
         unsafe {
             let state = pg_sys::GenericXLogStart(index.as_ptr());
             //TODO do we need a GENERIC_XLOG_FULL_IMAGE option?

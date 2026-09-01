@@ -433,40 +433,65 @@ pub fn serialize_active_entry(entry: IvfEntry) -> Vec<u8> {
     rkyv::to_bytes::<_, 256>(&active).unwrap().to_vec()
 }
 
-/// Append one entry to the active buffer's tail page, extending it with a new
-/// page when the tail is full.  Returns the updated active buffer.
-pub fn append_active_entry(
+/// Append one entry's serialized bytes to the active buffer's tail page,
+/// reusing `reserved_page` (a reclaimed block) when the tail is full or no
+/// buffer exists yet.  Returns the updated active buffer and whether the
+/// reserved page was consumed.
+pub fn append_active_entry_bytes(
     index: &PgRelation,
     active: Option<IvfActiveBuffer>,
-    entry: IvfEntry,
-) -> IvfActiveBuffer {
-    let bytes = serialize_active_entry(entry);
+    bytes: &[u8],
+    reserved_page: Option<BlockNumber>,
+) -> (IvfActiveBuffer, bool) {
+    let commit_new = |block: BlockNumber, bytes: &[u8]| {
+        let mut new_page = WritablePage::modify(index, block);
+        new_page.reinit(PageType::IvfActiveBuffer);
+        new_page.add_item(bytes);
+        new_page.commit();
+    };
     match active {
         Some(mut a) => {
             let tail_block = *a.pages.last().expect("active buffer has pages");
             let mut tail = WritablePage::modify(index, tail_block);
             if tail.get_aligned_free_space() >= bytes.len() {
-                tail.add_item(&bytes);
+                tail.add_item(bytes);
                 tail.commit();
                 a.num_entries += 1;
+                (a, false)
             } else {
                 drop(tail); // abort: no changes to the full tail page
+                match reserved_page {
+                    Some(block) => {
+                        commit_new(block, bytes);
+                        a.pages.push(block);
+                        a.num_entries += 1;
+                        (a, true)
+                    }
+                    None => {
+                        let mut new_page = WritablePage::new(index, PageType::IvfActiveBuffer);
+                        let block = new_page.get_block_number();
+                        new_page.add_item(bytes);
+                        new_page.commit();
+                        a.pages.push(block);
+                        a.num_entries += 1;
+                        (a, false)
+                    }
+                }
+            }
+        }
+        None => match reserved_page {
+            Some(block) => {
+                commit_new(block, bytes);
+                (IvfActiveBuffer::new(block), true)
+            }
+            None => {
                 let mut new_page = WritablePage::new(index, PageType::IvfActiveBuffer);
                 let block = new_page.get_block_number();
-                new_page.add_item(&bytes);
+                new_page.add_item(bytes);
                 new_page.commit();
-                a.pages.push(block);
-                a.num_entries += 1;
+                (IvfActiveBuffer::new(block), false)
             }
-            a
-        }
-        None => {
-            let mut new_page = WritablePage::new(index, PageType::IvfActiveBuffer);
-            let block = new_page.get_block_number();
-            new_page.add_item(&bytes);
-            new_page.commit();
-            IvfActiveBuffer::new(block)
-        }
+        },
     }
 }
 

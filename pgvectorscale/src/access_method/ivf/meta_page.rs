@@ -15,6 +15,7 @@ use crate::access_method::ivf::segment::{IvfFreeList, IvfFreeRange};
 use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::access_method::storage::StorageType;
 use crate::util::buffer::{AdvisoryLockGuard, LockedBufferExclusive};
+use crate::util::chain::ChainTapeWriter;
 use crate::util::page::{self, PageType, ReadablePage, WritablePage};
 use crate::util::*;
 
@@ -63,6 +64,9 @@ pub struct IvfMetaPage {
     /// Pointer to the free block list (chained item; writer-only, accessed
     /// under the relation ExclusiveLock).
     free_list: ItemPointer,
+    /// Number of contiguous blocks the free-list item occupies (0 = unknown /
+    /// not retireable).
+    free_list_blocks: u32,
     /// Monotonic generation counter (bumped on compaction; used by reclamation).
     generation: u64,
 }
@@ -154,6 +158,11 @@ impl IvfMetaPage {
         }
     }
 
+    /// Get the free-list item's block count (0 = unknown).
+    pub fn get_free_list_blocks(&self) -> u32 {
+        self.free_list_blocks
+    }
+
     /// Create a new IVF meta page and write it to block 0 of the index.
     pub unsafe fn create(
         index: &PgRelation,
@@ -180,6 +189,7 @@ impl IvfMetaPage {
             list_directory_pointer: ItemPointer::new_invalid(),
             quantizer_metadata: ItemPointer::new_invalid(),
             free_list: ItemPointer::new_invalid(),
+            free_list_blocks: 0,
             generation: 0,
         };
 
@@ -248,6 +258,48 @@ impl IvfMetaPage {
         result
     }
 
+    /// Republish the free list, rewriting the previous item IN PLACE.
+    ///
+    /// The free list is only ever read under the advisory-exclusive lock (no
+    /// scan walks it), so rewriting the previous item's first block in place
+    /// cannot tear a reader, and the per-update block churn disappears.  If
+    /// the item outgrows the previous chain, the extra pages extend the
+    /// relation; a shrunk chain leaks its leftover tail pages (rare, bounded).
+    unsafe fn republish_free_list(index: &PgRelation, list: &IvfFreeList, meta: &mut IvfMetaPage) {
+        // Coalesce adjacent ranges so the list does not fragment into
+        // 1-block runs that can never satisfy multi-block reservations.
+        let mut sorted: Vec<IvfFreeRange> = list.ranges.clone();
+        sorted.sort_unstable_by_key(|r| r.start_block);
+        let mut coalesced: Vec<IvfFreeRange> = Vec::with_capacity(sorted.len());
+        for r in sorted {
+            match coalesced.last_mut() {
+                Some(last)
+                    if last.start_block + last.num_blocks as pg_sys::BlockNumber
+                        == r.start_block =>
+                {
+                    last.num_blocks += r.num_blocks;
+                }
+                _ => coalesced.push(r),
+            }
+        }
+        let list = IvfFreeList { ranges: coalesced };
+        let bytes = list.serialize_to_vec();
+        let mut stats = crate::access_method::stats::WriteStats::default();
+        let (ptr, blocks) = match meta.get_free_list_pointer() {
+            Some(old_ptr) => {
+                let mut tape =
+                    ChainTapeWriter::reinit(index, PageType::IvfFreeList, &mut stats, old_ptr.block_number);
+                tape.write_counted(&bytes)
+            }
+            None => {
+                let mut tape = ChainTapeWriter::new(index, PageType::IvfFreeList, &mut stats);
+                tape.write_counted(&bytes)
+            }
+        };
+        meta.free_list = ptr;
+        meta.free_list_blocks = blocks;
+    }
+
     /// Append retired block ranges to the free list.
     ///
     /// Takes the relation ExclusiveLock: scans hold ShareLock for the duration
@@ -267,7 +319,7 @@ impl IvfMetaPage {
                 None => IvfFreeList::new(),
             };
             list.ranges.extend(ranges);
-            meta.free_list = list.store(index);
+            Self::republish_free_list(index, &list, meta);
         });
     }
 
@@ -307,7 +359,7 @@ impl IvfMetaPage {
                     });
                 }
                 found = Some(range.start_block);
-                meta.free_list = list.store(index);
+                Self::republish_free_list(index, &list, meta);
             }
             found
         })
@@ -333,7 +385,7 @@ impl IvfMetaPage {
                 start_block,
                 num_blocks,
             });
-            meta.free_list = list.store(index);
+            Self::republish_free_list(index, &list, meta);
         });
     }
 }
