@@ -611,7 +611,20 @@ impl<'a> IvfEntryReader<'a> {
             // first).  Fall back to opening it if not.
             let reln = (*rel).rd_smgr;
             let reln = if reln.is_null() {
-                pg_sys::smgropen((*rel).rd_locator, (*rel).rd_backend)
+                // Neon's fork extends `smgropen` with a `relpersistence`
+                // argument; vanilla PostgreSQL does not.
+                #[cfg(feature = "neon")]
+                {
+                    pg_sys::smgropen(
+                        (*rel).rd_locator,
+                        (*rel).rd_backend,
+                        (*(*rel).rd_rel).relpersistence,
+                    )
+                }
+                #[cfg(not(feature = "neon"))]
+                {
+                    pg_sys::smgropen((*rel).rd_locator, (*rel).rd_backend)
+                }
             } else {
                 reln
             };

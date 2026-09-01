@@ -19,6 +19,10 @@ pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = []
 build_parallel = []
+# Build against Neon's PostgreSQL fork, which has a modified smgr ABI
+# (`smgropen` takes an extra `relpersistence` argument) and a different
+# `FMGR_ABI_EXTRA` (requires `pgrx/unsafe-postgres`).
+neon = []
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = [
