@@ -96,6 +96,7 @@ pub static IVF_PROBES: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(1);
 pub static IVF_ITERATIVE_SCAN: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
 pub static IVF_MAX_PROBES: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(32768);
 pub static IVF_TOP_K: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(1000);
+pub static IVF_SEAL_THRESHOLD: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(4096);
 
 static mut RELOPT_KIND_IVF: pg_sys::relopt_kind::Type = 0;
 
@@ -173,6 +174,29 @@ pub unsafe fn init() {
             )
         },
         &IVF_TOP_K,
+        1,
+        1_000_000,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("ivf.seal_threshold".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Entries accumulated in a list's active buffer before it is sealed"
+                    .as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "The append buffer is sealed into an immutable segment when it reaches this \
+                 many entries. Higher values amortize sealing but keep more rows invisible to \
+                 scans until the next seal."
+                    .as_pg_cstr(),
+            )
+        },
+        &IVF_SEAL_THRESHOLD,
         1,
         1_000_000,
         pgrx::GucContext::Userset,

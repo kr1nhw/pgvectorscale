@@ -1,11 +1,22 @@
 //! IVF index insert implementation.
+//!
+//! Insert is O(1) amortized: the entry is appended to the list's unpublished
+//! active buffer (row-major items, one `PageAddItem` per entry), and the
+//! buffer is sealed into an immutable SoA segment once it reaches
+//! `ivf.seal_threshold`.  The list header's exclusive content lock is held for
+//! the whole append, serializing appenders to the same list and excluding
+//! concurrent compaction.
 
 use pgrx::*;
 
 use crate::access_method::ivf::centroid_page::IvfCentroidPage;
-use crate::access_method::ivf::entry::{IvfEntry, IvfEntryReader, IvfEntryWriter};
+use crate::access_method::ivf::entry::{
+    append_active_entry, read_active_entries, seal_entries, IvfEntry,
+};
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::IvfMetaPage;
+use crate::access_method::ivf::options::IVF_SEAL_THRESHOLD;
+use crate::access_method::ivf::segment::{IvfListHeader, IvfSegmentList};
 use crate::access_method::ivf::simd::find_nearest_centroids;
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::access_method::quantization::rabitq::RabitqQuantizer;
@@ -14,7 +25,7 @@ use crate::util::ItemPointer;
 /// Insert a tuple into the IVF index.
 ///
 /// Finds the nearest centroid, quantizes the vector relative to it, and
-/// appends the entry to that inverted list (rewriting the list's entry chain).
+/// appends the entry to that list's active buffer (sealing on threshold).
 #[pg_guard]
 pub unsafe extern "C-unwind" fn aminsert(
     index: pg_sys::Relation,
@@ -37,7 +48,7 @@ pub unsafe extern "C-unwind" fn aminsert(
         Some(p) => IvfCentroidPage::load(&index_rel, p),
         None => IvfCentroidPage::new(Vec::new()),
     };
-    let mut list_directory = IvfListDirectory::load(&index_rel);
+    let list_directory = IvfListDirectory::load(&index_rel);
 
     // Extract the vector.
     let datum = *values;
@@ -78,39 +89,63 @@ pub unsafe extern "C-unwind" fn aminsert(
     let code = quantizer.quantize_residual(centroid, &vector);
     let entry = IvfEntry::new(ItemPointer::with_item_pointer_data(*heap_tid), code);
 
-    // Append the entry to the list: read existing entries, push the new one,
-    // and rewrite the list as a contiguous entry block run.
-    let reader = IvfEntryReader::new(&index_rel);
-    let (start_page, num_blocks) = list_directory
+    // Append the entry to the list's unpublished active buffer, sealing it
+    // into an immutable segment when it reaches ivf.seal_threshold.  The
+    // header's exclusive content lock is held for the whole operation,
+    // serializing appenders to this list and excluding concurrent compaction
+    // (so no published segment is ever lost or torn).
+    let Some(header_block) = list_directory
         .get_list(list_id)
-        .map(|m| (m.start_page, m.num_blocks))
-        .unwrap_or((pg_sys::InvalidBlockNumber, 0));
-    let mut entries = if start_page != pg_sys::InvalidBlockNumber && num_blocks > 0 {
-        reader.read_entries(start_page, num_blocks)
-    } else {
-        Vec::new()
+        .map(|m| m.header.block_number)
+    else {
+        return false;
     };
-    entries.push(entry);
-
-    let mut writer = IvfEntryWriter::new(&index_rel, list_id);
-    for e in &entries {
-        writer.add_entry(e.clone());
-    }
-    let (start_page, num_blocks, count) = writer.finish();
-
-    if let Some(list_meta) = list_directory.get_list_mut(list_id) {
-        list_meta.start_page = start_page.unwrap_or(pg_sys::InvalidBlockNumber);
-        list_meta.num_blocks = num_blocks;
-        list_meta.insert_page = list_meta.start_page;
-        list_meta.num_tuples = count as u64;
-    }
-
+    let seal_threshold = IVF_SEAL_THRESHOLD.get().max(1) as u64;
     unsafe {
-        list_directory.store(&index_rel, false);
-        // The scan bulk-reads entry blocks via smgr (bypassing shared_buffers),
-        // so flush the newly written blocks to disk before they are visible.
-        pg_sys::FlushRelationBuffers(index);
-    }
+        IvfListHeader::update(&index_rel, header_block, |header| {
+            // 1. If the active buffer reached the seal threshold, seal it into
+            //    a published segment now (before appending the new entry).
+            if let Some(active) = header.active.as_ref() {
+                if active.num_entries >= seal_threshold {
+                    let entries = read_active_entries(&index_rel, active);
+                    let sealed = seal_entries(&index_rel, entries);
+                    if !sealed.is_empty() {
+                        let mut segments =
+                            IvfSegmentList::load(&index_rel, header.segment_list).segments;
+                        segments.push(sealed);
+                        let new_sl = IvfSegmentList::new(segments);
+                        let (new_ptr, new_blocks) = new_sl.store(&index_rel);
+                        // The old segment-list item becomes garbage; retire it
+                        // (the old segments stay referenced by the new item).
+                        crate::access_method::ivf::meta_page::IvfMetaPage::retire_ranges(
+                            &index_rel,
+                            vec![crate::access_method::ivf::segment::IvfRetiredRange {
+                                start_block: header.segment_list.block_number,
+                                num_blocks: header.segment_list_blocks,
+                                retired_generation: header.generation,
+                            }],
+                        );
+                        header.segment_list = new_ptr;
+                        header.segment_list_blocks = new_blocks;
+                        header.version += 1;
+                        // The sealed blocks must be on disk before the header
+                        // swap becomes visible to smgrreadv scans.  Flush
+                        // inside the closure — i.e. BEFORE the header page
+                        // itself is rewritten on update() exit.
+                        pg_sys::FlushRelationBuffers(index_rel.as_ptr());
+                    }
+                    header.active = None;
+                }
+            }
+
+            // 2. Append the entry to the (possibly fresh) active buffer.
+            header.active = Some(append_active_entry(
+                &index_rel,
+                header.active.take(),
+                entry,
+            ));
+        })
+    };
 
     false
 }

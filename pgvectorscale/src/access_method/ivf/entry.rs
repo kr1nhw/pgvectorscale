@@ -10,10 +10,12 @@
 
 use pgrx::pg_sys::BlockNumber;
 use pgrx::*;
+use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::access_method::quantization::rabitq::RabitqVector;
-use crate::util::page::{PageType, WritablePage};
-use crate::util::ports::{PageGetItem, PageGetItemId};
+use crate::access_method::ivf::segment::{IvfActiveBuffer, IvfSegment};
+use crate::util::page::{PageType, ReadablePage, WritablePage};
+use crate::util::ports::{PageGetItem, PageGetItemId, PageGetMaxOffsetNumber};
 use crate::util::*;
 
 /// Magic for the SoA entry byte stream.
@@ -301,6 +303,10 @@ impl<'a> IvfEntryWriter<'a> {
     ///
     /// The serialized SoA bytes are written across a contiguous run of pages
     /// (one item per page), so the scan can bulk-read them with `smgrreadv`.
+    /// The relation extension lock is held across the whole run, so concurrent
+    /// extension by other lists cannot interleave blocks into the middle of
+    /// the segment (reentrant within a backend, so the per-page
+    /// `WritablePage::new` calls below just bump the count).
     pub fn finish(self) -> (Option<BlockNumber>, u32, usize) {
         let total_entries = self.entries.len();
         if total_entries == 0 {
@@ -309,6 +315,8 @@ impl<'a> IvfEntryWriter<'a> {
 
         let _ = self.list_id;
         let bytes = serialize_entries(&self.entries);
+
+        let _ext_lock = crate::util::buffer::LockRelationForExtension::new(self.index);
 
         let mut page = WritablePage::new(self.index, PageType::IvfEntry);
         let first_block = page.get_block_number();
@@ -328,6 +336,116 @@ impl<'a> IvfEntryWriter<'a> {
         }
         (Some(first_block), num_blocks, total_entries)
     }
+}
+
+/// Seal `entries` into one immutable SoA segment (a contiguous run of blocks
+/// holding a single serialized byte stream).  `entries` is consumed.
+pub fn seal_entries(index: &PgRelation, entries: Vec<IvfEntry>) -> IvfSegment {
+    let mut writer = IvfEntryWriter::new(index, 0);
+    for e in entries {
+        writer.add_entry(e);
+    }
+    let (start_page, num_blocks, count) = writer.finish();
+    IvfSegment::new(
+        start_page.unwrap_or(pg_sys::InvalidBlockNumber),
+        num_blocks,
+        count as u64,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Active (append) buffer: the unpublished, writer-only staging area.
+//
+// Entries are stored row-major, one rkyv `ActiveEntry` item per `PageAddItem`,
+// so appends never touch previously written bytes.  1-bit codes stay
+// row-major here; `seal_entries` transposes them when the buffer is sealed
+// into an immutable SoA segment.  Readers (scans) never look at these pages.
+// ---------------------------------------------------------------------------
+
+/// A single entry in the unpublished active buffer (row-major rkyv item).
+#[derive(Clone, Debug, PartialEq, Archive, Deserialize, Serialize)]
+#[archive(check_bytes)]
+pub struct ActiveEntry {
+    pub heap_tid: ItemPointer,
+    pub code: RabitqVector,
+}
+
+/// Serialize one entry into its active-buffer item bytes.  The entry is
+/// consumed.  (Requires each entry to fit a page; 8-bit codes for dims near
+/// the vector-type maximum would not — same limit as the sealed path's items.)
+pub fn serialize_active_entry(entry: IvfEntry) -> Vec<u8> {
+    let active = ActiveEntry {
+        heap_tid: entry.heap_tid,
+        code: entry.code,
+    };
+    rkyv::to_bytes::<_, 256>(&active).unwrap().to_vec()
+}
+
+/// Append one entry to the active buffer's tail page, extending it with a new
+/// page when the tail is full.  Returns the updated active buffer.
+pub fn append_active_entry(
+    index: &PgRelation,
+    active: Option<IvfActiveBuffer>,
+    entry: IvfEntry,
+) -> IvfActiveBuffer {
+    let bytes = serialize_active_entry(entry);
+    match active {
+        Some(mut a) => {
+            let tail_block = *a.pages.last().expect("active buffer has pages");
+            let mut tail = WritablePage::modify(index, tail_block);
+            if tail.get_aligned_free_space() >= bytes.len() {
+                tail.add_item(&bytes);
+                tail.commit();
+                a.num_entries += 1;
+            } else {
+                drop(tail); // abort: no changes to the full tail page
+                let mut new_page = WritablePage::new(index, PageType::IvfActiveBuffer);
+                let block = new_page.get_block_number();
+                new_page.add_item(&bytes);
+                new_page.commit();
+                a.pages.push(block);
+                a.num_entries += 1;
+            }
+            a
+        }
+        None => {
+            let mut new_page = WritablePage::new(index, PageType::IvfActiveBuffer);
+            let block = new_page.get_block_number();
+            new_page.add_item(&bytes);
+            new_page.commit();
+            IvfActiveBuffer::new(block)
+        }
+    }
+}
+
+/// Read all entries of the active buffer back (used at seal time, while the
+/// list header's exclusive lock excludes concurrent appenders).  Pages are
+/// followed explicitly: unlike sealed segments, the active buffer's blocks are
+/// not guaranteed contiguous.
+pub fn read_active_entries(index: &PgRelation, active: &IvfActiveBuffer) -> Vec<IvfEntry> {
+    let mut out = Vec::with_capacity(active.num_entries as usize);
+    unsafe {
+        for &block in &active.pages {
+            let page = ReadablePage::read(index, block);
+            let page_ptr = *page;
+            let max = PageGetMaxOffsetNumber(page_ptr);
+            for off in 1..=max as pg_sys::OffsetNumber {
+                let item_id = PageGetItemId(page_ptr, off);
+                if (*item_id).lp_len() == 0 {
+                    continue; // unused line pointer
+                }
+                let item = PageGetItem(page_ptr, item_id);
+                let len = (*item_id).lp_len() as usize;
+                let bytes = std::slice::from_raw_parts(item as *const u8, len);
+                let entry: ActiveEntry = rkyv::from_bytes(bytes).unwrap();
+                out.push(IvfEntry {
+                    heap_tid: entry.heap_tid,
+                    code: entry.code,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Reader for IVF entry pages.

@@ -1,47 +1,37 @@
 //! IVF index metadata management.
 //!
 //! The IVF meta page (Page 0) stores global index metadata including pointers
-//! to centroids, list directory, and quantizer metadata.
+//! to centroids, list directory, and quantizer metadata.  It is a single-item
+//! page (item at offset 1) so it can be updated atomically under its buffer
+//! content lock via [`IvfMetaPage::update`].
 
-use pgrx::pg_sys::{InvalidBlockNumber, InvalidOffsetNumber};
 use pgrx::*;
 use pgvectorscale_derive::{Readable, Writeable};
 use rkyv::{Archive, Deserialize, Serialize};
 use semver::Version;
 
 use crate::access_method::distance::DistanceType;
+use crate::access_method::ivf::segment::{IvfRetiredList, IvfRetiredRange};
 use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::access_method::storage::StorageType;
-use crate::util::chain::{ChainItemReader, ChainTapeWriter};
-use crate::util::page::{self, PageType};
+use crate::util::buffer::LockedBufferExclusive;
+use crate::util::page::{self, PageType, ReadablePage, WritablePage};
 use crate::util::*;
 
 const IVF_MAGIC_NUMBER: u32 = 0x49564600; // "IVF\0"
-const IVF_VERSION: u32 = 1;
+const IVF_VERSION: u32 = 2;
 
 const META_BLOCK_NUMBER: pg_sys::BlockNumber = 0;
-const META_HEADER_OFFSET: pgrx::pg_sys::OffsetNumber = 1;
-const META_OFFSET: pgrx::pg_sys::OffsetNumber = 2;
-
-/// IVF metadata header. Contains magic number and version for sanity checks.
-/// Stored at offset 1 in the meta page.
-#[derive(Clone, PartialEq, Archive, Deserialize, Serialize, Readable, Writeable)]
-#[archive(check_bytes)]
-pub struct IvfMetaPageHeader {
-    /// Magic number for identifying IVF index
-    magic_number: u32,
-    /// Version number for future-proofing
-    version: u32,
-}
+const META_OFFSET: pgrx::pg_sys::OffsetNumber = 1;
 
 /// IVF metadata about the entire index.
-/// Stored at offset 2 in the meta page (Page 0).
+/// Stored as the only item of the meta page (Page 0).
 #[derive(Clone, Debug, PartialEq, Archive, Deserialize, Serialize, Readable, Writeable)]
 #[archive(check_bytes)]
 pub struct IvfMetaPage {
-    /// Magic number from header for sanity check
+    /// Magic number for sanity check
     magic_number: u32,
-    /// Version number from header for sanity check
+    /// Version number for future-proofing
     version: u32,
     /// Version of the extension when the index was built
     extension_version_when_built: String,
@@ -57,12 +47,16 @@ pub struct IvfMetaPage {
     bq_num_bits_per_dimension: u8,
     /// Rotation seed for RaBitQ (deterministic random rotation).
     rotation_seed: u64,
-    /// Pointer to centroids page (Page 2)
+    /// Pointer to centroids page
     centroids_pointer: ItemPointer,
     /// Pointer to list directory page (Page 1)
     list_directory_pointer: ItemPointer,
-    /// Pointer to quantizer metadata page (Page 3)
+    /// Pointer to quantizer metadata page
     quantizer_metadata: ItemPointer,
+    /// Pointer to the pending-reclamation list (chained item; writer-only).
+    retired_list: ItemPointer,
+    /// Monotonic generation counter (bumped on compaction; used by reclamation).
+    generation: u64,
 }
 
 impl IvfMetaPage {
@@ -123,6 +117,11 @@ impl IvfMetaPage {
         }
     }
 
+    /// Get the reclamation generation counter.
+    pub fn get_generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Set pointer to centroids page.
     pub fn set_centroids_pointer(&mut self, pointer: ItemPointer) {
         self.centroids_pointer = pointer;
@@ -138,7 +137,16 @@ impl IvfMetaPage {
         self.quantizer_metadata = pointer;
     }
 
-    /// Create a new IVF meta page and write it to the index.
+    /// Get the pending-reclamation list pointer.
+    pub fn get_retired_list_pointer(&self) -> Option<ItemPointer> {
+        if self.retired_list.is_valid() {
+            Some(self.retired_list)
+        } else {
+            None
+        }
+    }
+
+    /// Create a new IVF meta page and write it to block 0 of the index.
     pub unsafe fn create(
         index: &PgRelation,
         num_dimensions: u32,
@@ -160,54 +168,46 @@ impl IvfMetaPage {
             lists,
             bq_num_bits_per_dimension,
             rotation_seed,
-            centroids_pointer: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
-            list_directory_pointer: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
-            quantizer_metadata: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
+            centroids_pointer: ItemPointer::new_invalid(),
+            list_directory_pointer: ItemPointer::new_invalid(),
+            quantizer_metadata: ItemPointer::new_invalid(),
+            retired_list: ItemPointer::new_invalid(),
+            generation: 0,
         };
 
         meta.store(index, true);
         meta
     }
 
-    /// Write the meta page to the index.
+    /// Write the meta page to the index.  `first_time` writes a fresh page at
+    /// block 0; otherwise the existing page is rewritten in place.
     pub unsafe fn store(&self, index: &PgRelation, first_time: bool) {
-        let header = IvfMetaPageHeader {
-            magic_number: self.magic_number,
-            version: self.version,
-        };
+        assert_eq!(self.magic_number, IVF_MAGIC_NUMBER);
+        assert_eq!(self.version, IVF_VERSION);
 
-        assert_eq!(header.magic_number, IVF_MAGIC_NUMBER);
-        assert_eq!(header.version, IVF_VERSION);
-
-        let mut stats = crate::access_method::stats::WriteStats::default();
-        let mut tape = if first_time {
-            ChainTapeWriter::new(index, PageType::IvfMeta, &mut stats)
-        } else {
-            ChainTapeWriter::reinit(index, PageType::IvfMeta, &mut stats, META_BLOCK_NUMBER)
-        };
-
-        // Serialize the header
-        let bytes = header.serialize_to_vec();
-        let off = tape.write(&bytes);
-        assert_eq!(off, ItemPointer::new(META_BLOCK_NUMBER, META_HEADER_OFFSET));
-
-        // Serialize the meta
         let bytes = self.serialize_to_vec();
-        let off = tape.write(&bytes);
-        assert_eq!(off, ItemPointer::new(META_BLOCK_NUMBER, META_OFFSET));
+        if first_time {
+            let mut page = WritablePage::new(index, PageType::IvfMeta);
+            let block = page.get_block_number();
+            let off = page.add_item(&bytes);
+            page.commit();
+            assert_eq!(block, META_BLOCK_NUMBER, "meta page must be block 0");
+            assert_eq!(off, META_OFFSET);
+        } else {
+            let mut page = WritablePage::modify(index, META_BLOCK_NUMBER);
+            page.reinit(PageType::IvfMeta);
+            page.add_item(&bytes);
+            page.commit();
+        }
     }
 
     /// Read the meta page from the index.
     pub fn fetch(index: &PgRelation) -> IvfMetaPage {
         unsafe {
-            let mut stats = crate::access_method::stats::WriteStats::default();
-            let mut tape = ChainItemReader::new(index, PageType::IvfMeta, &mut stats);
-
-            let mut buf: Vec<u8> = Vec::new();
-            for item in tape.read(ItemPointer::new(META_BLOCK_NUMBER, META_OFFSET)) {
-                buf.extend_from_slice(item.get_data_slice());
-            }
-            let result = rkyv::from_bytes::<IvfMetaPage>(&buf).unwrap();
+            let page = ReadablePage::read(index, META_BLOCK_NUMBER);
+            assert!(page.get_type() == PageType::IvfMeta);
+            let item = page.get_item_unchecked(META_OFFSET);
+            let result = rkyv::from_bytes::<IvfMetaPage>(item.get_data_slice()).unwrap();
 
             // Verify magic number and version
             assert_eq!(result.magic_number, IVF_MAGIC_NUMBER);
@@ -215,5 +215,44 @@ impl IvfMetaPage {
 
             result
         }
+    }
+
+    /// Read-modify-write the meta page under its exclusive content lock.  The
+    /// closure receives the current meta (parsed under the lock) and may do
+    /// arbitrary work (e.g. appending to the retired list); the page is
+    /// rewritten in place (WAL-logged) after the closure returns.
+    pub unsafe fn update<R, F: FnOnce(&mut IvfMetaPage) -> R>(index: &PgRelation, f: F) -> R {
+        let buffer = LockedBufferExclusive::read(index, META_BLOCK_NUMBER);
+        let page = pg_sys::BufferGetPage(**&buffer);
+        let item_id = crate::util::ports::PageGetItemId(page, META_OFFSET);
+        let item = crate::util::ports::PageGetItem(page, item_id);
+        let len = (*item_id).lp_len() as usize;
+        let mut meta =
+            rkyv::from_bytes::<IvfMetaPage>(std::slice::from_raw_parts(item as *const u8, len))
+                .unwrap();
+        assert_eq!(meta.magic_number, IVF_MAGIC_NUMBER);
+        assert_eq!(meta.version, IVF_VERSION);
+
+        let result = f(&mut meta);
+        let bytes = meta.serialize_to_vec();
+        page::write_single_item_page_locked(index, &buffer, PageType::IvfMeta, &bytes);
+        result
+    }
+
+    /// Append block ranges to the pending-reclamation list (serialized by the
+    /// meta page's content lock, so concurrent seals/compactions cannot lose
+    /// each other's ranges).
+    pub unsafe fn retire_ranges(index: &PgRelation, ranges: Vec<IvfRetiredRange>) {
+        if ranges.is_empty() {
+            return;
+        }
+        Self::update(index, |meta| {
+            let mut list = match meta.get_retired_list_pointer() {
+                Some(p) => IvfRetiredList::load(index, p),
+                None => IvfRetiredList::new(),
+            };
+            list.ranges.extend(ranges);
+            meta.retired_list = list.store(index);
+        });
     }
 }

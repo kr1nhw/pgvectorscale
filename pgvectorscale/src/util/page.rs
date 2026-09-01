@@ -42,6 +42,10 @@ pub enum PageType {
     IvfCentroids = 13,
     IvfQuantizerMetadata = 14,
     IvfEntry = 15,
+    IvfListHeader = 16,
+    IvfSegmentList = 17,
+    IvfActiveBuffer = 18,
+    IvfRetiredList = 19,
 }
 
 impl PageType {
@@ -63,6 +67,10 @@ impl PageType {
             13 => PageType::IvfCentroids,
             14 => PageType::IvfQuantizerMetadata,
             15 => PageType::IvfEntry,
+            16 => PageType::IvfListHeader,
+            17 => PageType::IvfSegmentList,
+            18 => PageType::IvfActiveBuffer,
+            19 => PageType::IvfRetiredList,
             _ => panic!("Unknown PageType number {}", value),
         }
     }
@@ -78,6 +86,9 @@ impl PageType {
             || matches!(self, PageType::IvfCentroids)
             || matches!(self, PageType::IvfQuantizerMetadata)
             || matches!(self, PageType::IvfEntry)
+            || matches!(self, PageType::IvfListHeader)
+            || matches!(self, PageType::IvfSegmentList)
+            || matches!(self, PageType::IvfRetiredList)
     }
 }
 
@@ -262,6 +273,38 @@ impl Drop for WritablePage<'_> {
             };
         }
     }
+}
+
+/// Rewrite a page whose buffer is ALREADY pinned and exclusively locked by the
+/// caller, replacing its content with `bytes` as its only item (offset 1).
+///
+/// This is for callers that must hold the buffer lock across a multi-step
+/// operation (e.g. the IVF list-header read-modify-write under the header's
+/// content lock).  WAL-logged via GenericXLog; the caller keeps the lock.
+pub unsafe fn write_single_item_page_locked(
+    index: &PgRelation,
+    buffer: &LockedBufferExclusive,
+    page_type: PageType,
+    bytes: &[u8],
+) {
+    let state = pg_sys::GenericXLogStart(index.as_ptr());
+    let page = pg_sys::GenericXLogRegisterBuffer(state, **buffer, 0);
+    pg_sys::PageInit(
+        page,
+        pg_sys::BLCKSZ as usize,
+        std::mem::size_of::<TsvPageOpaqueData>(),
+    );
+    *TsvPageOpaqueData::with_page(page) = TsvPageOpaqueData::new(page_type);
+    let off = pg_sys::PageAddItemExtended(
+        page,
+        bytes.as_ptr() as _,
+        bytes.len(),
+        pg_sys::InvalidOffsetNumber,
+        0,
+    );
+    assert!(off != pg_sys::InvalidOffsetNumber);
+    pg_sys::MarkBufferDirty(**buffer);
+    pg_sys::GenericXLogFinish(state);
 }
 
 impl Deref for WritablePage<'_> {

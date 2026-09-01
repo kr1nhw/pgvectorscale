@@ -73,8 +73,7 @@ impl<'a, S: StatsNodeWrite> ChainTapeWriter<'a, S> {
     }
 
     /// Write chained data to the tape, returning an `ItemPointer` to the start of the data.
-    pub fn write(&mut self, mut data: &[u8]) -> super::ItemPointer {
-        let mut current_page = WritablePage::modify(self.index, self.current);
+    pub fn write(&mut self, mut data: &[u8]) -> super::ItemPointer {        let mut current_page = WritablePage::modify(self.index, self.current);
 
         // If there isn't enough space for the header plus some data, start a new page.
         if current_page.get_aligned_free_space() < CHAIN_ITEM_HEADER_SIZE + 1 {
@@ -119,6 +118,17 @@ impl<'a, S: StatsNodeWrite> ChainTapeWriter<'a, S> {
         self.stats.record_write();
 
         result
+    }
+
+    /// Write chained data, returning the `ItemPointer` and the number of blocks
+    /// the chain occupies.  The count assumes the chain's pages are contiguous;
+    /// callers that may later reclaim the chain's blocks must hold the relation
+    /// extension lock across this call (see `IvfSegmentList::store`).
+    pub fn write_counted(&mut self, data: &[u8]) -> (super::ItemPointer, u32) {
+        let first = self.current;
+        let ptr = self.write(data);
+        let count = self.current - first + 1;
+        (ptr, count)
     }
 }
 

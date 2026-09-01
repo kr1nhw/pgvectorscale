@@ -20,12 +20,8 @@ const LIST_DIRECTORY_OFFSET: pgrx::pg_sys::OffsetNumber = 1;
 #[derive(Clone, Debug, PartialEq, Archive, Deserialize, Serialize, Readable, Writeable)]
 #[archive(check_bytes)]
 pub struct IvfListMetadata {
-    /// First page of the contiguous entry block run for this list
-    pub start_page: BlockNumber,
-    /// Number of contiguous blocks in the entry run
-    pub num_blocks: u32,
-    /// Current page being appended to (for inserts)
-    pub insert_page: BlockNumber,
+    /// Pointer to this list's header page (atomic publication target).
+    pub header: ItemPointer,
     /// Offset into centroids page for this list's centroid
     pub centroid_offset: u32,
     /// Number of tuples in this list
@@ -36,9 +32,7 @@ impl IvfListMetadata {
     /// Create new list metadata with default values.
     pub fn new(centroid_offset: u32) -> Self {
         Self {
-            start_page: pgrx::pg_sys::InvalidBlockNumber,
-            num_blocks: 0,
-            insert_page: pgrx::pg_sys::InvalidBlockNumber,
+            header: ItemPointer::new_invalid(),
             centroid_offset,
             num_tuples: 0,
         }
@@ -47,18 +41,6 @@ impl IvfListMetadata {
     /// Check if this list has any entries.
     pub fn is_empty(&self) -> bool {
         self.num_tuples == 0
-    }
-
-    /// Increment the tuple count.
-    pub fn increment_tuples(&mut self) {
-        self.num_tuples += 1;
-    }
-
-    /// Decrement the tuple count.
-    pub fn decrement_tuples(&mut self) {
-        if self.num_tuples > 0 {
-            self.num_tuples -= 1;
-        }
     }
 }
 

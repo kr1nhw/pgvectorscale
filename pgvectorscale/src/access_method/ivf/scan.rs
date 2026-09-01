@@ -17,6 +17,7 @@ use crate::access_method::ivf::entry::IvfEntryReader;
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::IvfMetaPage;
 use crate::access_method::ivf::options::{IVF_PROBES, IVF_TOP_K};
+use crate::access_method::ivf::segment::{IvfListHeader, IvfSegmentList};
 use crate::access_method::ivf::simd::find_nearest_centroids;
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::access_method::quantization::rabitq::{RabitqFastScan, RabitqQuantizer};
@@ -181,11 +182,22 @@ pub unsafe extern "C-unwind" fn amgettuple(
         let mut heap: BinaryHeap<DistTid> = BinaryHeap::with_capacity(top_k.min(1024));
         for list_id in nearest {
             if let Some(list_meta) = list_directory.get_list(list_id as u16) {
-                if list_meta.start_page != pg_sys::InvalidBlockNumber && list_meta.num_blocks > 0 {
-                    let centroid = &centroid_page.centroids[list_id as usize];
-                    let rq = quantizer.rotate_query_residual(centroid, &scan_state.query);
-                    let fastscan = RabitqFastScan::new(&rq, num_bits, quantizer.dim());
-                    reader.for_each_slice(list_meta.start_page, list_meta.num_blocks, |view| {
+                if !list_meta.header.is_valid() {
+                    continue;
+                }
+                let header = IvfListHeader::load(&index_rel, list_meta.header);
+                let segment_list = IvfSegmentList::load(&index_rel, header.segment_list);
+                if segment_list.segments.is_empty() {
+                    continue;
+                }
+                let centroid = &centroid_page.centroids[list_id as usize];
+                let rq = quantizer.rotate_query_residual(centroid, &scan_state.query);
+                let fastscan = RabitqFastScan::new(&rq, num_bits, quantizer.dim());
+                for segment in &segment_list.segments {
+                    if segment.start_page == pg_sys::InvalidBlockNumber || segment.num_blocks == 0 {
+                        continue;
+                    }
+                    reader.for_each_slice(segment.start_page, segment.num_blocks, |view| {
                         if num_bits == 1 {
                             // 1-bit: SIMD FastScan sum + fused SIMD estimate over
                             // 32-row transposed batches.

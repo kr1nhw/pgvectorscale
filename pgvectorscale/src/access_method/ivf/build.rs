@@ -9,10 +9,11 @@ use rand::rngs::SmallRng;
 use crate::access_method::distance::DistanceType;
 use crate::access_method::ivf::centroid::{kmeans_plus_plus_init, lloyds_algorithm};
 use crate::access_method::ivf::centroid_page::IvfCentroidPage;
-use crate::access_method::ivf::entry::{IvfEntry, IvfEntryWriter};
+use crate::access_method::ivf::entry::{seal_entries, IvfEntry};
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::IvfMetaPage;
 use crate::access_method::ivf::options::TSVIvfOptions;
+use crate::access_method::ivf::segment::{IvfListHeader, IvfSegmentList};
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::access_method::quantization::rabitq::{RabitqQuantizer, RabitqVector};
 use crate::util::ItemPointer;
@@ -151,14 +152,14 @@ pub extern "C-unwind" fn ambuildempty(index: pg_sys::Relation) {
 }
 
 /// Write the minimal IVF on-disk structure (meta + empty list directory +
-/// empty centroid page) with the fixed block layout.
+/// empty centroid page + one empty header per list) with the fixed block layout.
 fn write_empty_index(index: &PgRelation, options: &TSVIvfOptions, num_dimensions: u32) {
     let num_lists = options.get_lists() as usize;
     let mut rng = SmallRng::from_entropy();
     let rotation_seed: u64 = rng.gen();
 
     // Meta page (block 0), empty list directory (block 1), empty centroids
-    // (dynamic block recorded in the meta).
+    // (dynamic block recorded in the meta), and one empty header per list.
     let mut meta = unsafe {
         IvfMetaPage::create(
             index,
@@ -171,14 +172,28 @@ fn write_empty_index(index: &PgRelation, options: &TSVIvfOptions, num_dimensions
         )
     };
 
-    let list_directory = IvfListDirectory::new(num_lists as u16);
+    let mut list_directory = IvfListDirectory::new(num_lists as u16);
     unsafe {
         list_directory.store(index, true);
     }
 
     let centroid_page = IvfCentroidPage::new(Vec::new());
     let centroid_ptr = unsafe { centroid_page.store(index, None) };
+
+    // All empty lists share one immutable empty segment-list item.
+    let empty_segment_list = IvfSegmentList::new(Vec::new());
+    let (empty_segment_list_ptr, empty_segment_list_blocks) =
+        unsafe { empty_segment_list.store(index) };
+    for list_id in 0..num_lists {
+        let header = IvfListHeader::new(empty_segment_list_ptr, empty_segment_list_blocks);
+        let header_ptr = unsafe { header.store_new(index) };
+        if let Some(list_meta) = list_directory.get_list_mut(list_id as u16) {
+            list_meta.header = header_ptr;
+        }
+    }
+
     unsafe {
+        list_directory.store(index, false);
         meta.set_list_directory_pointer(ItemPointer::new(1, 1));
         meta.set_centroids_pointer(centroid_ptr);
         meta.store(index, false);
@@ -347,34 +362,36 @@ pub fn build_ivf_index_serial(
         meta_page.store(index, false);
     }
 
-    // Step 7: Write entry pages for each list (block 3+).  The per-list append
-    // is serial because entry storage is a chained page per list.
+    // Step 7: Seal each list into one immutable segment and write its header
+    // (which points at a fresh segment-list item).
     for list_id in 0..num_lists {
-        let mut writer = IvfEntryWriter::new(index, list_id as u16);
-        let mut count = 0u64;
+        let entries: Vec<IvfEntry> = assigned
+            .iter()
+            .enumerate()
+            .filter(|(_, (l, _))| *l == list_id as u16)
+            .map(|(i, (_, code))| IvfEntry::new(heap_tids[i], code.clone()))
+            .collect();
 
-        for (i, (assigned_list, code)) in assigned.iter().enumerate() {
-            if *assigned_list == list_id as u16 {
-                let entry = IvfEntry::new(heap_tids[i], code.clone());
-                writer.add_entry(entry);
-                count += 1;
-            }
-        }
+        let count = entries.len() as u64;
+        let segment = seal_entries(index, entries);
+        let segments = if segment.is_empty() {
+            Vec::new()
+        } else {
+            vec![segment]
+        };
+        let segment_list = IvfSegmentList::new(segments);
+        let (segment_list_ptr, segment_list_blocks) =
+            unsafe { segment_list.store(index) };
+        let header = IvfListHeader::new(segment_list_ptr, segment_list_blocks);
+        let header_ptr = unsafe { header.store_new(index) };
 
-        let (start_page, num_blocks, _) = writer.finish();
-
-        // Update list directory
         if let Some(list_meta) = list_directory.get_list_mut(list_id as u16) {
-            if let Some(page) = start_page {
-                list_meta.start_page = page;
-                list_meta.insert_page = page;
-            }
-            list_meta.num_blocks = num_blocks;
+            list_meta.header = header_ptr;
             list_meta.num_tuples = count;
         }
     }
 
-    // Step 8: Rewrite list directory in place at block 1 with the entry pointers.
+    // Step 8: Rewrite list directory in place at block 1 with the header pointers.
     unsafe {
         list_directory.store(index, false);
         // Bulk smgr scans need the built entry blocks on disk first.

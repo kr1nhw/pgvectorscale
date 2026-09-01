@@ -12,6 +12,7 @@ pub mod list_directory;
 pub mod meta_page;
 pub mod options;
 pub mod scan;
+pub mod segment;
 pub mod simd;
 pub mod vacuum;
 
