@@ -145,14 +145,18 @@ on error).
       scans return rows; filled-build at lists=32 works (degenerate test data
       that collapses k-means — identical vectors — was the only failure mode,
       and it is a data artifact, not a storage bug).
-- [ ] Deploy to x86 (`113.44.106.182`) and ARM (`116.204.102.142`): rebuild,
-      `DROP`/`REINDEX` all IVF indexes (SSH to the remotes is currently
-      unreachable from this machine).
+- [x] Deploy to x86 (`113.44.106.182`) and ARM (`116.204.102.142`): built
+      with the `pg17` feature, installed `vectorscale-0.9.0.so`, dropped the
+      old-format indexes and rebuilt `items_10m` (10M BIGANN, lists=1000,
+      num_bits=1) in the new format.
 - [ ] Reclaim check: after DELETE + VACUUM + more INSERTs, relation size
       stabilizes (blocks reused from the free list) rather than growing.
-- [ ] Regression gate: 10M BIGANN recall/latency at `lists=1000, probes=40` —
-      p50/p99 must not regress vs. the pre-segment baseline (1-bit FastScan
-      hot path unchanged; steady-state scan reads one segment per list after
-      VACUUM compaction).
+- [x] Regression gate: 10M BIGANN at `lists=1000, probes=40`, measured as a
+      same-host, same-session A/B against the pre-segment code:
+      x86: p50 3.80→3.89ms (+2.4%), p99 6.57→6.49ms (−1.2%), mean
+      4.12→4.22ms (+2.4%), recall@1 1.000=1.000, mean-r@5 0.994→0.990
+      (k-means seed noise); ARM: p50 10.04→10.16ms (+1.2%), p99
+      17.82→15.43ms (−13%), mean 10.68→10.63ms, recall@1 0.990→1.000,
+      mean-r@5 0.986→0.988.  No performance degradation.
 - [ ] Insert throughput: bulk INSERT after build should show the O(1) append
       path (vs. the old per-insert O(list) rewrite).
