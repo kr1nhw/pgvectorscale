@@ -11,10 +11,10 @@ use rkyv::{Archive, Deserialize, Serialize};
 use semver::Version;
 
 use crate::access_method::distance::DistanceType;
-use crate::access_method::ivf::segment::{IvfRetiredList, IvfRetiredRange};
+use crate::access_method::ivf::segment::{IvfFreeList, IvfFreeRange};
 use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::access_method::storage::StorageType;
-use crate::util::buffer::LockedBufferExclusive;
+use crate::util::buffer::{LockedBufferExclusive, RelationLockGuard};
 use crate::util::page::{self, PageType, ReadablePage, WritablePage};
 use crate::util::*;
 
@@ -53,8 +53,9 @@ pub struct IvfMetaPage {
     list_directory_pointer: ItemPointer,
     /// Pointer to quantizer metadata page
     quantizer_metadata: ItemPointer,
-    /// Pointer to the pending-reclamation list (chained item; writer-only).
-    retired_list: ItemPointer,
+    /// Pointer to the free block list (chained item; writer-only, accessed
+    /// under the relation ExclusiveLock).
+    free_list: ItemPointer,
     /// Monotonic generation counter (bumped on compaction; used by reclamation).
     generation: u64,
 }
@@ -137,10 +138,10 @@ impl IvfMetaPage {
         self.quantizer_metadata = pointer;
     }
 
-    /// Get the pending-reclamation list pointer.
-    pub fn get_retired_list_pointer(&self) -> Option<ItemPointer> {
-        if self.retired_list.is_valid() {
-            Some(self.retired_list)
+    /// Get the free-list pointer.
+    pub fn get_free_list_pointer(&self) -> Option<ItemPointer> {
+        if self.free_list.is_valid() {
+            Some(self.free_list)
         } else {
             None
         }
@@ -171,7 +172,7 @@ impl IvfMetaPage {
             centroids_pointer: ItemPointer::new_invalid(),
             list_directory_pointer: ItemPointer::new_invalid(),
             quantizer_metadata: ItemPointer::new_invalid(),
-            retired_list: ItemPointer::new_invalid(),
+            free_list: ItemPointer::new_invalid(),
             generation: 0,
         };
 
@@ -239,20 +240,89 @@ impl IvfMetaPage {
         result
     }
 
-    /// Append block ranges to the pending-reclamation list (serialized by the
-    /// meta page's content lock, so concurrent seals/compactions cannot lose
-    /// each other's ranges).
-    pub unsafe fn retire_ranges(index: &PgRelation, ranges: Vec<IvfRetiredRange>) {
+    /// Append retired block ranges to the free list.
+    ///
+    /// Takes the relation ExclusiveLock: scans hold ShareLock for the duration
+    /// of their `smgrreadv` burst, so by the time the ExclusiveLock is granted
+    /// no scan is still reading the retired blocks, and they can safely become
+    /// reusable.  (New scans can never reference them: they were swapped out of
+    /// the published header before being retired.)
+    pub unsafe fn reclaim_ranges(index: &PgRelation, ranges: Vec<IvfFreeRange>) {
         if ranges.is_empty() {
             return;
         }
+        let _guard = RelationLockGuard::new(index.as_ptr(), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
         Self::update(index, |meta| {
-            let mut list = match meta.get_retired_list_pointer() {
-                Some(p) => IvfRetiredList::load(index, p),
-                None => IvfRetiredList::new(),
+            let mut list = match meta.get_free_list_pointer() {
+                Some(p) => IvfFreeList::load(index, p),
+                None => IvfFreeList::new(),
             };
             list.ranges.extend(ranges);
-            meta.retired_list = list.store(index);
+            meta.free_list = list.store(index);
+        });
+    }
+
+    /// Reserve a free range of at least `need` blocks for reuse, returning its
+    /// start block (the range is split if larger than `need`).  Returns `None`
+    /// if no range is large enough (callers fall back to relation extension).
+    ///
+    /// Serialized against scans the same way as [`Self::reclaim_ranges`]: the
+    /// ExclusiveLock guarantees no scan is mid-read of the returned blocks,
+    /// and scans started later never reference them (they are unreachable from
+    /// every published header).
+    pub unsafe fn allocate_range(index: &PgRelation, need: u32) -> Option<pg_sys::BlockNumber> {
+        if need == 0 {
+            return None;
+        }
+        // Fast path: no free list yet → fall back to extension without taking
+        // the ExclusiveLock (which would otherwise stall behind every
+        // concurrent inserter's RowExclusiveLock on the index relation).
+        if Self::fetch(index).get_free_list_pointer().is_none() {
+            return None;
+        }
+        let _guard = RelationLockGuard::new(index.as_ptr(), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+        Self::update(index, |meta| {
+            let mut list = match meta.get_free_list_pointer() {
+                Some(p) => IvfFreeList::load(index, p),
+                None => IvfFreeList::new(),
+            };
+            let mut found: Option<pg_sys::BlockNumber> = None;
+            if let Some(pos) = list.ranges.iter().position(|r| r.num_blocks >= need) {
+                let range = list.ranges.remove(pos);
+                if range.num_blocks > need {
+                    // Split: push the tail back.
+                    list.ranges.push(IvfFreeRange {
+                        start_block: range.start_block + need as pg_sys::BlockNumber,
+                        num_blocks: range.num_blocks - need,
+                    });
+                }
+                found = Some(range.start_block);
+                meta.free_list = list.store(index);
+            }
+            found
+        })
+    }
+
+    /// Return an unused reserved range to the free list.
+    pub unsafe fn push_back_range(
+        index: &PgRelation,
+        start_block: pg_sys::BlockNumber,
+        num_blocks: u32,
+    ) {
+        if num_blocks == 0 {
+            return;
+        }
+        let _guard = RelationLockGuard::new(index.as_ptr(), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+        Self::update(index, |meta| {
+            let mut list = match meta.get_free_list_pointer() {
+                Some(p) => IvfFreeList::load(index, p),
+                None => IvfFreeList::new(),
+            };
+            list.ranges.push(IvfFreeRange {
+                start_block,
+                num_blocks,
+            });
+            meta.free_list = list.store(index);
         });
     }
 }

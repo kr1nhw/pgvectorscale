@@ -353,6 +353,58 @@ pub fn seal_entries(index: &PgRelation, entries: Vec<IvfEntry>) -> IvfSegment {
     )
 }
 
+/// Exact serialized byte length of a seal of `n` entries (mirrors the
+/// `serialize_entries` arithmetic), so the reclamation allocator can reserve
+/// exactly the right number of blocks before sealing.
+pub fn seal_bytes_len(n: usize, num_bits: u8, dim_padded: u32) -> usize {
+    let code_len = match num_bits {
+        1 => dim_padded as usize / 8,
+        4 => dim_padded as usize / 2,
+        _ => dim_padded as usize,
+    };
+    let codes = if num_bits == 1 {
+        n.div_ceil(32) * 32 * code_len
+    } else {
+        n * code_len
+    };
+    ENTRY_HEADER_SIZE + n * TID_SIZE + codes + n * 12
+}
+
+/// Number of blocks a seal of `n` entries occupies (exact for a fresh page).
+pub fn seal_blocks_needed(n: usize, num_bits: u8, dim_padded: u32) -> u32 {
+    let bytes = seal_bytes_len(n, num_bits, dim_padded);
+    let cap = crate::util::page::tsv_fresh_page_capacity().max(1);
+    bytes.div_ceil(cap) as u32
+}
+
+/// Seal `entries` into an immutable SoA segment written into blocks
+/// `[start_block, start_block + used)` (reclaimed blocks).  Returns the number
+/// of blocks used; the caller must have reserved at least `seal_blocks_needed`
+/// blocks and pushes back any unused tail.
+pub fn seal_entries_at(
+    index: &PgRelation,
+    entries: Vec<IvfEntry>,
+    start_block: BlockNumber,
+) -> u32 {
+    if entries.is_empty() {
+        return 0;
+    }
+    let bytes = serialize_entries(&entries);
+    let mut remaining: &[u8] = &bytes;
+    let mut used = 0u32;
+    while !remaining.is_empty() {
+        let mut page = WritablePage::modify(index, start_block + used as BlockNumber);
+        page.reinit(PageType::IvfEntry);
+        let cap = page.get_aligned_free_space();
+        let chunk_len = remaining.len().min(cap);
+        page.add_item(&remaining[..chunk_len]);
+        page.commit();
+        used += 1;
+        remaining = &remaining[chunk_len..];
+    }
+    used
+}
+
 // ---------------------------------------------------------------------------
 // Active (append) buffer: the unpublished, writer-only staging area.
 //

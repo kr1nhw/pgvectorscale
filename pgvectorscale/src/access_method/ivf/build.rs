@@ -180,12 +180,14 @@ fn write_empty_index(index: &PgRelation, options: &TSVIvfOptions, num_dimensions
     let centroid_page = IvfCentroidPage::new(Vec::new());
     let centroid_ptr = unsafe { centroid_page.store(index, None) };
 
-    // All empty lists share one immutable empty segment-list item.
+    // All empty lists share one immutable empty segment-list item, marked with
+    // segment_list_blocks = 0: a sentinel meaning "shared, never retire" (a
+    // list that later seals creates its own item, so the shared one is never
+    // the target of a retire-and-reclaim).
     let empty_segment_list = IvfSegmentList::new(Vec::new());
-    let (empty_segment_list_ptr, empty_segment_list_blocks) =
-        unsafe { empty_segment_list.store(index) };
+    let (empty_segment_list_ptr, _) = unsafe { empty_segment_list.store(index) };
     for list_id in 0..num_lists {
-        let header = IvfListHeader::new(empty_segment_list_ptr, empty_segment_list_blocks);
+        let header = IvfListHeader::new(empty_segment_list_ptr, 0);
         let header_ptr = unsafe { header.store_new(index) };
         if let Some(list_meta) = list_directory.get_list_mut(list_id as u16) {
             list_meta.header = header_ptr;

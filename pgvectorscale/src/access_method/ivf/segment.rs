@@ -117,26 +117,25 @@ impl IvfSegmentList {
     }
 }
 
-/// A block range retired by a compaction/seal swap, awaiting reclamation.
+/// A contiguous block range made available for reuse by reclamation.
 #[derive(Clone, Debug, PartialEq, Archive, Deserialize, Serialize, Readable, Writeable)]
 #[archive(check_bytes)]
-pub struct IvfRetiredRange {
+pub struct IvfFreeRange {
     pub start_block: BlockNumber,
     pub num_blocks: u32,
-    /// Header generation at which this range became garbage.
-    pub retired_generation: u64,
 }
 
-/// The pending-reclamation list (chained, referenced from the meta page).
-/// Writers append retired ranges; Phase 4 drains it (under the reclamation
-/// lock) and reuses the blocks.
+/// The free block list (chained, referenced from the meta page).  Writers push
+/// retired ranges; the allocator pops them for reuse.  All access happens
+/// under the relation ExclusiveLock (see `IvfMetaPage::reclaim_ranges` /
+/// `IvfMetaPage::allocate_range`), so it is safe against in-flight smgr reads.
 #[derive(Clone, Debug, PartialEq, Archive, Deserialize, Serialize, Readable, Writeable)]
 #[archive(check_bytes)]
-pub struct IvfRetiredList {
-    pub ranges: Vec<IvfRetiredRange>,
+pub struct IvfFreeList {
+    pub ranges: Vec<IvfFreeRange>,
 }
 
-impl IvfRetiredList {
+impl IvfFreeList {
     pub fn new() -> Self {
         Self { ranges: Vec::new() }
     }
@@ -144,20 +143,20 @@ impl IvfRetiredList {
     pub unsafe fn store(&self, index: &PgRelation) -> ItemPointer {
         let _ext_lock = crate::util::buffer::LockRelationForExtension::new(index);
         let mut stats = crate::access_method::stats::WriteStats::default();
-        let mut tape = ChainTapeWriter::new(index, PageType::IvfRetiredList, &mut stats);
+        let mut tape = ChainTapeWriter::new(index, PageType::IvfFreeList, &mut stats);
         tape.write(&self.serialize_to_vec())
     }
 
-    pub fn load(index: &PgRelation, pointer: ItemPointer) -> IvfRetiredList {
+    pub fn load(index: &PgRelation, pointer: ItemPointer) -> IvfFreeList {
         unsafe {
             let mut stats = crate::access_method::stats::WriteStats::default();
-            let mut tape = ChainItemReader::new(index, PageType::IvfRetiredList, &mut stats);
+            let mut tape = ChainItemReader::new(index, PageType::IvfFreeList, &mut stats);
 
             let mut buf: Vec<u8> = Vec::new();
             for item in tape.read(pointer) {
                 buf.extend_from_slice(item.get_data_slice());
             }
-            rkyv::from_bytes::<IvfRetiredList>(&buf).unwrap()
+            rkyv::from_bytes::<IvfFreeList>(&buf).unwrap()
         }
     }
 }

@@ -21,6 +21,7 @@ use crate::access_method::ivf::segment::{IvfListHeader, IvfSegmentList};
 use crate::access_method::ivf::simd::find_nearest_centroids;
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::access_method::quantization::rabitq::{RabitqFastScan, RabitqQuantizer};
+use crate::util::buffer::RelationLockGuard;
 use crate::util::ItemPointer;
 
 /// A (distance, heap tid) candidate pair ordered by distance, used as the
@@ -155,6 +156,13 @@ pub unsafe extern "C-unwind" fn amgettuple(
     // Compute results on first call
     if !scan_state.results_computed {
         let index_rel = unsafe { PgRelation::from_pg((*scan).indexRelation) };
+        // Read-burst protocol: hold the relation ShareLock across the header /
+        // segment-list reads and the smgrreadv bursts.  Reclamation takes the
+        // ExclusiveLock, so it cannot free (and reuse) blocks while this scan
+        // is still reading them; ShareLock is self-compatible, so concurrent
+        // scans do not contend.
+        let _read_guard =
+            RelationLockGuard::new(index_rel.as_ptr(), pg_sys::ShareLock as pg_sys::LOCKMODE);
         let meta = IvfMetaPage::fetch(&index_rel);
         let distance_type = meta.get_distance_type();
         let centroid_page = match meta.get_centroids_pointer() {

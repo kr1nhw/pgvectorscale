@@ -45,7 +45,7 @@ pub enum PageType {
     IvfListHeader = 16,
     IvfSegmentList = 17,
     IvfActiveBuffer = 18,
-    IvfRetiredList = 19,
+    IvfFreeList = 19,
 }
 
 impl PageType {
@@ -70,7 +70,7 @@ impl PageType {
             16 => PageType::IvfListHeader,
             17 => PageType::IvfSegmentList,
             18 => PageType::IvfActiveBuffer,
-            19 => PageType::IvfRetiredList,
+            19 => PageType::IvfFreeList,
             _ => panic!("Unknown PageType number {}", value),
         }
     }
@@ -88,7 +88,7 @@ impl PageType {
             || matches!(self, PageType::IvfEntry)
             || matches!(self, PageType::IvfListHeader)
             || matches!(self, PageType::IvfSegmentList)
-            || matches!(self, PageType::IvfRetiredList)
+            || matches!(self, PageType::IvfFreeList)
     }
 }
 
@@ -273,6 +273,16 @@ impl Drop for WritablePage<'_> {
             };
         }
     }
+}
+
+/// The usable bytes for one item on a freshly initialized TSV page — exactly
+/// what `WritablePage::get_aligned_free_space` reports on a fresh page.  Used
+/// by callers that must size a block allocation for a multi-page item write
+/// before writing it (e.g. the IVF reclamation allocator).
+pub fn tsv_fresh_page_capacity() -> usize {
+    let header = std::mem::offset_of!(pg_sys::PageHeaderData, pd_linp);
+    let free = pg_sys::BLCKSZ as usize - header - std::mem::size_of::<TsvPageOpaqueData>();
+    free - free % 8
 }
 
 /// Rewrite a page whose buffer is ALREADY pinned and exclusively locked by the

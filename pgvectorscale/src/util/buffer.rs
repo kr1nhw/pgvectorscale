@@ -192,6 +192,36 @@ impl Deref for LockedBufferShare<'_> {
     }
 }
 
+/// A heavyweight relation lock (lock manager) held for a lexical scope,
+/// released on drop.  Used by the IVF scan's read-burst (ShareLock) protocol:
+/// reclamation takes ExclusiveLock, so it waits for in-flight `smgrreadv`
+/// bursts that bypass the buffer manager.
+pub struct RelationLockGuard {
+    relation: pg_sys::Relation,
+    mode: pg_sys::LOCKMODE,
+}
+
+impl RelationLockGuard {
+    pub fn new(relation: pg_sys::Relation, mode: pg_sys::LOCKMODE) -> Self {
+        unsafe {
+            pg_sys::LockRelation(relation, mode);
+        }
+        Self { relation, mode }
+    }
+}
+
+impl Drop for RelationLockGuard {
+    fn drop(&mut self) {
+        // Only unlock while in a transaction state; on abort the lock manager
+        // releases everything itself.
+        if unsafe { pgrx::pg_sys::IsTransactionState() } {
+            unsafe {
+                pg_sys::UnlockRelation(self.relation, self.mode);
+            }
+        }
+    }
+}
+
 /// PinnerBuffer is an RAII-guarded buffer that
 /// has been pinned but not locked.
 ///

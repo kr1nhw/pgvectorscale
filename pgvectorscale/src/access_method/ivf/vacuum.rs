@@ -6,7 +6,7 @@ use crate::access_method::ivf::centroid_page::IvfCentroidPage;
 use crate::access_method::ivf::entry::{seal_entries, IvfEntryReader};
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::IvfMetaPage;
-use crate::access_method::ivf::segment::{IvfListHeader, IvfSegmentList};
+use crate::access_method::ivf::segment::{IvfFreeRange, IvfListHeader, IvfSegmentList};
 
 /// Bulk delete tuples from the IVF index.
 ///
@@ -50,7 +50,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         // concurrent insert's seal cannot be clobbered (the header is always
         // re-parsed under the lock before publishing).
         let dead_before = total_dead;
-        let num_entries = unsafe {
+        let (num_entries, retired) = unsafe {
             IvfListHeader::update(&index_rel, header_block, |header| {
                 let segment_list = IvfSegmentList::load(&index_rel, header.segment_list);
 
@@ -84,7 +84,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                 let current_total: u64 =
                     segment_list.segments.iter().map(|s| s.num_entries).sum();
                 if total_dead == dead_before && segment_list.segments.len() <= 1 {
-                    return current_total;
+                    return (current_total, Vec::new());
                 }
 
                 // Seal the survivors into one merged segment and swap the
@@ -105,31 +105,40 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                 pg_sys::FlushRelationBuffers(index_rel.as_ptr());
 
                 // Retire the old segment-list item and the old segments.
-                let retired_generation = header.generation + 1;
-                let mut retired = vec![crate::access_method::ivf::segment::IvfRetiredRange {
-                    start_block: header.segment_list.block_number,
-                    num_blocks: header.segment_list_blocks,
-                    retired_generation,
-                }];
+                // segment_list_blocks == 0 marks the shared empty item used by
+                // never-sealed lists — never retire it.
+                let mut retired = Vec::new();
+                if header.segment_list_blocks > 0 {
+                    retired.push(IvfFreeRange {
+                        start_block: header.segment_list.block_number,
+                        num_blocks: header.segment_list_blocks,
+                    });
+                }
                 for s in &segment_list.segments {
                     if s.start_page != pg_sys::InvalidBlockNumber && s.num_blocks > 0 {
-                        retired.push(crate::access_method::ivf::segment::IvfRetiredRange {
+                        retired.push(IvfFreeRange {
                             start_block: s.start_page,
                             num_blocks: s.num_blocks,
-                            retired_generation,
                         });
                     }
                 }
-                IvfMetaPage::retire_ranges(&index_rel, retired);
 
                 header.version += 1;
                 header.generation += 1;
                 header.segment_list = new_ptr;
                 header.segment_list_blocks = new_blocks;
-                header.active = None;
-                num_entries
+                // NOTE: header.active is left untouched — the active buffer's
+                // unsealed entries are unrelated to the published segments
+                // being merged, and clearing the pointer would orphan them.
+                (num_entries, retired)
             })
         };
+
+        // Reclaim under the ExclusiveLock only AFTER the header lock was
+        // released (the ExclusiveLock must never nest inside it).
+        unsafe {
+            IvfMetaPage::reclaim_ranges(&index_rel, retired);
+        }
 
         if let Some(list_meta) = list_directory.get_list_mut(list_id as u16) {
             list_meta.num_tuples = num_entries;
