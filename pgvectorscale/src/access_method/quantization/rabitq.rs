@@ -1609,3 +1609,36 @@ mod two_bit_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod two_bit_debug_tests {
+    use super::*;
+    use rand::Rng;
+
+    #[test]
+    fn two_bit_bigann_estimation_error() {
+        // BIGANN-like u8 0-255 data: measure the estimated-vs-exact L2 error
+        // for 2-bit against the 4-bit path on the same vectors.
+        for (num_bits, label) in [(2u8, "2-bit"), (4u8, "4-bit")] {
+            let dim = 128usize;
+            let q = RabitqQuantizer::new(num_bits, 42, dim);
+            let mut rng = rand::thread_rng();
+            let a: Vec<f32> = (0..dim).map(|_| rng.gen_range(0.0..255.0)).collect();
+            let qa = q.quantize(&a);
+            let mut mean_err = 0.0f32;
+            let mut worst = 0.0f32;
+            let n = 20;
+            for _ in 0..n {
+                let b: Vec<f32> = (0..dim).map(|_| rng.gen_range(0.0..255.0)).collect();
+                let exact: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum();
+                let rq = q.rotate_query(&b);
+                let est = q.estimate_l2(&qa, &rq);
+                let rel = (est - exact).abs() / exact.max(1.0);
+                mean_err += rel;
+                worst = worst.max(rel);
+            }
+            eprintln!("{}: mean_rel_err={:.3} worst={:.3} sx2={:.0} res_dot={:.1}",
+                label, mean_err / n as f32, worst, qa.sum_of_x2, qa.l1_of_rotated);
+        }
+    }
+}

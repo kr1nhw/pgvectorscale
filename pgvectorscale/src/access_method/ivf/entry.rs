@@ -256,18 +256,21 @@ impl<'a> IvfEntrySlice<'a> {
     }
 
     /// Transposed sign-plane of 2-bit batch `batch` (32 × code_len/2 bytes).
+    /// Plane 0 occupies the FIRST half of the codes region.
     #[inline]
     pub fn code_batch_plane0(&self, batch: usize) -> &'a [u8] {
         let half = self.code_len / 2;
-        let start = batch * 32 * self.code_len;
+        let start = batch * 32 * half;
         &self.codes[start..start + 32 * half]
     }
 
     /// Transposed ex-plane of 2-bit batch `batch` (32 × code_len/2 bytes).
+    /// Plane 1 occupies the SECOND half of the codes region.
     #[inline]
     pub fn code_batch_plane1(&self, batch: usize) -> &'a [u8] {
         let half = self.code_len / 2;
-        let start = batch * 32 * self.code_len + 32 * half;
+        let plane_bytes = self.num_batches() * 32 * half;
+        let start = plane_bytes + batch * 32 * half;
         &self.codes[start..start + 32 * half]
     }
 
@@ -770,5 +773,89 @@ mod two_bit_soa_tests {
         };
         assert_eq!(parsed.len(), 40);
         assert_eq!(parsed[7].block_number, 7);
+    }
+}
+
+#[cfg(test)]
+mod two_bit_plane_slice_tests {
+    use super::*;
+    use crate::access_method::quantization::rabitq::{padded_dim, RabitqQuantizer};
+    use crate::access_method::quantization::rabitq_fastscan::transpose_1bit;
+
+    #[test]
+    fn two_bit_plane_slices_match_manual_transpose() {
+        let dim = 128usize;
+        let q = RabitqQuantizer::new(2, 5, dim);
+        let n = 100usize; // > 32 → multiple batches
+        let mut entries = Vec::new();
+        let mut sign_planes = vec![0u8; n * (dim / 8)];
+        let mut ex_planes = vec![0u8; n * (dim / 8)];
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim).map(|d| ((i * 13 + d * 7) % 23) as f32 - 11.0).collect();
+            let code = q.quantize(&v);
+            let sp = &mut sign_planes[i * (dim / 8)..(i + 1) * (dim / 8)];
+            let ep = &mut ex_planes[i * (dim / 8)..(i + 1) * (dim / 8)];
+            for (byte_idx, &b) in code.packed_code.iter().enumerate() {
+                for j in 0..4usize {
+                    let d = byte_idx * 4 + j;
+                    if b & (1 << (2 * j)) != 0 {
+                        sp[d / 8] |= 1 << (d % 8);
+                    }
+                    if b & (1 << (2 * j + 1)) != 0 {
+                        ep[d / 8] |= 1 << (d % 8);
+                    }
+                }
+            }
+            entries.push(IvfEntry { heap_tid: ItemPointer::new(i as u32, 1), code });
+        }
+        let bytes = serialize_entries(&entries);
+        let view = IvfEntrySlice::parse(&bytes);
+        let half = view.code_len() / 2;
+
+        // Manually transpose plane0 and compare with the parse slices per batch.
+        let p0 = transpose_1bit(&sign_planes, n, half);
+        let p1 = transpose_1bit(&ex_planes, n, half);
+        for batch in 0..view.num_batches() {
+            assert_eq!(
+                view.code_batch_plane0(batch),
+                &p0[batch * 32 * half..(batch + 1) * 32 * half],
+                "plane0 batch {} mismatch",
+                batch
+            );
+            assert_eq!(
+                view.code_batch_plane1(batch),
+                &p1[batch * 32 * half..(batch + 1) * 32 * half],
+                "plane1 batch {} mismatch",
+                batch
+            );
+        }
+        // Full round-trip through the read_entries interleave logic.
+        let row_major: Vec<u8> = {
+            let plane_bytes = view.num_batches() * 32 * half;
+            let p0 = crate::access_method::quantization::rabitq_fastscan::untranspose_1bit(
+                &view.codes()[..plane_bytes], n, half,
+            );
+            let p1 = crate::access_method::quantization::rabitq_fastscan::untranspose_1bit(
+                &view.codes()[plane_bytes..plane_bytes * 2], n, half,
+            );
+            let mut packed = vec![0u8; n * view.code_len()];
+            for i in 0..n {
+                for d in 0..half * 8 {
+                    let sign = (p0[i * half + d / 8] >> (d % 8)) & 1;
+                    let ex = (p1[i * half + d / 8] >> (d % 8)) & 1;
+                    packed[i * view.code_len() + d / 4] |=
+                        (sign << (2 * (d % 4))) | (ex << (2 * (d % 4) + 1));
+                }
+            }
+            packed
+        };
+        for i in 0..n {
+            assert_eq!(
+                &row_major[i * view.code_len()..(i + 1) * view.code_len()],
+                &entries[i].code.packed_code[..],
+                "entry {} code round-trip mismatch",
+                i
+            );
+        }
     }
 }
