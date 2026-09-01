@@ -116,6 +116,30 @@ on error).
 - Unchanged: `ivf.probes`, `ivf.top_k`, reloptions `lists`, `num_bits`,
   `storage_layout`.
 
+## 2-bit RaBitQ (added later)
+
+2-bit codes (1 sign + 1 ex bit per dim, 4 dims per byte) are split into two
+bit-planes, each identical to a 1-bit code, so the FastScan table, 32-row
+transpose, NEON `vqtbl`/AVX2 `pshufb` `sum_batch`, and the fused estimate
+kernel are reused per plane; the estimate combines
+`dot = (2·sum0 + sum1)·range_scale + 3·num_chunks·qmin − 1.5·Σrot`
+(u32 intermediates, no u16 overflow).  The SoA codes region stores both
+transposed planes; `IvfEntrySlice::code_batch_plane0/1` slice them; the
+rewrite round-trip re-interleaves the planes.
+
+10M BIGANN results (pg17, lists=1000, num_bits=2, after fixing the initial
+plane-slicing bug found by a unit test):
+
+| metric | x86 | ARM |
+|---|---|---|
+| probes=10 recall@1 / r@5 | 0.940 / 0.930 (1-bit: 0.920/0.900) | 0.910 / 0.910 |
+| probes=40 recall@1 / r@5 | 1.000 / 0.990 (1-bit: 1.000/0.990) | 1.000 / 0.986 |
+| p50 / p99 (probes=40) | 4.56 / 7.75 ms (1-bit: 3.89/6.49) | 11.51 / 19.81 ms (1-bit: 10.16/15.43) |
+
+2-bit costs 2× the 1-bit storage (32 vs 16 bytes/vector at 128d) and ~+15-20%
+scan latency for better recall at low probes; fresh vs post-vacuum recall is
+identical (the compaction round-trip is correct).
+
 ## Known limitations (documented, not correctness holes for the common path)
 
 - **Crash window during multi-page writes:** the append path writes the active
