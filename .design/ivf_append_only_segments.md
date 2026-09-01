@@ -149,8 +149,13 @@ on error).
       with the `pg17` feature, installed `vectorscale-0.9.0.so`, dropped the
       old-format indexes and rebuilt `items_10m` (10M BIGANN, lists=1000,
       num_bits=1) in the new format.
-- [ ] Reclaim check: after DELETE + VACUUM + more INSERTs, relation size
-      stabilizes (blocks reused from the free list) rather than growing.
+- [x] Reclaim check (x86 + ARM, pg17): 5 delete-all/VACUUM/reload cycles hold
+      the index at exactly 409,600 bytes every cycle; the full 100K-row
+      check (load → delete 80% → vacuum → reload → delete → vacuum → reload)
+      holds 3,637,248 bytes across all stages.  This required fixing the
+      active-buffer page allocations, the peek/closure free-space mismatch,
+      the seal-reset page reservation, in-place free-list republishing, and
+      segment-list item reuse (see commit history).
 - [x] Regression gate: 10M BIGANN at `lists=1000, probes=40`, measured as a
       same-host, same-session A/B against the pre-segment code:
       x86: p50 3.80→3.89ms (+2.4%), p99 6.57→6.49ms (−1.2%), mean
@@ -158,5 +163,6 @@ on error).
       (k-means seed noise); ARM: p50 10.04→10.16ms (+1.2%), p99
       17.82→15.43ms (−13%), mean 10.68→10.63ms, recall@1 0.990→1.000,
       mean-r@5 0.986→0.988.  No performance degradation.
-- [ ] Insert throughput: bulk INSERT after build should show the O(1) append
-      path (vs. the old per-insert O(list) rewrite).
+- [x] Insert throughput (x86, pg17, same host A/B, 10K rows, lists=4): old
+      code 43,121 ms vs new code 197 ms — **219x faster** (O(1) amortized
+      append vs. per-insert O(list) rewrite).
