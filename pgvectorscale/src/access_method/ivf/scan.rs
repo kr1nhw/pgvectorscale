@@ -237,6 +237,39 @@ pub unsafe extern "C-unwind" fn amgettuple(
                                     }
                                 }
                             }
+                        } else if num_bits == 2 {
+                            // 2-bit: SIMD FastScan over both bit-planes
+                            // (sign + ex), fused into one SIMD estimate per
+                            // 32-row transposed batch.
+                            let mut sums0 = [0u16; 32];
+                            let mut sums1 = [0u16; 32];
+                            let mut dists = [0f32; 32];
+                            for batch in 0..view.num_batches() {
+                                fastscan.sum_batch(view.code_batch_plane0(batch), &mut sums0);
+                                fastscan.sum_batch(view.code_batch_plane1(batch), &mut sums1);
+                                let base = batch * 32;
+                                let count = (view.len() - base).min(32);
+                                fastscan.estimate_batch_2bit(
+                                    &sums0[..count],
+                                    &sums1[..count],
+                                    &view.scale_slice()[base..base + count],
+                                    &view.sum_of_x2_slice()[base..base + count],
+                                    &view.margin_factor_slice()[base..base + count],
+                                    &mut dists[..count],
+                                    count,
+                                );
+                                for r in 0..count {
+                                    let candidate =
+                                        DistTid { dist: dists[r], tid: view.tid(base + r) };
+                                    if heap.len() < top_k {
+                                        heap.push(candidate);
+                                    } else if let Some(mut worst) = heap.peek_mut() {
+                                        if candidate.dist < worst.dist {
+                                            *worst = candidate;
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             // 4/8-bit: SIMD ex-dot per entry (row-major).
                             for i in 0..view.len() {

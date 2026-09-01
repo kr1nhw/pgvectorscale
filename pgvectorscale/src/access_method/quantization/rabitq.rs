@@ -147,6 +147,31 @@ pub fn code_hamming(a: &[u8], b: &[u8]) -> usize {
 #[inline]
 pub fn dot_with_rotated_fields(num_bits: u8, dim: u32, packed_code: &[u8], rot: &[f32]) -> f32 {
     match num_bits {
+        2 => {
+            // 1 sign bit + 1 ex bit per dim, 4 dims per byte (bits 2j = sign,
+            // 2j+1 = ex).  Lance full_dot: 2·Σ sign·rot + Σ ex·rot − 1.5·Σrot,
+            // with the sign bit unsigned 0/1.
+            let code_scale = 2.0;
+            let code_bias = -1.5;
+            let mut binary_ip = 0.0f32;
+            let mut ex_dist = 0.0f32;
+            for (bi, &b) in packed_code.iter().enumerate() {
+                for j in 0..4u32 {
+                    let dim_idx = bi as u32 * 4 + j;
+                    if dim_idx as usize >= rot.len() {
+                        break;
+                    }
+                    let r = rot[dim_idx as usize];
+                    if b & (1 << (2 * j)) != 0 {
+                        binary_ip += r;
+                    }
+                    ex_dist += ((b >> (2 * j + 1)) & 1) as f32 * r;
+                }
+            }
+            code_scale * binary_ip
+                + ex_dist
+                + code_bias * rot[..dim as usize].iter().sum::<f32>()
+        }
         4 => {
             let code_scale = 8.0;
             let code_bias = -7.5;
@@ -608,6 +633,49 @@ pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
         let (rot_c, sum_rc) = self.rotate_center_of(centroid);
 
         match self.num_bits {
+            2 => {
+                // 1 sign bit + 1 ex bit per dim, packed 4 dims per byte
+                // (bits 2j = sign, 2j+1 = ex).  Same Lance norm-aware ex
+                // quantization as the 4/8-bit arms with ex_bits = 1:
+                //   l1_of_rotated = ⟨rot, code⟩ (reconstruction dot)
+                //   sum_of_x2     = ‖r‖²
+                let ex_bits = 1u32;
+                let max_code: u8 = 1;
+                let mask: u8 = 0x1;
+                let code_scale = 2.0f32;
+                let code_bias = -1.5f32;
+                let norm = sum_of_x2.sqrt().max(1e-9);
+                let abs_normalized: Vec<f32> =
+                    rotated.iter().map(|v| v.abs() / norm).collect();
+                let t = Self::best_ex_rescale_factor(&abs_normalized, ex_bits);
+                let mut code = vec![0u8; self.dim.div_ceil(4)];
+                let mut res_dot = 0.0f32; // ⟨rot, code⟩
+                let mut cent_dot = 0.0f32; // ⟨rot_c, code⟩
+                for (i, &v) in rotated.iter().enumerate() {
+                    let mut ex = ((t * abs_normalized[i]) + Self::EX_QUANTIZATION_EPSILON)
+                        .floor()
+                        .clamp(0.0, max_code as f32) as u8;
+                    if v.is_sign_negative() {
+                        ex = (!ex) & mask;
+                    }
+                    let sign_bit = u8::from(v.is_sign_positive());
+                    let full_code = ((sign_bit as u32) << ex_bits) + ex as u32;
+                    let factor = full_code as f32 + code_bias;
+                    res_dot += v * factor;
+                    cent_dot += factor * rot_c[i];
+                    // byte i/4: bit 2j = sign, bit 2j+1 = ex.
+                    let j = (i % 4) as u8;
+                    code[i / 4] |= (sign_bit << (2 * j)) | ((ex & mask) << (2 * j + 1));
+                }
+                RabitqVector {
+                    dim: self.dim as u32,
+                    sum_of_x2,
+                    l1_of_rotated: res_dot,
+                    packed_code: code,
+                    num_bits: self.num_bits,
+                    cent_dot,
+                }
+            }
             4 | 8 => {
                 // Lance sign + unsigned ex-bits code: per dimension the top
                 // bit is the sign, the low (num_bits-1) bits are the magnitude
@@ -788,11 +856,14 @@ pub struct RabitqFastScan<'a> {
     /// Fused dequantize constants: `full_dot = a_full·sum + b_full`.
     a_full: f32,
     b_full: f32,
+    /// 2-bit affine constants: `full_dot = a_2bit·(2·sum0 + sum1) + b_2bit`.
+    a_2bit: f32,
+    b_2bit: f32,
 }
 
 impl<'a> RabitqFastScan<'a> {
     pub fn new(rq: &'a RabitqQuery, num_bits: u8, dim: usize) -> Self {
-        let (table_u8, qmin, range_scale, num_chunks) = if num_bits == 1 {
+        let (table_u8, qmin, range_scale, num_chunks) = if num_bits == 1 || num_bits == 2 {
             let f32_table = Self::build_table(&rq.rotated);
             let (q, qmin, rs) = crate::access_method::quantization::rabitq_fastscan::quantize_table(
                 &f32_table,
@@ -805,6 +876,11 @@ impl<'a> RabitqFastScan<'a> {
         //        = (2·range_scale)·sum + (2·num_chunks·qmin − sum_rot).
         let a_full = 2.0 * range_scale;
         let b_full = 2.0 * num_chunks as f32 * qmin - rq.sum_q;
+        // 2-bit: dot = 2·m + e − 1.5·Σrot with m/e the two plane sums, each
+        // dequantized as sum·range_scale + num_chunks·qmin:
+        //   = (2·s0 + s1)·range_scale + 3·num_chunks·qmin − 1.5·Σrot.
+        let a_2bit = range_scale;
+        let b_2bit = 3.0 * num_chunks as f32 * qmin - 1.5 * rq.sum_q;
         Self {
             rq,
             num_bits,
@@ -818,6 +894,8 @@ impl<'a> RabitqFastScan<'a> {
             rq_margin: rq.sum_of_x2.max(0.0).sqrt(),
             a_full,
             b_full,
+            a_2bit,
+            b_2bit,
         }
     }
 
@@ -875,6 +953,35 @@ impl<'a> RabitqFastScan<'a> {
             mf,
             self.a_full,
             self.b_full,
+            self.rq_sum_of_x2,
+            self.rq_margin,
+            out,
+            n,
+        );
+    }
+
+    /// Fused estimate for a batch of 2-bit rows from the two plane sums
+    /// (dequantize + combine + L2), SIMD over 4/8 rows.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn estimate_batch_2bit(
+        &self,
+        sums0: &[u16],
+        sums1: &[u16],
+        scales: &[f32],
+        sx2: &[f32],
+        mf: &[f32],
+        out: &mut [f32],
+        n: usize,
+    ) {
+        crate::access_method::quantization::rabitq_fastscan::estimate_batch_2bit(
+            sums0,
+            sums1,
+            scales,
+            sx2,
+            mf,
+            self.a_2bit,
+            self.b_2bit,
             self.rq_sum_of_x2,
             self.rq_margin,
             out,
@@ -1413,6 +1520,92 @@ mod four_bit_tests {
         assert_eq!(
             est[0].0, exact[0].0,
             "8-bit estimator must rank the exact NN first"
+        );
+    }
+}
+
+#[cfg(test)]
+mod two_bit_tests {
+    use super::*;
+
+    #[test]
+    fn two_bit_dot_matches_unpacked_reference() {
+        // Unpack the 2-bit code and compare dot_with_rotated_fields against
+        // Σ (full_code − 1.5)·rot (guards the sign-0/1 convention).
+        let dim = 128usize;
+        let q = RabitqQuantizer::new(2, 7, dim);
+        let v: Vec<f32> = (0..dim).map(|i| ((i % 11) as f32) - 5.0).collect();
+        let qv = q.quantize(&v);
+        assert_eq!(qv.packed_code.len(), dim / 4, "2-bit packs 4 dims per byte");
+        let rot: Vec<f32> = (0..dim).map(|i| ((i % 9) as f32) - 4.0).collect();
+
+        let full_dot = dot_with_rotated_fields(2, dim as u32, &qv.packed_code, &rot);
+
+        let mut reference = 0.0f32;
+        for (byte_idx, &b) in qv.packed_code.iter().enumerate() {
+            for j in 0..4usize {
+                let d = byte_idx * 4 + j;
+                let sign = (b >> (2 * j)) & 1;
+                let ex = (b >> (2 * j + 1)) & 1;
+                let full_code = ((sign as u32) << 1) + ex as u32;
+                reference += (full_code as f32 - 1.5) * rot[d];
+            }
+        }
+        assert!(
+            (full_dot - reference).abs() <= 1e-3 * reference.abs().max(1.0),
+            "dot {} vs {}",
+            full_dot,
+            reference
+        );
+    }
+
+    #[test]
+    fn two_bit_fastscan_matches_estimate_l2_fields() {
+        // The two-plane FastScan estimate must agree with the scalar
+        // estimate_l2_fields path (within the u8-table tolerance).
+        let dim = 128usize;
+        let q = RabitqQuantizer::new(2, 42, dim);
+        let v: Vec<f32> = (0..dim).map(|i| ((i % 7) as f32) - 3.0).collect();
+        let qv = q.quantize(&v);
+        let rq = q.rotate_query(&v);
+        let fastscan = RabitqFastScan::new(&rq, 2, q.dim());
+
+        // Split into planes (mirroring serialize_entries) and transpose one row.
+        let mut sign_plane = vec![0u8; dim / 8];
+        let mut ex_plane = vec![0u8; dim / 8];
+        for (byte_idx, &b) in qv.packed_code.iter().enumerate() {
+            for j in 0..4usize {
+                let d = byte_idx * 4 + j;
+                if b & (1 << (2 * j)) != 0 {
+                    sign_plane[d / 8] |= 1 << (d % 8);
+                }
+                if b & (1 << (2 * j + 1)) != 0 {
+                    ex_plane[d / 8] |= 1 << (d % 8);
+                }
+            }
+        }
+        let p0 = crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
+            &sign_plane, 1, dim / 8,
+        );
+        let p1 = crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
+            &ex_plane, 1, dim / 8,
+        );
+        let mut s0 = [0u16; 32];
+        let mut s1 = [0u16; 32];
+        fastscan.sum_batch(&p0, &mut s0);
+        fastscan.sum_batch(&p1, &mut s1);
+        let scale = -2.0 * qv.sum_of_x2 / qv.l1_of_rotated.max(1e-9);
+        let margin_factor =
+            2.0 * qv.sum_of_x2.max(0.0).sqrt() / (q.dim() as f32).sqrt().max(1.0);
+        let mut out = [0f32; 32];
+        fastscan.estimate_batch_2bit(&s0, &s1, &[scale], &[qv.sum_of_x2], &[margin_factor], &mut out, 1);
+
+        let expected = q.estimate_l2(&qv, &rq);
+        assert!(
+            (out[0] - expected).abs() <= 1.0,
+            "fastscan 2-bit estimate {} vs scalar {}",
+            out[0],
+            expected
         );
     }
 }

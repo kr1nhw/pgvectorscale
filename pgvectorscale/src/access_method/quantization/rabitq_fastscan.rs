@@ -231,6 +231,153 @@ unsafe fn estimate_batch_avx2(
     estimate_batch_scalar(&sums[i..], &scales[i..], &sx2[i..], &mf[i..], a_full, b_full, rq_sum, rq_margin, &mut out[i..], n - i);
 }
 
+/// Fused L2 estimate for 2-bit rows from the two bit-plane sums.
+///
+/// Per row: `dot = (2·sum0 + sum1)·a2 + b2` with `a2 = range_scale` and
+/// `b2 = 3·num_chunks·qmin − 1.5·Σrot` (Lance: `full_dot = 2·m + e − 1.5·Σrot`
+/// where `m`/`e` are the sign/ex plane sums); the estimate then uses the same
+/// fused formula as [`estimate_batch`].  u32 intermediates avoid the u16
+/// overflow that `2·sum0 + sum1` would hit at very high dimensions.
+#[inline]
+pub fn estimate_batch_2bit(
+    sums0: &[u16],
+    sums1: &[u16],
+    scales: &[f32],
+    sx2: &[f32],
+    mf: &[f32],
+    a2: f32,
+    b2: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: only selected when AVX2 was detected.
+            unsafe {
+                estimate_batch_2bit_avx2(sums0, sums1, scales, sx2, mf, a2, b2, rq_sum, rq_margin, out, n);
+                return;
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64.
+        unsafe {
+            estimate_batch_2bit_neon(sums0, sums1, scales, sx2, mf, a2, b2, rq_sum, rq_margin, out, n);
+            return;
+        }
+    }
+    estimate_batch_2bit_scalar(sums0, sums1, scales, sx2, mf, a2, b2, rq_sum, rq_margin, out, n);
+}
+
+#[inline]
+fn estimate_batch_2bit_scalar(
+    sums0: &[u16],
+    sums1: &[u16],
+    scales: &[f32],
+    sx2: &[f32],
+    mf: &[f32],
+    a2: f32,
+    b2: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) {
+    for i in 0..n {
+        let s = (2 * sums0[i] as u32 + sums1[i] as u32) as f32;
+        let dot = s * a2 + b2;
+        out[i] = (dot * scales[i] + rq_sum + sx2[i] - mf[i] * rq_margin).max(0.0);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn estimate_batch_2bit_neon(
+    sums0: &[u16],
+    sums1: &[u16],
+    scales: &[f32],
+    sx2: &[f32],
+    mf: &[f32],
+    a2: f32,
+    b2: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) {
+    use std::arch::aarch64::*;
+    let rq_sum_v = vdupq_n_f32(rq_sum);
+    let rq_margin_v = vdupq_n_f32(rq_margin);
+    let a2_v = vdupq_n_f32(a2);
+    let b2_v = vdupq_n_f32(b2);
+    let zero = vdupq_n_f32(0.0);
+    let mut i = 0;
+    while i + 4 <= n {
+        let s0_32 = vmovl_u16(vld1_u16(sums0.as_ptr().add(i)));
+        let s1_32 = vmovl_u16(vld1_u16(sums1.as_ptr().add(i)));
+        let s_32 = vmlaq_n_u32(s1_32, s0_32, 2); // 2·sum0 + sum1 (u32)
+        let s_f = vcvtq_f32_u32(s_32);
+        let dot = vmlaq_n_f32(b2_v, s_f, a2);
+        let scale_v = vld1q_f32(scales.as_ptr().add(i));
+        let sx2_v = vld1q_f32(sx2.as_ptr().add(i));
+        let mf_v = vld1q_f32(mf.as_ptr().add(i));
+        let mut acc = vaddq_f32(rq_sum_v, sx2_v);
+        acc = vmlaq_f32(acc, dot, scale_v);
+        acc = vmlsq_n_f32(acc, mf_v, rq_margin);
+        vst1q_f32(out.as_mut_ptr().add(i), vmaxq_f32(acc, zero));
+        i += 4;
+    }
+    estimate_batch_2bit_scalar(&sums0[i..], &sums1[i..], &scales[i..], &sx2[i..], &mf[i..], a2, b2, rq_sum, rq_margin, &mut out[i..], n - i);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn estimate_batch_2bit_avx2(
+    sums0: &[u16],
+    sums1: &[u16],
+    scales: &[f32],
+    sx2: &[f32],
+    mf: &[f32],
+    a2: f32,
+    b2: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) {
+    use std::arch::x86_64::*;
+    let rq_sum_v = _mm256_set1_ps(rq_sum);
+    let rq_margin_v = _mm256_set1_ps(rq_margin);
+    let a2_v = _mm256_set1_ps(a2);
+    let b2_v = _mm256_set1_ps(b2);
+    let two = _mm256_set1_ps(2.0);
+    let zero = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let s0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_loadu_si128(
+            sums0.as_ptr().add(i) as *const __m128i,
+        )));
+        let s1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_loadu_si128(
+            sums1.as_ptr().add(i) as *const __m128i,
+        )));
+        let s = _mm256_fmadd_ps(s0, two, s1); // 2·sum0 + sum1
+        let dot = _mm256_fmadd_ps(s, a2_v, b2_v);
+        let scale_v = _mm256_loadu_ps(scales.as_ptr().add(i));
+        let sx2_v = _mm256_loadu_ps(sx2.as_ptr().add(i));
+        let mf_v = _mm256_loadu_ps(mf.as_ptr().add(i));
+        let mut acc = _mm256_add_ps(rq_sum_v, sx2_v);
+        acc = _mm256_fmadd_ps(dot, scale_v, acc);
+        acc = _mm256_fnmadd_ps(mf_v, rq_margin_v, acc);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_max_ps(acc, zero));
+        i += 8;
+    }
+    estimate_batch_2bit_scalar(&sums0[i..], &sums1[i..], &scales[i..], &sx2[i..], &mf[i..], a2, b2, rq_sum, rq_margin, &mut out[i..], n - i);
+}
+
 /// Sum the quantized table for one 32-row transposed batch.
 ///
 /// `codes` is `code_len × 32` transposed bytes, `table` is the flat

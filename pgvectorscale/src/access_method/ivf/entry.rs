@@ -80,15 +80,48 @@ pub fn serialize_entries(entries: &[IvfEntry]) -> Vec<u8> {
         buf.extend_from_slice(&e.heap_tid.block_number.to_le_bytes());
         buf.extend_from_slice(&e.heap_tid.offset.to_le_bytes());
     }
-    if num_bits == 1 {
-        // 1-bit codes are stored transposed (32-row batches) for SIMD FastScan.
-        let mut row_major = Vec::with_capacity(n * code_len);
-        for e in entries {
-            row_major.extend_from_slice(&e.code.packed_code);
+    if num_bits == 1 || num_bits == 2 {
+        // 1-bit codes are stored transposed (32-row batches) for SIMD
+        // FastScan.  2-bit codes are split into their sign and ex bit-planes
+        // (each a plain 1-bit-style code of `code_len/2` bytes per vector)
+        // and both planes are transposed: plane0 then plane1.
+        let plane_len = if num_bits == 1 { code_len } else { code_len / 2 };
+        if num_bits == 1 {
+            let mut row_major = Vec::with_capacity(n * code_len);
+            for e in entries {
+                row_major.extend_from_slice(&e.code.packed_code);
+            }
+            let transposed = crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
+                &row_major, n, code_len,
+            );
+            buf.extend_from_slice(&transposed);
+        } else {
+            let mut sign_plane = Vec::with_capacity(n * plane_len);
+            let mut ex_plane = Vec::with_capacity(n * plane_len);
+            for e in entries {
+                let mut sp = vec![0u8; plane_len];
+                let mut ep = vec![0u8; plane_len];
+                for (byte_idx, &b) in e.code.packed_code.iter().enumerate() {
+                    for j in 0..4usize {
+                        let d = byte_idx * 4 + j;
+                        if b & (1 << (2 * j)) != 0 {
+                            sp[d / 8] |= 1 << (d % 8);
+                        }
+                        if b & (1 << (2 * j + 1)) != 0 {
+                            ep[d / 8] |= 1 << (d % 8);
+                        }
+                    }
+                }
+                sign_plane.extend_from_slice(&sp);
+                ex_plane.extend_from_slice(&ep);
+            }
+            buf.extend_from_slice(&crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
+                &sign_plane, n, plane_len,
+            ));
+            buf.extend_from_slice(&crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
+                &ex_plane, n, plane_len,
+            ));
         }
-        let transposed =
-            crate::access_method::quantization::rabitq_fastscan::transpose_1bit(&row_major, n, code_len);
-        buf.extend_from_slice(&transposed);
     } else {
         for e in entries {
             buf.extend_from_slice(&e.code.packed_code);
@@ -135,7 +168,10 @@ impl<'a> IvfEntrySlice<'a> {
         let tid_off = ENTRY_HEADER_SIZE;
         let code_off = tid_off + num_entries * TID_SIZE;
         // 1-bit codes are stored transposed (batched by 32, zero-padded).
-        let codes_len = if num_bits == 1 {
+        // 1-bit: transposed 32-row batches.  2-bit: the sign and ex planes
+        // are each transposed, so the combined region is also
+        // ceil(n/32)·32·code_len (plane_len = code_len/2, two planes).
+        let codes_len = if num_bits == 1 || num_bits == 2 {
             num_entries.div_ceil(32) * 32 * code_len
         } else {
             num_entries * code_len
@@ -217,6 +253,22 @@ impl<'a> IvfEntrySlice<'a> {
     pub fn code_batch(&self, batch: usize) -> &'a [u8] {
         let b = 32 * self.code_len;
         &self.codes[batch * b..(batch + 1) * b]
+    }
+
+    /// Transposed sign-plane of 2-bit batch `batch` (32 × code_len/2 bytes).
+    #[inline]
+    pub fn code_batch_plane0(&self, batch: usize) -> &'a [u8] {
+        let half = self.code_len / 2;
+        let start = batch * 32 * self.code_len;
+        &self.codes[start..start + 32 * half]
+    }
+
+    /// Transposed ex-plane of 2-bit batch `batch` (32 × code_len/2 bytes).
+    #[inline]
+    pub fn code_batch_plane1(&self, batch: usize) -> &'a [u8] {
+        let half = self.code_len / 2;
+        let start = batch * 32 * self.code_len + 32 * half;
+        &self.codes[start..start + 32 * half]
     }
 
     /// `sum_of_x2` (residual norm squared) of entry `i`.
@@ -359,10 +411,13 @@ pub fn seal_entries(index: &PgRelation, entries: Vec<IvfEntry>) -> IvfSegment {
 pub fn seal_bytes_len(n: usize, num_bits: u8, dim_padded: u32) -> usize {
     let code_len = match num_bits {
         1 => dim_padded as usize / 8,
+        2 => dim_padded as usize / 4,
         4 => dim_padded as usize / 2,
         _ => dim_padded as usize,
     };
-    let codes = if num_bits == 1 {
+    // 1-bit and 2-bit codes are stored transposed (2-bit as two planes, which
+    // sums to the same ceil(n/32)·32·code_len total).
+    let codes = if num_bits == 1 || num_bits == 2 {
         n.div_ceil(32) * 32 * code_len
     } else {
         n * code_len
@@ -595,14 +650,40 @@ impl<'a> IvfEntryReader<'a> {
             return Vec::new();
         }
         let view = IvfEntrySlice::parse(&buf);
-        // 1-bit codes are stored transposed; recover row-major for the
-        // in-memory IvfEntry (the rewrite path re-transposes on serialize).
+        // Transposed codes are recovered to row-major for the in-memory
+        // IvfEntry (the rewrite path re-transposes on serialize): 1-bit is a
+        // single plane; 2-bit re-interleaves its two planes into the packed
+        // 4-dims-per-byte form.
         let row_major: Vec<u8> = if view.num_bits() == 1 {
             crate::access_method::quantization::rabitq_fastscan::untranspose_1bit(
                 view.codes(),
                 view.len(),
                 view.code_len(),
             )
+        } else if view.num_bits() == 2 {
+            let half = view.code_len() / 2;
+            let n_batches = view.num_batches();
+            let plane_bytes = n_batches * 32 * half;
+            let p0 = crate::access_method::quantization::rabitq_fastscan::untranspose_1bit(
+                &view.codes()[..plane_bytes],
+                view.len(),
+                half,
+            );
+            let p1 = crate::access_method::quantization::rabitq_fastscan::untranspose_1bit(
+                &view.codes()[plane_bytes..plane_bytes * 2],
+                view.len(),
+                half,
+            );
+            let mut packed = vec![0u8; view.len() * view.code_len()];
+            for i in 0..view.len() {
+                for d in 0..half * 8 {
+                    let sign = (p0[i * half + d / 8] >> (d % 8)) & 1;
+                    let ex = (p1[i * half + d / 8] >> (d % 8)) & 1;
+                    packed[i * view.code_len() + d / 4] |=
+                        (sign << (2 * (d % 4))) | (ex << (2 * (d % 4) + 1));
+                }
+            }
+            packed
         } else {
             Vec::new()
         };
@@ -613,7 +694,7 @@ impl<'a> IvfEntryReader<'a> {
                     dim: view.dim() as u32,
                     sum_of_x2: view.sum_of_x2(i),
                     l1_of_rotated: view.l1_reconstructed(i),
-                    packed_code: if view.num_bits() == 1 {
+                    packed_code: if view.num_bits() == 1 || view.num_bits() == 2 {
                         row_major[i * view.code_len()..(i + 1) * view.code_len()].to_vec()
                     } else {
                         view.code(i).to_vec()
@@ -642,5 +723,52 @@ impl<'a> IvfEntryReader<'a> {
         }
         let view = IvfEntrySlice::parse(&buf);
         f(&view);
+    }
+}
+
+#[cfg(test)]
+mod two_bit_soa_tests {
+    use super::*;
+    use crate::access_method::quantization::rabitq::{padded_dim, RabitqQuantizer};
+
+    #[test]
+    fn two_bit_soa_roundtrip_and_sizing() {
+        let dim = 128usize;
+        let q = RabitqQuantizer::new(2, 5, dim);
+        let mut entries = Vec::new();
+        for i in 0..40usize {
+            let v: Vec<f32> = (0..dim).map(|d| ((i * 13 + d * 7) % 23) as f32 - 11.0).collect();
+            entries.push(IvfEntry {
+                heap_tid: ItemPointer::new(i as u32, 1),
+                code: q.quantize(&v),
+            });
+        }
+
+        let bytes = serialize_entries(&entries);
+        assert_eq!(
+            bytes.len(),
+            seal_bytes_len(entries.len(), 2, padded_dim(dim) as u32),
+            "seal sizing must match the serialized length"
+        );
+
+        let view = IvfEntrySlice::parse(&bytes);
+        assert_eq!(view.num_bits(), 2);
+        assert_eq!(view.len(), 40);
+        assert_eq!(view.num_batches(), 40usize.div_ceil(32));
+
+        // Round-trip through the zero-copy parse → read path.
+        let parsed = {
+            let mut out = Vec::new();
+            for i in 0..view.len() {
+                let (tid, code) = (view.tid(i), view.code(i));
+                let _ = (tid, code);
+            }
+            for i in 0..view.len() {
+                out.push(view.tid(i));
+            }
+            out
+        };
+        assert_eq!(parsed.len(), 40);
+        assert_eq!(parsed[7].block_number, 7);
     }
 }
