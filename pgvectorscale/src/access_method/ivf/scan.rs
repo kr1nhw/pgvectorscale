@@ -204,25 +204,10 @@ pub unsafe extern "C-unwind" fn amgettuple(
                 let centroid = &centroid_page.centroids[list_id as usize];
                 let rq = quantizer.rotate_query_residual(centroid, &scan_state.query);
                 let fastscan = RabitqFastScan::new(&rq, num_bits, quantizer.dim());
-                let segments: Vec<&crate::access_method::ivf::segment::IvfSegment> =
-                    segment_list
-                        .segments
-                        .iter()
-                        .filter(|s| {
-                            s.start_page != pg_sys::InvalidBlockNumber && s.num_blocks > 0
-                        })
-                        .collect();
-                for (seg_idx, segment) in segments.iter().enumerate() {
-                    // Neon: pipeline the next segment's page fetches with this
-                    // segment's scoring.  `smgrprefetch` on libpagestore issues
-                    // asynchronous page requests, so the next segment's
-                    // `smgrreadv` finds the pages already in flight or resident
-                    // instead of paying a synchronous round trip.
-                    #[cfg(feature = "neon")]
-                    if let Some(next) = segments.get(seg_idx + 1) {
-                        reader.prefetch_blocks(next.start_page, next.num_blocks);
-                    }
-                    reader.for_each_slice(segment.start_page, segment.num_blocks, |view| {
+                for segment in &segment_list.segments {
+                    if segment.start_page == pg_sys::InvalidBlockNumber || segment.num_blocks == 0 {
+                        continue;
+                    }                    reader.for_each_slice(segment.start_page, segment.num_blocks, |view| {
                         if num_bits == 1 {
                             // 1-bit: SIMD FastScan sum + fused SIMD estimate over
                             // 32-row transposed batches.
