@@ -57,6 +57,35 @@ Notes:
   ivfrq for large datasets on small CUs; hnsw only with reduced m/ef_construction
   or smaller datasets.**
 
+## 1b. A1 measurements (2 CU proxy, measured 2026-09-02)
+
+2 CU proxy = `shared_buffers` 256/512MB, LFC 2GB, postmaster pinned to 2
+vCPUs; ivf built in-place (160 s), 9-point sweep:
+
+- ivfrq p50 @99.7% recall: **~430–700 ms** (vs 6.4 ms vanilla, ~5.7 ms at the
+  8 CU tier). The parity target is NOT met at 2 CU with current code.
+- Three cost mechanisms identified (perf trace + EXPLAIN BUFFERS):
+  1. **WAL-redo on first touch**: freshly built pages live in WAL-only
+     layers; every first read pays `neon_walredo` per page (~0.4 ms/page,
+     serialized). Fixed by aggressive pageserver compaction
+     (`compaction_period=2s, compaction_threshold=1` in pageserver.toml +
+     restart): new-qid fetches dropped from 13–326 ms to ~2–5 ms.
+  2. **Per-query first-touch working set**: each distinct query touches
+     ~1000 buffer-manager pages (heap recheck + active-segment entries);
+     on Neon a miss = one pageserver round trip (~0.4 ms), on vanilla it is
+     a local read. The 100-query sweep working set (~800 MB) exceeds the
+     2 CU buffer budget, so the timed pass re-misses (~370 ms p50 even
+     after warmup). Same-qid repeats: ~2 ms.
+  3. **Unsealed active segments**: a freshly built (never VACUUMed) index
+     serves entries through the buffer-manager row path instead of the
+     `smgrreadv` FastScan path (EXPLAIN: read=676–990, dirtied≈written≈
+     600–780 per query). VACUUM did not remove the cost in this build —
+     seal/merge behavior needs review (`vacuum.rs`).
+- Actions: (a) benchmark recipe = compact after build + VACUUM + warm; (b)
+  investigate the executor recheck heap-fetch amplification (top_k=1000
+  candidates ⇒ up to ~1000 heap fetches/query) — reducing it is the
+  highest-leverage 2 CU fix; (c) review active-segment sealing.
+
 ## 2. LFC (local file cache) — the primary lever, sized to the CU
 
 Facts from this session:
@@ -93,20 +122,19 @@ The read path: ivf scan issues `smgrreadv` segment bursts → libpagestore →
 LFC hit (local pread) or pageserver fetch (0.4–1 ms localhost RTT). Today the
 scan is **synchronous**: burst N+1 is issued only after burst N is consumed.
 
-1. **Our side (vectorscale scan): software pipelining.** Issue the next
-   segment's readv before scoring the current one (double-buffer the raw
-   buffers in `entry.rs::read_bytes`). Memory cost: one extra segment burst
-   (~1–3 MB) — negligible in any CU budget. On LFC hits this overlaps compute
-   with pread; on misses it overlaps FastScan compute with the pageserver RTT.
-   Expected: hides most of the residual Neon gap for multi-segment scans
-   (large `probes`), little effect on single-segment scans.
-2. **Neon's `smgr_prefetch` hook.** The fork's smgr vtable has
-   `smgrprefetch()` → `neon_prefetch` (libpagestore). Our scan can prefetch
-   the next list's blocks before `smgrreadv` — the pageserver/LFC fetch
-   overlaps with scoring. This is the "coherence" win between our predictable
-   segment-list access pattern and Neon's smgr.
-3. Both are CPU-cheap and RAM-cheap — **explicitly compatible with 2 CU**
-   (they trade the idle wait time for a little scheduling, not for memory).
+1. **Measured (A2/A3, 2026-09-02): implemented and REVERTED — no gain.**
+   A double-buffered `smgrreadv` pipeline + `smgrprefetch`
+   (`neon_prefetch`, feature-gated, commit `560e8cb`) was A/B'd on the 8 CU
+   tier (warm LFC): probes=1/8/64 p50 1.39→1.58 / 2.10→2.21 / 5.71→5.83 ms —
+   noise-level regression. On LFC-hit reads there is nothing to hide, and the
+   prefetch request overhead adds up. On LFC-miss bursts the win would be
+   bounded by libpagestore's own serialized per-page processing anyway
+   (perf trace: one recv→LFC-write→send cycle per page). Keep the revert
+   (`d67741e`); revisit only if a cold-path workload demands it.
+2. **The real read-path levers (measured, higher priority than prefetch):**
+   post-build pageserver compaction (walredo-per-page removal, §1b) and the
+   executor recheck heap-fetch amplification (top_k=1000 candidates ⇒ up to
+   ~1000 buffer-manager fetches per query — the dominant 2 CU cost).
 
 ## 4. Multi-pageserver / sharding — scale cache outside the CU
 
@@ -152,7 +180,7 @@ sharding** (`shard_count` / `shard_stripe_size` + a controller-driven split):
 |---|---|---|---|---|---|---|
 | ivf/ivfrq ≤ 1 GB index | 2–4 | 2–3 GB | 4 GB | 1 | §3.1 | = vanilla (projected from 8 CU parity) |
 | ivfrq ≥ 1 GB index (num_bits=8) | 4–8 | 4–10 GB | 4–8 GB | 1 | §3.1+§3.2 | → vanilla parity |
-| hnsw ≥ 8 GB graph | 8 | 10–12 GB (partial fit) | 8 GB × N | 3 | §3.2 | pageserver-bound; shards are the lever |
+| hnsw ≥ 8 GB graph | 2–8 | — | — | — | — | **use ivfrq instead** (mainline recommendation; do not tune hnsw) |
 | many tenants / throughput | any | per-CU auto-size | 8 GB × N | N | §3.2 | cache capacity × N |
 | write-heavy | any | — | — | any | — | WAL/ingest-bound (§5.3) |
 
