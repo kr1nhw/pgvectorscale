@@ -635,16 +635,34 @@ impl<'a> IvfEntryReader<'a> {
             // every byte, so zero-filling it would be pure wasted memset.
             let mut raw: Vec<u8> = Vec::with_capacity(n * blksz);
             raw.set_len(n * blksz);
-            let mut ptrs: Vec<*mut std::os::raw::c_void> = (0..n)
-                .map(|i| raw.as_mut_ptr().add(i * blksz) as *mut std::os::raw::c_void)
-                .collect();
-            pg_sys::smgrreadv(
-                reln,
-                pg_sys::ForkNumber::MAIN_FORKNUM,
-                start_page,
-                ptrs.as_mut_ptr(),
-                num_blocks as BlockNumber,
-            );
+
+            // The smgr vtable caps one vectored read.  Vanilla md allows
+            // PG_IOV_MAX (=IOV_MAX, 1024 on Linux), but Neon's fork defines
+            // PG_IOV_MAX as Min(IOV_MAX, 32) because a single pagestore
+            // request is bounded; its `neon_readv` errors above that.  Chunk
+            // the burst so the same code works under both smgr backends.
+            #[cfg(feature = "neon")]
+            let max_burst: usize = 32; // Neon fork: PG_IOV_MAX = Min(IOV_MAX, 32)
+            #[cfg(not(feature = "neon"))]
+            let max_burst: usize = 1024; // vanilla: IOV_MAX on Linux/macOS
+
+            let mut off = 0usize;
+            while off < n {
+                let chunk = (n - off).min(max_burst);
+                let mut ptrs: Vec<*mut std::os::raw::c_void> = (0..chunk)
+                    .map(|i| {
+                        raw.as_mut_ptr().add((off + i) * blksz) as *mut std::os::raw::c_void
+                    })
+                    .collect();
+                pg_sys::smgrreadv(
+                    reln,
+                    pg_sys::ForkNumber::MAIN_FORKNUM,
+                    start_page + off as BlockNumber,
+                    ptrs.as_mut_ptr(),
+                    chunk as BlockNumber,
+                );
+                off += chunk;
+            }
 
             let mut buf: Vec<u8> = Vec::with_capacity(n * blksz);
             for i in 0..n {
