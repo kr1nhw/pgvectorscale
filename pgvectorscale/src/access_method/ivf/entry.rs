@@ -594,6 +594,63 @@ impl<'a> IvfEntryReader<'a> {
         Self { index }
     }
 
+    /// The relation's smgr handle, opened on demand.  The scan normally has
+    /// it open already (the meta/centroid/directory pages go through the
+    /// buffer manager first); fall back to opening it if not.
+    unsafe fn smgr_reln(&self) -> pg_sys::SMgrRelation {
+        let rel = self.index.as_ptr();
+        let reln = (*rel).rd_smgr;
+        if reln.is_null() {
+            // Neon's fork extends `smgropen` with a `relpersistence`
+            // argument; vanilla PostgreSQL does not.
+            #[cfg(feature = "neon")]
+            {
+                pg_sys::smgropen(
+                    (*rel).rd_locator,
+                    (*rel).rd_backend,
+                    (*(*rel).rd_rel).relpersistence,
+                )
+            }
+            #[cfg(not(feature = "neon"))]
+            {
+                pg_sys::smgropen((*rel).rd_locator, (*rel).rd_backend)
+            }
+        } else {
+            reln
+        }
+    }
+
+    /// Ask the smgr layer to fetch a contiguous block range asynchronously.
+    ///
+    /// Neon-only: its pagestore smgr exposes `smgrprefetch` (bool return),
+    /// which issues asynchronous page requests to the pageserver/local file
+    /// cache so the following `smgrreadv` completes without a synchronous
+    /// round trip.  Vanilla md's `smgrprefetch` has a different (void)
+    /// signature, so the call is feature-gated.
+    #[cfg(feature = "neon")]
+    pub fn prefetch_blocks(&self, start_page: BlockNumber, num_blocks: u32) {
+        if num_blocks == 0 {
+            return;
+        }
+        unsafe {
+            let reln = self.smgr_reln();
+            // Neon caps a single pagestore request at PG_IOV_MAX = 32 blocks.
+            const MAX_BURST: usize = 32;
+            let n = num_blocks as usize;
+            let mut off = 0usize;
+            while off < n {
+                let chunk = (n - off).min(MAX_BURST);
+                let _ = pg_sys::smgrprefetch(
+                    reln,
+                    pg_sys::ForkNumber::MAIN_FORKNUM,
+                    start_page + off as BlockNumber,
+                    chunk as std::os::raw::c_int,
+                );
+                off += chunk;
+            }
+        }
+    }
+
     /// Bulk-read a list's contiguous entry blocks via `smgrreadv` and return the
     /// reassembled SoA byte stream.
     ///
@@ -605,29 +662,7 @@ impl<'a> IvfEntryReader<'a> {
             return Vec::new();
         }
         unsafe {
-            let rel = self.index.as_ptr();
-            // The relation's smgr handle is normally already open (the scan
-            // reads the meta/centroid/directory pages via the buffer manager
-            // first).  Fall back to opening it if not.
-            let reln = (*rel).rd_smgr;
-            let reln = if reln.is_null() {
-                // Neon's fork extends `smgropen` with a `relpersistence`
-                // argument; vanilla PostgreSQL does not.
-                #[cfg(feature = "neon")]
-                {
-                    pg_sys::smgropen(
-                        (*rel).rd_locator,
-                        (*rel).rd_backend,
-                        (*(*rel).rd_rel).relpersistence,
-                    )
-                }
-                #[cfg(not(feature = "neon"))]
-                {
-                    pg_sys::smgropen((*rel).rd_locator, (*rel).rd_backend)
-                }
-            } else {
-                reln
-            };
+            let reln = self.smgr_reln();
 
             let n = num_blocks as usize;
             let blksz = pg_sys::BLCKSZ as usize;
@@ -649,6 +684,23 @@ impl<'a> IvfEntryReader<'a> {
             let mut off = 0usize;
             while off < n {
                 let chunk = (n - off).min(max_burst);
+                // Neon: pipeline the next burst's fetch with this burst's read.
+                // `smgrprefetch` on libpagestore issues asynchronous page
+                // requests, so by the time the next `smgrreadv` runs the pages
+                // are already in flight or resident, hiding the round trip.
+                #[cfg(feature = "neon")]
+                {
+                    let next_off = off + chunk;
+                    if next_off < n {
+                        let next_chunk = (n - next_off).min(max_burst);
+                        let _ = pg_sys::smgrprefetch(
+                            reln,
+                            pg_sys::ForkNumber::MAIN_FORKNUM,
+                            start_page + next_off as BlockNumber,
+                            next_chunk as std::os::raw::c_int,
+                        );
+                    }
+                }
                 let mut ptrs: Vec<*mut std::os::raw::c_void> = (0..chunk)
                     .map(|i| {
                         raw.as_mut_ptr().add((off + i) * blksz) as *mut std::os::raw::c_void
