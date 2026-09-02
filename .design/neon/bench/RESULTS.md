@@ -130,7 +130,7 @@ single-node, while adding HA. See `K8S.md` and
 .design/neon/bench/run_sweep.sh $PSQL ivf|hnsw <label> sweep.csv
 
 # aggregate
-.design/neon/bench/aggregate_plot.py all.csv -o results
+.design/neon/bench/aggregate_plot.py all.csv -o results_table  # NB: not 'results' — clashes with RESULTS.md on case-insensitive FS
 ```
 
 Raw CSVs: `.design/neon/bench/data/all.csv`.
