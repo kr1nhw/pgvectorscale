@@ -116,6 +116,15 @@ pub fn estimate_batch(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+        {
+            // SAFETY: only selected when the AVX-512 families were detected.
+            unsafe {
+                estimate_batch_avx512(sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n);
+                return;
+            }
+        }
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: only selected when AVX2 was detected.
             unsafe {
@@ -254,6 +263,15 @@ pub fn estimate_batch_2bit(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+        {
+            // SAFETY: only selected when the AVX-512 families were detected.
+            unsafe {
+                estimate_batch_2bit_avx512(sums0, sums1, scales, sx2, mf, a2, b2, rq_sum, rq_margin, out, n);
+                return;
+            }
+        }
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: only selected when AVX2 was detected.
             unsafe {
@@ -390,6 +408,16 @@ pub fn sum_batch(codes: &[u8], code_len: usize, table: &[u8], out: &mut [u16]) -
 
     #[cfg(target_arch = "x86_64")]
     {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
+        {
+            // SAFETY: only selected when the AVX-512 families were detected.
+            unsafe {
+                sum_batch_avx512(codes, code_len, table, out);
+                return BATCH_SIZE;
+            }
+        }
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: only selected when AVX2 was detected.
             unsafe {
@@ -528,6 +556,189 @@ unsafe fn sum_batch_avx2(codes: &[u8], code_len: usize, table: &[u8], out: &mut 
         _mm256_blend_epi32(accu2, accu3, 0xF0),
     );
     _mm256_storeu_si256(out.as_mut_ptr().add(16) as *mut __m256i, dis1);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vbmi")]
+unsafe fn sum_batch_avx512(codes: &[u8], code_len: usize, table: &[u8], out: &mut [u16]) {
+    use std::arch::x86_64::*;
+
+    // 64-byte LUT lookups (vpermb) process TWO chunks per iteration: chunk
+    // 2k's 32 code bytes and chunk 2k+1's 32 code bytes are loaded as one
+    // zmm, the two 32-byte LUTs are concatenated, and each byte position's
+    // nibble index is offset by its LUT half: pos&0x30 (0/16/32/48).  This
+    // reproduces the per-128-bit-lane behavior of the AVX2 vpshufb kernel at
+    // twice the width.
+    let low_mask = _mm512_set1_epi8(0x0f);
+    #[rustfmt::skip]
+    static OFFSETS: [i8; 64] = [
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        16,16,16,16,16,16,16,16,16,16,16,16,16,16,16,16,
+        32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,
+        48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,
+    ];
+    let offsets = _mm512_loadu_si512(OFFSETS.as_ptr() as *const _);
+
+    let mut accu0 = _mm512_setzero_si512();
+    let mut accu1 = _mm512_setzero_si512();
+    let mut accu2 = _mm512_setzero_si512();
+    let mut accu3 = _mm512_setzero_si512();
+
+    // Padded scratch for an odd trailing chunk: its LUT/code halves are
+    // zeroed, so the pair iteration below accumulates +0 for it.
+    let padded: [u8; 128];
+    let (codes_ptr, lut_ptr, n_pairs) = if code_len % 2 == 1 {
+        padded = [0u8; 128];
+        std::ptr::copy_nonoverlapping(
+            codes.as_ptr().add((code_len - 1) * BATCH_SIZE),
+            padded.as_ptr() as *mut u8,
+            BATCH_SIZE,
+        );
+        std::ptr::copy_nonoverlapping(
+            table.as_ptr().add((code_len - 1) * BATCH_SIZE),
+            padded.as_ptr().add(BATCH_SIZE) as *mut u8,
+            BATCH_SIZE,
+        );
+        (padded.as_ptr(), padded.as_ptr().add(BATCH_SIZE), code_len / 2 + 1)
+    } else {
+        (codes.as_ptr(), table.as_ptr(), code_len / 2)
+    };
+
+    for k in 0..n_pairs {
+        let src = if code_len % 2 == 1 && k == n_pairs - 1 {
+            codes_ptr
+        } else {
+            codes.as_ptr().add(2 * k * BATCH_SIZE)
+        };
+        let lut_src = if code_len % 2 == 1 && k == n_pairs - 1 {
+            lut_ptr
+        } else {
+            table.as_ptr().add(2 * k * BATCH_SIZE)
+        };
+
+        let c64 = _mm512_loadu_si512(src as *const _);
+        let lut64 = _mm512_loadu_si512(lut_src as *const _);
+        let lo = _mm512_or_si512(_mm512_and_si512(c64, low_mask), offsets);
+        let hi = _mm512_or_si512(
+            _mm512_and_si512(_mm512_srli_epi16(c64, 4), low_mask),
+            offsets,
+        );
+        let res_lo = _mm512_permutexvar_epi8(lo, lut64);
+        let res_hi = _mm512_permutexvar_epi8(hi, lut64);
+        accu0 = _mm512_add_epi16(accu0, res_lo);
+        accu1 = _mm512_add_epi16(accu1, _mm512_srli_epi16(res_lo, 8));
+        accu2 = _mm512_add_epi16(accu2, res_hi);
+        accu3 = _mm512_add_epi16(accu3, _mm512_srli_epi16(res_hi, 8));
+    }
+
+    // Lanes 0..31 and 32..63 of each accumulator hold the same rows for the
+    // two chunks of a pair: fold them together, then apply the same epilogue
+    // as the AVX2 kernel.
+    let fold = |v: __m512i| -> __m256i {
+        let lo = _mm512_castsi512_si256(v);
+        let hi = _mm512_extracti64x4_epi64::<1>(v);
+        _mm256_add_epi16(lo, hi)
+    };
+    let mut a0 = fold(accu0);
+    let mut a1 = fold(accu1);
+    let mut a2 = fold(accu2);
+    let mut a3 = fold(accu3);
+
+    a0 = _mm256_sub_epi16(a0, _mm256_slli_epi16(a1, 8));
+    let dis0 = _mm256_add_epi16(
+        _mm256_permute2f128_si256(a0, a1, 0x21),
+        _mm256_blend_epi32(a0, a1, 0xF0),
+    );
+    _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, dis0);
+
+    a2 = _mm256_sub_epi16(a2, _mm256_slli_epi16(a3, 8));
+    let dis1 = _mm256_add_epi16(
+        _mm256_permute2f128_si256(a2, a3, 0x21),
+        _mm256_blend_epi32(a2, a3, 0xF0),
+    );
+    _mm256_storeu_si256(out.as_mut_ptr().add(16) as *mut __m256i, dis1);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw")]
+unsafe fn estimate_batch_avx512(
+    sums: &[u16],
+    scales: &[f32],
+    sx2: &[f32],
+    mf: &[f32],
+    a_full: f32,
+    b_full: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) {
+    use std::arch::x86_64::*;
+    let rq_sum_v = _mm512_set1_ps(rq_sum);
+    let rq_margin_v = _mm512_set1_ps(rq_margin);
+    let a_v = _mm512_set1_ps(a_full);
+    let b_v = _mm512_set1_ps(b_full);
+    let zero = _mm512_setzero_ps();
+    let mut i = 0;
+    while i + 16 <= n {
+        let sums_v = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(_mm256_loadu_si256(
+            sums.as_ptr().add(i) as *const __m256i,
+        )));
+        let scale_v = _mm512_loadu_ps(scales.as_ptr().add(i));
+        let sx2_v = _mm512_loadu_ps(sx2.as_ptr().add(i));
+        let mf_v = _mm512_loadu_ps(mf.as_ptr().add(i));
+        let mut acc = _mm512_fmadd_ps(scale_v, b_v, rq_sum_v);
+        acc = _mm512_add_ps(acc, sx2_v);
+        acc = _mm512_fnmadd_ps(mf_v, rq_margin_v, acc);
+        acc = _mm512_fmadd_ps(_mm512_mul_ps(sums_v, scale_v), a_v, acc);
+        _mm512_storeu_ps(out.as_mut_ptr().add(i), _mm512_max_ps(acc, zero));
+        i += 16;
+    }
+    estimate_batch_scalar(&sums[i..], &scales[i..], &sx2[i..], &mf[i..], a_full, b_full, rq_sum, rq_margin, &mut out[i..], n - i);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw")]
+unsafe fn estimate_batch_2bit_avx512(
+    sums0: &[u16],
+    sums1: &[u16],
+    scales: &[f32],
+    sx2: &[f32],
+    mf: &[f32],
+    a2: f32,
+    b2: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) {
+    use std::arch::x86_64::*;
+    let rq_sum_v = _mm512_set1_ps(rq_sum);
+    let rq_margin_v = _mm512_set1_ps(rq_margin);
+    let a2_v = _mm512_set1_ps(a2);
+    let b2_v = _mm512_set1_ps(b2);
+    let two = _mm512_set1_ps(2.0);
+    let zero = _mm512_setzero_ps();
+    let mut i = 0;
+    while i + 16 <= n {
+        let s0 = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(_mm256_loadu_si256(
+            sums0.as_ptr().add(i) as *const __m256i,
+        )));
+        let s1 = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(_mm256_loadu_si256(
+            sums1.as_ptr().add(i) as *const __m256i,
+        )));
+        let s = _mm512_fmadd_ps(s0, two, s1);
+        let dot = _mm512_fmadd_ps(s, a2_v, b2_v);
+        let scale_v = _mm512_loadu_ps(scales.as_ptr().add(i));
+        let sx2_v = _mm512_loadu_ps(sx2.as_ptr().add(i));
+        let mf_v = _mm512_loadu_ps(mf.as_ptr().add(i));
+        let mut acc = _mm512_add_ps(rq_sum_v, sx2_v);
+        acc = _mm512_fmadd_ps(dot, scale_v, acc);
+        acc = _mm512_fnmadd_ps(mf_v, rq_margin_v, acc);
+        _mm512_storeu_ps(out.as_mut_ptr().add(i), _mm512_max_ps(acc, zero));
+        i += 16;
+    }
+    estimate_batch_2bit_scalar(&sums0[i..], &sums1[i..], &scales[i..], &sx2[i..], &mf[i..], a2, b2, rq_sum, rq_margin, &mut out[i..], n - i);
 }
 
 #[cfg(test)]
