@@ -39,10 +39,10 @@ ANALYZE items;
 SELECT count(*) AS nrows FROM items;
 
 -- ---------- Part 1: build an index for every supported num_bits ----------
-CREATE INDEX items_ivf_1 ON items USING ivf (embedding) WITH (lists = 8, num_bits = 1);
-CREATE INDEX items_ivf_2 ON items USING ivf (embedding) WITH (lists = 8, num_bits = 2);
-CREATE INDEX items_ivf_4 ON items USING ivf (embedding) WITH (lists = 8, num_bits = 4);
-CREATE INDEX items_ivf_8 ON items USING ivf (embedding) WITH (lists = 8, num_bits = 8);
+CREATE INDEX items_ivf_1 ON items USING ivf (embedding vector_l2_ops) WITH (lists = 8, num_bits = 1);
+CREATE INDEX items_ivf_2 ON items USING ivf (embedding vector_l2_ops) WITH (lists = 8, num_bits = 2);
+CREATE INDEX items_ivf_4 ON items USING ivf (embedding vector_l2_ops) WITH (lists = 8, num_bits = 4);
+CREATE INDEX items_ivf_8 ON items USING ivf (embedding vector_l2_ops) WITH (lists = 8, num_bits = 8);
 
 SELECT indexrelid::regclass AS idx, indisvalid, indisready
 FROM pg_index WHERE indrelid = 'items'::regclass ORDER BY 1;
@@ -121,7 +121,7 @@ DECLARE
 BEGIN
   FOREACH nb IN ARRAY ARRAY[1,2,4,8] LOOP
     DROP INDEX IF EXISTS items_ivf_bits;
-    EXECUTE format('CREATE INDEX items_ivf_bits ON items USING ivf (embedding) WITH (lists = 8, num_bits = %s)', nb);
+    EXECUTE format('CREATE INDEX items_ivf_bits ON items USING ivf (embedding vector_l2_ops) WITH (lists = 8, num_bits = %s)', nb);
     total_hits := 0;
     total_exact := 0;
     FOR q IN SELECT id FROM probes LOOP

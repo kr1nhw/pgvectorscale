@@ -1,6 +1,11 @@
 #!/bin/bash
-# Concurrent DML + query smoke test against the Neon compute (55432)
-PSQL="/data1/neon-test/pg_install/v17/bin/psql -h 127.0.0.1 -p 55432 -U cloud_admin -d postgres -q -v ON_ERROR_STOP=1"
+# Concurrent DML + query smoke test against a running PostgreSQL/Neon compute.
+#
+# Usage: concurrent_dml.sh [psql]
+#   psql   full psql command (default: the Neon fork's psql on 127.0.0.1:55432)
+set -u
+
+PSQL="${1:-/data1/neon-test/pg_install/v17/bin/psql -h 127.0.0.1 -p 55432 -U cloud_admin -d postgres -q -v ON_ERROR_STOP=1}"
 PIDS=()
 
 # 4 concurrent inserters, 100 rows each
@@ -39,5 +44,10 @@ done
 echo "concurrent test finished, fail=$FAIL"
 $PSQL -c "SELECT count(*) AS nrows FROM items;"
 $PSQL -c "SET enable_seqscan=off; SELECT id, round((embedding <-> '[3,3,3,3,3,3,3,3]'::vector)::numeric,3) AS dist FROM items ORDER BY embedding <-> '[3,3,3,3,3,3,3,3]'::vector LIMIT 3;"
-$PSQL -c "VACUUM items; SELECT count(*) AS nrows_after_vacuum FROM items;"
+# VACUUM cannot run with psql -c (implicit transaction); run it via -f
+VACUUM_FILE="$(mktemp)"
+printf 'VACUUM items;\n' > "$VACUUM_FILE"
+$PSQL -f "$VACUUM_FILE" >/dev/null 2>&1
+rm -f "$VACUUM_FILE"
+$PSQL -c "SELECT count(*) AS nrows_after_vacuum FROM items;"
 $PSQL -c "SET enable_seqscan=off; SELECT id, round((embedding <-> '[3,3,3,3,3,3,3,3]'::vector)::numeric,3) AS dist FROM items ORDER BY embedding <-> '[3,3,3,3,3,3,3,3]'::vector LIMIT 3;"
