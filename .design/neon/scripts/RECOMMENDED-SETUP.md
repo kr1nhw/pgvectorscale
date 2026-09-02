@@ -18,6 +18,12 @@ neon_local endpoint stop main && neon_local endpoint start main
 
 Verify: `SHOW shared_buffers; SHOW neon.max_file_cache_size; SHOW neon.file_cache_size_limit;`
 
+CU-aware scaling (production): 1 CU = 1 vCPU + 2 GB RAM; typical computes are
+2 CU (4 GB) to 8 CU (16 GB). The 8 GB LFC above matches an ~8 CU dev box —
+scale down per size: 2 CU → LFC 2–2.5 GB / shared_buffers 256–512 MB;
+4 CU → LFC 4–6 GB; keep `neon.file_cache_size_limit <= ~60%` of CU RAM.
+See ../bench/../OPTIMIZATION-PLAN.md for the full memory-budget design.
+
 ## 2. Pageserver page cache (64MB default → 4GB)
 
 ```toml

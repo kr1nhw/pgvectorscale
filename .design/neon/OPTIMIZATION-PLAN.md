@@ -4,6 +4,12 @@ Evidence base: BIGANN-10M (128-dim, L2) benchmarks on the k8s-based Neon dev
 stack (`root@113.44.106.182`, 16 vCPU / 60 GB, QEMU guest) + `perf` profiling.
 See `bench/RESULTS.md`, `bench/K8S.md`, `scripts/RECOMMENDED-SETUP.md`.
 
+**Design constraint (production): the serverless compute is memory-bound.**
+Neon compute size units (CU): **1 CU = 1 vCPU + 2 GB RAM**; typical service
+sizes are 2 CU (2 vCPU / 4 GB) to 8 CU (8 vCPU / 16 GB). Everything below
+must fit that budget — the dev-box numbers (8–16 GB caches) are upper-bound
+references, not production settings.
+
 ## 0. The measured baseline (what we are optimizing against)
 
 | config | ivfrq p50 @99.4% recall | hnsw p50 @~99% recall | build (10M×128) |
@@ -15,127 +21,149 @@ See `bench/RESULTS.md`, `bench/K8S.md`, `scripts/RECOMMENDED-SETUP.md`.
 
 `perf stat` on a probes=64 workload backend: **7.3% CPU utilized on Neon vs
 100% on vanilla** (IPC ~1.9 on both). The Neon backend waits on pagestore
-reads ~93% of wall time. **Every Neon-side optimization below is therefore
-about the read path, not ALU.** (ALU/instruction promotion is a *vanilla*
-topic — see `../vanilla-simd-promotion.md`.)
+reads ~93% of wall time. **Every Neon-side optimization below is about the
+read path, not ALU.** (ALU/instruction promotion is a *vanilla* topic — see
+`../vanilla-simd-promotion.md`.)
 
-## 1. LFC (local file cache) — the primary lever
+## 1. Memory budget per CU (the coherence envelope)
+
+What a CU's RAM must cover: postgres shared_buffers + per-backend work_mem +
+connections + **LFC** (compute-local page cache) + the extension's own
+allocations (our scan allocates the readv burst buffers + candidate heaps).
+
+| CU | RAM | suggested split (tunable) | fits (BIGANN-10M) |
+|---|---|---|---|
+| 2 CU | 4 GB | shared_buffers 256–512 MB, LFC **2–2.5 GB**, rest for PG/conns | ivfrq (346 MB index + hot segments) ✔ |
+| 4 CU | 8 GB | shared_buffers 512 MB–1 GB, LFC **4–6 GB** | ivfrq ✔, hnsw graph *partial* (7.9 GB → thrash) |
+| 8 CU | 16 GB | shared_buffers 1–2 GB, LFC **10–12 GB** | ivfrq ✔, hnsw graph + hot heap *mostly* fits |
+
+Notes:
+
+- The production control plane auto-sizes LFC from the CU count; our spec has
+  `disable_lfc_resizing` — keep auto-sizing ON and tune within it. Our dev
+  numbers (8 GB LFC) correspond to roughly an 8 CU compute.
+- **Index size is now a first-class design constraint.** On 2–4 CU the LFC
+  cannot hold a 7.9 GB hnsw graph, so hnsw deep scans are pageserver-bound no
+  matter what. Our RaBitQ index is **~23× smaller** (346 MB at num_bits=1 for
+  10M×128; ~600 MB at num_bits=4; ~1.2 GB at num_bits=8) — it *fits* the 2 CU
+  budget, which is the architectural argument for ivfrq on small serverless
+  computes. The num_bits knob becomes a memory-budget knob, not just a
+  recall/speed one.
+- **Build-time memory is also CU-constrained.** pgvector hnsw needs ~10–12 GB
+  `maintenance_work_mem` to build 10M×128 without spilling — impossible on
+  2–8 CU computes (16 GB total at 8 CU); spilled builds are dramatically
+  slower. Our ivf build runs in a few minutes within small-CU memory
+  (parallel maintenance workers only). Co-design consequence: **recommend
+  ivfrq for large datasets on small CUs; hnsw only with reduced m/ef_construction
+  or smaller datasets.**
+
+## 2. LFC (local file cache) — the primary lever, sized to the CU
 
 Facts from this session:
 
-- LFC defaults to **disabled** (`neon.max_file_cache_size` = 0, PGC_POSTMASTER;
-  `neon.file_cache_size_limit` = 0, PGC_SIGHUP, capped by the max).
-- Enabling 8GB took ivfrq from 626 ms → 5.15 ms p50 (~120×): the 346 MB index +
-  hot heap pages fit entirely in LFC, so warm scans never touch the pageserver.
+- LFC defaults to **disabled** in dev (`neon.max_file_cache_size` = 0,
+  PGC_POSTMASTER; `neon.file_cache_size_limit` = 0, PGC_SIGHUP, capped by max).
+- 8 GB LFC took ivfrq from 626 ms → 5.15 ms p50 (~120×): index + hot heap
+  pages fit entirely in LFC, so warm scans never touch the pageserver.
 - hnsw stayed ~3–7× vanilla because the working set (7.9 GB graph + 5.3 GB
-  table) **exceeds 8 GB LFC + 4 GB pageserver cache**: deep ef_search walks
-  spill to pageserver round trips (the reproducible ef_search=320 spike,
-  76.6 ms on re-run, is a working-set boundary).
+  table) exceeded 8 GB LFC + 4 GB pageserver cache; the reproducible
+  ef_search=320 spike (76.6 ms on re-run) is a working-set boundary.
 
-Design rules:
+CU-aware design rules:
 
-1. **Size LFC to the index + hot heap pages, not to shared_buffers.**
-   `LFC ≈ index_size + hot_fraction × table_size + headroom`. For this box:
-   8 GB for ivfrq (measured parity), **16 GB for hnsw@10M** (predicted parity;
-   to be verified — the box has RAM headroom: 60 GB total, ~25–30 GB used).
-2. Keep `shared_buffers` modest (2 GB is fine): LFC is the cache that matters;
-   oversized shared_buffers just duplicate pages the LFC already serves.
+1. **Size LFC inside the CU budget**: `LFC ≈ min(index + hot_heap_pages,
+   ~60% of CU RAM)`. ivfrq 10M fits 2 CU (2–2.5 GB LFC); hnsw 10M needs the
+   pageserver cache as the real second tier on any small CU.
+2. Keep `shared_buffers` modest (256 MB–1 GB by CU): LFC is the cache that
+   matters; oversized shared_buffers duplicate what LFC already serves.
 3. **Chunk size**: `neon.file_cache_chunk_size=256` (2 MB) suits our
-   contiguous segment bursts; consider 128–256 for mixed workloads. Larger
-   chunks = fewer metadata lookups, more read amplification for point reads.
-4. `neon.file_cache_path` may point at a **raw device** (bypasses FS overhead);
-   on this VM it stays on the virtio disk — an NVMe-backed path is the next
-   hardware step.
-5. Bump the **pageserver page cache** too (currently 4 GB): it is the second
-   tier for LFC misses. 8–16 GB is affordable here; ×N with sharding (§3).
-6. `autoprewarm` (compute spec) primes LFC at endpoint start — avoids the
-   cold-start latency cliff in production-like operation.
+   contiguous segment bursts; 128–256 for mixed workloads. Fewer, larger
+   chunks amortize metadata lookups within a small cache.
+4. `neon.file_cache_path` may point at a **raw device**; on NVMe-backed
+   compute nodes this removes FS overhead — most valuable exactly when the
+   LFC budget is small.
+5. Pageserver page cache is tier-2 and **scales independently of CU RAM** —
+   this is the right place to spend the big-memory budget (see §4 sharding).
+6. `autoprewarm` (compute spec) primes LFC at endpoint start — hides the
+   cold-start latency cliff that otherwise dominates small-CU P99s.
 
-## 2. Prefetch / pipelining (hide the round trip)
+## 3. Prefetch / pipelining (hide the round trip — memory-cheap)
 
-The read path is: ivf scan issues `smgrreadv` segment bursts → libpagestore →
+The read path: ivf scan issues `smgrreadv` segment bursts → libpagestore →
 LFC hit (local pread) or pageserver fetch (0.4–1 ms localhost RTT). Today the
 scan is **synchronous**: burst N+1 is issued only after burst N is consumed.
 
 1. **Our side (vectorscale scan): software pipelining.** Issue the next
    segment's readv before scoring the current one (double-buffer the raw
-   buffers in `entry.rs::read_bytes`). On LFC hits this overlaps compute with
-   pread; on misses it overlaps FastScan compute with the pageserver RTT.
+   buffers in `entry.rs::read_bytes`). Memory cost: one extra segment burst
+   (~1–3 MB) — negligible in any CU budget. On LFC hits this overlaps compute
+   with pread; on misses it overlaps FastScan compute with the pageserver RTT.
    Expected: hides most of the residual Neon gap for multi-segment scans
    (large `probes`), little effect on single-segment scans.
 2. **Neon's `smgr_prefetch` hook.** The fork's smgr vtable has
-   `smgrprefetch()` → `neon_prefetch` (libpagestore). Our scan can issue
-   prefetches for the blocks of the next list(s) before `smgrreadv` — the
-   pageserver/LFC fetch overlaps with scoring. This is the "coherence" win
-   between our access pattern (predictable segment lists) and Neon's smgr.
-3. **Deeper**: libpagestore already supports vectored page requests; verify
-   whether readv bursts are sent as one pageserver RPC (they are — up to
-   `PG_IOV_MAX`=32 blocks on Neon) and whether raising the compute's
-   `neon.max_pageserver_parallel_requests`-style concurrency helps. Check the
-   actual GUC surface in `pgxn/neon` before claiming; at minimum batch =
-   1 RPC per 32-block burst.
+   `smgrprefetch()` → `neon_prefetch` (libpagestore). Our scan can prefetch
+   the next list's blocks before `smgrreadv` — the pageserver/LFC fetch
+   overlaps with scoring. This is the "coherence" win between our predictable
+   segment-list access pattern and Neon's smgr.
+3. Both are CPU-cheap and RAM-cheap — **explicitly compatible with 2 CU**
+   (they trade the idle wait time for a little scheduling, not for memory).
 
-## 3. Multi-pageserver / sharding — the scale-out coherence
+## 4. Multi-pageserver / sharding — scale cache outside the CU
 
 Current state: 3 pageserver pods run, but the tenant's single shard sits on
-node 1 — pods 2–4 are standby (re-attached, 0 tenants). Real multi-PS gains
-come from **tenant sharding** (`shard_count` / `shard_stripe_size` in the
-compute spec + a controller-driven split):
+node 1 — pods 2–4 are standby. Real multi-PS gains come from **tenant
+sharding** (`shard_count` / `shard_stripe_size` + a controller-driven split):
 
-- **Effective cache scales out**: each pageserver caches its stripe (page
-  cache 4 GB × N + LFC stays per-compute). For hnsw@10M with 3 shards the
-  per-PS working set drops below the 4 GB cache → deep scans stop spilling.
-- **Aggregate read bandwidth × N** (interleaved stripe reads), while single-
-  query latency still pays one round trip (possibly less, if the hot stripe
-  is cached).
-- Requires: controller-side shard split of the tenant (dev controller does
-  not currently orchestrate it — needs a shard split op), spec
-  `shard_stripe_size` set, and compute pageserver_connstring with the shard
-  map. Documented as the next infrastructure step, not yet measured.
+- **Cache capacity scales out**: each pageserver caches its stripe
+  (4 GB page cache × N). For hnsw@10M with 3 shards the per-PS working set
+  drops below 4 GB → deep scans stop spilling — *without* growing the
+  compute's LFC (which the CU budget forbids).
+- **Aggregate read bandwidth × N**; single-query latency still pays one round
+  trip (less if the hot stripe is cached).
+- Under the CU constraint this is the *only* knob that grows cache for
+  big-graph workloads — the compute-side LFC is capped by RAM.
+- Requires: controller-side shard split (dev controller does not orchestrate
+  it today — next infra step), spec `shard_stripe_size`, compute
+  pageserver_connstring with the shard map.
 
-Also coherent with §1: **1 big pageserver cache vs N small ones** — prefer N
-shards only if the workload parallelizes; otherwise one PS with a bigger
-page cache is simpler and equally effective for single-stream latency.
+## 5. Other optimizing points found while profiling
 
-## 4. Other optimizing points found while profiling
-
-1. **io_uring unavailable in this VM**: pageserver logs
-   `auto-detected IO engine StdFs; tokio-epoll-uring fails: Operation not
-   supported`. On a host with io_uring, the pageserver's virtual-file layer
-   (`virtual_file_io_engine`) would cut syscall overhead on its local files.
+1. **io_uring unavailable in this VM** (pageserver: `tokio-epoll-uring
+   fails: Operation not supported` → StdFs fallback). On hosts with io_uring,
+   the pageserver virtual-file layer cuts syscall overhead on its local files.
 2. **WAL/commit path**: the 3/3 quorum costs ~5–10% (synchronous walproposer
-   standby). `max_replication_flush_lag=10GB` is already loose; for
-   read-heavy benchmarks this is not the binding constraint.
-3. **Bulk ingest**: 10M rows imported at ~30 MB/s (2m53s) — WAL ingest into
-   the pageserver is the limiter; `fsync=off` + `wal_log_hints=off` already
-   applied. Consider disabling the compute's WAL proposer sync lag during
-   bulk load only.
-4. **Parallelism**: scans are single-backend; `max_parallel_maintenance_workers=8`
-   accelerates builds only. A parallel ivf scan (per-list workers) would
-   amortize round trips across cores — high value on Neon (latency-bound),
-   moderate on vanilla (already CPU-bound per backend). Candidate: parallel
-   index scan support (`amcanbuildparallels`/parallel-aware scan).
+   standby); for read-heavy workloads not the binding constraint.
+3. **Bulk ingest**: ~30 MB/s (2m53s for 10M rows) — WAL ingest limited;
+   `fsync=off` + `wal_log_hints=off` already applied. Consider relaxing the
+   compute's WAL sync lag only during bulk load.
+4. **Parallelism**: scans are single-backend; on a 2–8 CU compute the other
+   vCPUs are idle during a single scan. A parallel per-list ivf scan
+   amortizes round trips across cores — high value on Neon (latency-bound),
+   and it fits the CU model by construction (uses the vCPUs the CU provides).
 5. **Network/compression** (real clusters): libpagestore protocol v3 supports
-   zstd; for remote pageservers prefer `compression` in the connstring; in
-   this all-localhost k8s setup hostNetwork+loopback is already optimal.
-6. **k8s niceties**: pin storage pods to nodes colocated with their disk;
-   use `hostPath`→local PV with the right FS; avoid pod eviction during
-   benchmarks (the pageserver pods are stateful).
+   zstd; for remote pageservers prefer `compression` in the connstring; on
+   all-localhost k8s, hostNetwork+loopback is already optimal.
+6. **k8s niceties**: colocate storage pods with their disks; use local PVs;
+   request/limit CPU to match the CU model in the demo manifests.
 
-## 5. Coherent recommendation matrix
+## 6. Coherent recommendation matrix (CU-aware)
 
-| workload | LFC | PS page cache | shards | prefetch | expected |
-|---|---|---|---|---|---|
-| ivf/ivfrq ≤ 1 GB index | 8 GB | 4 GB | 1 | burst pipelining (§2.1) | = vanilla (achieved) |
-| hnsw ≥ 8 GB graph | 16 GB | 8 GB | 1–3 | §2.1 + §2.2 | → vanilla parity (to verify) |
-| many tenants / throughput | 8 GB+ | 8 GB × N | N (stripe) | §2.2 | cache capacity × N |
-| write-heavy | — | — | any | — | WAL/ingest-bound (§4.3) |
+| workload | CU | LFC | PS page cache | shards | prefetch | expected |
+|---|---|---|---|---|---|---|
+| ivf/ivfrq ≤ 1 GB index | 2–4 | 2–3 GB | 4 GB | 1 | §3.1 | = vanilla (projected from 8 CU parity) |
+| ivfrq ≥ 1 GB index (num_bits=8) | 4–8 | 4–10 GB | 4–8 GB | 1 | §3.1+§3.2 | → vanilla parity |
+| hnsw ≥ 8 GB graph | 8 | 10–12 GB (partial fit) | 8 GB × N | 3 | §3.2 | pageserver-bound; shards are the lever |
+| many tenants / throughput | any | per-CU auto-size | 8 GB × N | N | §3.2 | cache capacity × N |
+| write-heavy | any | — | — | any | — | WAL/ingest-bound (§5.3) |
 
-## 6. Next actions (priority order)
+## 7. Next actions (priority order)
 
-1. hnsw@10M with 16 GB LFC + 8 GB PS cache → verify parity (30 min bench).
-2. Implement §2.1 (double-buffered readv pipelining) in the ivf scan; A/B on
-   k8s Neon (expect large-probes p50 to drop toward LFC-hit floor).
-3. Try `smgrprefetch` (§2.2) for the next list's blocks; measure RTT hiding.
-4. Investigate shard split feasibility in this controller revision (§3).
-5. `../vanilla-simd-promotion.md` for the ALU side.
+1. **Validate under a CU memory cap**: re-run the ivfrq sweep with the compute
+   limited to 4 GB (2 CU) and LFC 2 GB → confirm the parity projection holds
+   in-budget; repeat at 16 GB (8 CU) for hnsw.
+2. Implement §3.1 (double-buffered readv pipelining) — RAM-cheap, A/B on k8s
+   Neon (expect large-probes p50 to drop toward the LFC-hit floor).
+3. Try `smgrprefetch` (§3.2) for the next list's blocks; measure RTT hiding.
+4. Investigate shard split feasibility in this controller revision (§4) —
+   the only cache-growth path that respects the CU memory envelope.
+5. `../vanilla-simd-promotion.md` for the ALU side (vanilla-only for now).
