@@ -150,9 +150,17 @@ sharding** (`shard_count` / `shard_stripe_size` + a controller-driven split):
   trip (less if the hot stripe is cached).
 - Under the CU constraint this is the *only* knob that grows cache for
   big-graph workloads — the compute-side LFC is capped by RAM.
-- Requires: controller-side shard split (dev controller does not orchestrate
-  it today — next infra step), spec `shard_stripe_size`, compute
-  pageserver_connstring with the shard map.
+- A5 status (2026-09-02): the split machinery EXISTS in this revision —
+  `PUT /control/v1/tenant/{tid}/shard_split` (`TenantShardSplitRequest
+  {new_shard_count, shard_stripe_size}`) on the controller (1234), with
+  `abort_tenant_shard_split` as the rollback. Remaining work before the
+  operation is safe to run: pre-split the tenant when idle, then update
+  the compute spec's `pageserver_connstring`/shard map (the dev compute
+  spec is rebuilt by neon_local from the endpoint conf, which has no
+  shard-map field — needs a spec edit or a neon_local flag) and
+  re-validate reads per shard. Deferred: the operation moves data
+  (WAL-replay splits) and was judged too risky to run mid-benchmark;
+  the recipe is recorded for a dedicated run.
 
 ## 5. Other optimizing points found while profiling
 
