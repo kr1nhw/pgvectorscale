@@ -218,12 +218,6 @@ pub fn dot_with_rotated_fields(num_bits: u8, dim: u32, packed_code: &[u8], rot: 
 pub fn dot_full_code(num_bits: u8, code: &[u8], rot: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512bw")
-        {
-            // SAFETY: only selected when the AVX-512 families were detected.
-            return unsafe { ex_dot_simd::dot_full_code_avx512(num_bits, code, rot) };
-        }
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
             // SAFETY: only selected when AVX2 and FMA were detected.
@@ -272,16 +266,6 @@ mod ex_dot_simd {
             4 => dot_u4_full_avx2(code, rot),
             8 => dot_u8_full_avx2(code, rot),
             _ => super::dot_full_code_scalar(num_bits, code, rot),
-        }
-    }
-
-    /// Dispatch to the per-width AVX-512 kernel.
-    #[inline]
-    pub(super) unsafe fn dot_full_code_avx512(num_bits: u8, code: &[u8], rot: &[f32]) -> f32 {
-        match num_bits {
-            4 => dot_u4_full_avx512(code, rot),
-            8 => dot_u8_full_avx512(code, rot),
-            _ => dot_full_code_avx2(num_bits, code, rot),
         }
     }
 
@@ -346,61 +330,6 @@ mod ex_dot_simd {
             i += 8;
         }
         let mut sum = reduce_add_avx2(_mm256_add_ps(acc[0], acc[1]));
-        for j in i..n_bytes {
-            sum += (code[j] & 0x0F) as f32 * rot[j * 2];
-            sum += (code[j] >> 4) as f32 * rot[j * 2 + 1];
-        }
-        sum
-    }
-
-    /// FMA 16 u8 codes against 16 query floats (one 512-bit vector).
-    #[inline]
-    #[target_feature(enable = "avx512f", enable = "avx512bw")]
-    unsafe fn fma16_avx512(codes: __m128i, query: *const f32, acc: &mut __m512) {
-        let codes_f = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(codes));
-        *acc = _mm512_fmadd_ps(codes_f, _mm512_loadu_ps(query), *acc);
-    }
-
-    #[inline]
-    #[target_feature(enable = "avx512f")]
-    unsafe fn reduce_add_avx512(v: __m512) -> f32 {
-        _mm512_reduce_add_ps(v)
-    }
-
-    #[target_feature(enable = "avx512f", enable = "avx512bw")]
-    unsafe fn dot_u8_full_avx512(code: &[u8], rot: &[f32]) -> f32 {
-        let mut acc = _mm512_setzero_ps();
-        let n = code.len();
-        let full = n - (n % 16);
-        let mut i = 0;
-        while i < full {
-            let codes = _mm_loadu_si128(code.as_ptr().add(i) as *const __m128i);
-            fma16_avx512(codes, rot.as_ptr().add(i), &mut acc);
-            i += 16;
-        }
-        let mut sum = reduce_add_avx512(acc);
-        for j in i..n {
-            sum += code[j] as f32 * rot[j];
-        }
-        sum
-    }
-
-    #[target_feature(enable = "avx512f", enable = "avx512bw")]
-    unsafe fn dot_u4_full_avx512(code: &[u8], rot: &[f32]) -> f32 {
-        // 16 bytes = 32 sequential 4-bit codes; two 512-bit FMAs per block
-        // (the SSE2 unpack helper yields 16 natural-order codes per 8 bytes).
-        let mut acc = _mm512_setzero_ps();
-        let n_bytes = code.len();
-        let full_bytes = n_bytes - (n_bytes % 16);
-        let mut i = 0;
-        while i < full_bytes {
-            let a = unpack_u4_sequential(code.as_ptr().add(i));
-            let b = unpack_u4_sequential(code.as_ptr().add(i + 8));
-            fma16_avx512(a, rot.as_ptr().add(i * 2), &mut acc);
-            fma16_avx512(b, rot.as_ptr().add(i * 2 + 16), &mut acc);
-            i += 16;
-        }
-        let mut sum = reduce_add_avx512(acc);
         for j in i..n_bytes {
             sum += (code[j] & 0x0F) as f32 * rot[j * 2];
             sum += (code[j] >> 4) as f32 * rot[j * 2 + 1];
