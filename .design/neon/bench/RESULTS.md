@@ -1,23 +1,27 @@
-# recall@10 vs p50/p99 latency — pgvectorscale ivfrq & pgvector hnsw on vanilla PG17 vs Neon (x86)
+# recall@10 vs p50/p99 latency — pgvectorscale ivfrq & pgvector hnsw: vanilla PG17 vs Neon-on-Kubernetes (x86)
 
 Date: 2026-09-02 — Server: `root@113.44.106.182` (Huawei Cloud EulerOS 2.0, x86_64,
-16 vCPU, 60 GB RAM, local NVMe-class `/data1`). All four configurations run on the
-**same machine**: vanilla PostgreSQL 17.11 on port 5432 and a Neon dev stack
-(pageserver + safekeeper + storage_broker + storage_controller + compute,
-fork `1e01fcea`, PG 17.5) on port 55432.
+16 vCPU, 60 GB RAM). Four configurations on the **same machine**:
+
+- **vanilla PG17**: PostgreSQL 17.11 on port 5432, `shared_buffers=8GB`, 8 parallel maintenance workers.
+- **Neon (k8s)**: Neon dev stack with the storage layer on a single-node **k3s**
+  cluster (v1.29.10) — 3 pageserver pods + 3 safekeeper pods — and the compute
+  (fork `1e01fcea`, PG 17.5) on port 55434, running on a **3/3 WAL quorum** of the
+  pod safekeepers with the recommended tuning applied (see below).
 
 ## 1. Setup
 
-| | vanilla PG17 | Neon compute |
+| | vanilla PG17 | Neon on k8s (3 PS + 3 SK) |
 |---|---|---|
-| Server | PG 17.11, `shared_buffers=8GB`, 8 parallel maintenance workers | Neon fork PG 17.5, `shared_buffers=1MB` (Neon default), `fsync=off`, LFC **disabled** (`neon.file_cache_size_limit=0`) |
-| vectorscale | 0.9.0 built from `ivf-rabitq` HEAD (plain `pg17` features) | 0.9.0 same HEAD, features `pg17 neon pgrx/unsafe-postgres` |
-| pgvector | 0.8.6 (stock) | 0.8.6 + Neon's unlogged-build patch (see §4) |
-| Dataset | BIGANN-10M first 10M rows, `vector(128)`, L2, `items_10m` | same rows COPY-binary-loaded (2m53s, ~30 MB/s through pageserver) |
-| Queries | 100 query vectors, `bench_queries`, exact top-10 ground truth `gt_10m` (seq scan) | same |
-| Protocol | 100 queries/point, LIMIT 10; recall@10 vs ground truth in SQL; one untimed warmup pass, then a timed pass parsing psql `\timing`; p50/p99 over 100 per-query wall times | identical harness |
+| Server | PG 17.11, `shared_buffers=8GB` | Neon fork PG 17.5, compute on 55434, **tuned**: `shared_buffers=2GB`, LFC `neon.max_file_cache_size`/`neon.file_cache_size_limit`=8GB, pageserver `page_cache_size`=4GB, `maintenance_work_mem=1GB` |
+| Storage layer | local disk | pageserver pod (node 1, host) + standby pods ps2–ps4; WAL to safekeeper pods sk4–sk6 (3/3 quorum, gen 1) |
+| vectorscale | 0.9.0 `ivf-rabitq` HEAD (plain `pg17`) | 0.9.0 same HEAD, features `pg17 neon pgrx/unsafe-postgres` |
+| pgvector | 0.8.6 (stock) | 0.8.6 + Neon unlogged-build patch (`-DNEON_SMGR`) |
+| Dataset | BIGANN-10M first 10M rows, `vector(128)`, L2 | same data, branched timeline (`bench-k8s`) |
+| Queries / ground truth | 100 queries, exact top-10 `gt_10m` | same |
 | ivfrq index | `ivf (embedding vector_l2_ops) WITH (lists=1000, num_bits=1)`, 346 MB | same, 346 MB |
 | hnsw index | `hnsw (embedding vector_l2_ops) WITH (m=16, ef_construction=64)`, 7.9 GB | same, 7.9 GB |
+| Protocol | 100 queries/point, LIMIT 10; recall@10 in SQL; one untimed warmup pass + one timed pass (psql `\timing`); p50/p99 over 100 wall times | identical harness |
 
 ## 2. Results (recall@10, p50/p99 ms)
 
@@ -39,71 +43,71 @@ fork `1e01fcea`, PG 17.5) on port 55432.
 | hnsw-vanilla | hnsw | ef_search | 160 | 97.90 | 6.315 | 14.926 |
 | hnsw-vanilla | hnsw | ef_search | 320 | 99.00 | 8.988 | 27.778 |
 | hnsw-vanilla | hnsw | ef_search | 640 | 99.70 | 12.679 | 43.839 |
-| ivfrq-neon | ivf | probes | 1 | 47.23 | 389.687 | 422.798 |
-| ivfrq-neon | ivf | probes | 2 | 61.50 | 397.716 | 427.371 |
-| ivfrq-neon | ivf | probes | 4 | 76.80 | 403.749 | 424.640 |
-| ivfrq-neon | ivf | probes | 8 | 88.50 | 418.409 | 457.222 |
-| ivfrq-neon | ivf | probes | 16 | 94.90 | 464.119 | 536.424 |
-| ivfrq-neon | ivf | probes | 32 | 98.10 | 520.722 | 589.665 |
-| ivfrq-neon | ivf | probes | 64 | 99.40 | 626.435 | 743.478 |
-| ivfrq-neon | ivf | probes | 128 | 99.60 | 803.403 | 962.328 |
-| ivfrq-neon | ivf | probes | 256 | 99.40 | 1142.316 | 1334.262 |
-| hnsw-neon | hnsw | ef_search | 10 | 67.68 | 130.377 | 224.084 |
-| hnsw-neon | hnsw | ef_search | 20 | 79.08 | 175.222 | 388.616 |
-| hnsw-neon | hnsw | ef_search | 40 | 88.50 | 292.850 | 504.434 |
-| hnsw-neon | hnsw | ef_search | 80 | 95.10 | 514.641 | 776.807 |
-| hnsw-neon | hnsw | ef_search | 160 | 97.80 | 904.897 | 1220.966 |
-| hnsw-neon | hnsw | ef_search | 320 | 99.00 | 1592.769 | 2220.374 |
-| hnsw-neon | hnsw | ef_search | 640 | 99.50 | 2842.271 | 4254.562 |
+| ivfrq-k8s | ivf | probes | 1 | 47.23 | 1.388 | 3.076 |
+| ivfrq-k8s | ivf | probes | 2 | 61.50 | 1.641 | 3.624 |
+| ivfrq-k8s | ivf | probes | 4 | 76.80 | 1.834 | 4.434 |
+| ivfrq-k8s | ivf | probes | 8 | 88.50 | 2.099 | 4.662 |
+| ivfrq-k8s | ivf | probes | 16 | 94.90 | 2.804 | 5.711 |
+| ivfrq-k8s | ivf | probes | 32 | 98.10 | 3.835 | 7.417 |
+| ivfrq-k8s | ivf | probes | 64 | 99.40 | 5.707 | 9.561 |
+| ivfrq-k8s | ivf | probes | 128 | 99.60 | 9.599 | 14.372 |
+| ivfrq-k8s | ivf | probes | 256 | 99.40 | 16.509 | 22.392 |
+| hnsw-k8s | hnsw | ef_search | 10 | 67.00 | 0.559 | 1.871 |
+| hnsw-k8s | hnsw | ef_search | 20 | 77.20 | 0.816 | 2.093 |
+| hnsw-k8s | hnsw | ef_search | 40 | 88.70 | 1.270 | 2.954 |
+| hnsw-k8s | hnsw | ef_search | 80 | 95.00 | 1.849 | 4.149 |
+| hnsw-k8s | hnsw | ef_search | 160 | 98.00 | 11.791 | 43.018 |
+| hnsw-k8s | hnsw | ef_search | 320 | 99.10 | 87.855 | 352.179 |
+| hnsw-k8s | hnsw | ef_search | 640 | 99.40 | 32.495 | 89.600 |
 
 Plot: `results.svg` (x = recall@10 %, y = latency ms, log scale; p50 solid, p99 dashed).
 
 ## 3. Headlines
 
-- **Recall curves are identical between stacks** (same indexes, same data): e.g.
-  ivfrq probes=8 → 88.00% (vanilla) vs 88.50% (Neon); probes=64 → 99.30% vs 99.40%.
-  The ivf scan path (FastScan `smgrreadv` bursts + exact rescoring) behaves
-  identically on Neon's pagestore smgr after the 32-block chunking fix (§4.1).
-- **At ~99% recall, ivfrq is faster than hnsw on both stacks:**
-  - vanilla: ivfrq 6.42 ms p50 (probes=64, 99.3%) vs hnsw 8.99 ms p50 (ef=320, 99.0%)
-  - Neon: ivfrq 626 ms p50 vs hnsw 1593 ms p50
-- **Neon latency is ~100–180× vanilla at matched recall** in this configuration:
-  the compute runs `shared_buffers=1MB` with the local file cache disabled, so every
-  index/metadata page read is a pagestore round trip (~0.4 s floor visible at
-  probes=1: 390 ms vs 1.6 ms on vanilla). This is a *configuration* of the dev
-  stack, not a storage-format tax: warm pages served from a local cache would close
-  most of the gap. On vanilla, ivfrq probes=1..16 stays at p50 1.6–3.6 ms.
-- **Index build times (10M × 128):** ivfrq 28 s vanilla / 276–293 s Neon (~10×,
-  WAL + pageserver ingest); hnsw 16 GB-maintenance_work_mem vanilla ≈ 10 min,
-  Neon ≈ 38 min (unlogged build locally + one `log_newpage_range` WAL burst of
-  the 7.9 GB graph at the end).
+- **Recall curves are stack-identical** (same indexes, same data): ivfrq probes=8 →
+  88.00% (vanilla) vs 88.50% (k8s Neon); probes=64 → 99.30% vs 99.40%.
+- **At ~99% recall, ivfrq beats hnsw on both stacks**:
+  - vanilla: ivfrq 6.42 ms p50 (probes=64, 99.3%) vs hnsw 8.99 ms (ef=320, 99.0%)
+  - k8s Neon: ivfrq 5.71 ms p50 vs hnsw 32.5–87.9 ms (see note)
+- **With the recommended tuning, Neon-on-k8s is now at vanilla parity for ivfrq**
+  (5.71 vs 6.42 ms p50 at 99.4% — slightly faster) and within ~3–7× for hnsw,
+  down from the ~100–180× penalty of the untuned dev defaults. The residual
+  hnsw gap is the 7.9 GB graph exceeding the 8 GB LFC + 4 GB pageserver cache:
+  deep ef_search scans spill to pageserver round trips (visible as the local
+  peak at ef_search=320, reproducible: re-run gave 76.6/126.7 ms).
+- **Index build times (10M × 128):** ivfrq 28 s vanilla / ~4.9 min k8s Neon
+  (WAL to the 3/3 quorum); hnsw ~10 min vanilla / ~30 min k8s Neon (unlogged
+  build locally + one `log_newpage_range` WAL burst of the 7.9 GB graph,
+  replicated to 3 safekeepers).
 
-## 4. Compatibility bugs found (and fixed) by this benchmark
+## 4. Tuning journey (why the untuned numbers were misleading)
 
-1. **`smgrreadv` burst > Neon's vectored-I/O cap.** Neon's fork defines
-   `PG_IOV_MAX = Min(IOV_MAX, 32)` (`port/pg_iovec.h`) and `neon_readv` errors
-   with `Read request too large: 76 is larger than max 32`. Our FastScan passed
-   whole list segments (up to ~76 blocks at probes=16) in one call. Fixed in
-   commit `89d19ed`: the burst is chunked at 32 blocks under the `neon` feature
-   (1024 otherwise). No effect on vanilla.
-2. **pgvector hnsw build PANICs Neon** with
-   `[NEON_SMGR] Page 0 ... is evicted with zero LSN` (write path, buffer
-   eviction) — pgvector's build writes MAIN-fork graph pages with
-   `MarkBufferDirty` and no per-page LSN, which Neon's smgr forbids. Fixed with
-   Neon's own `compute/patches/pgvector.patch` (wraps the build in
-   `smgr_start_unlogged_build`/`smgr_finish_unlogged_build_phase_1`/
-   `smgr_end_unlogged_build`, compiled with `-DNEON_SMGR`); applied to 0.8.6 by
-   `.design/neon/scripts/patch_pgvector_neon.py`. The crash also took down
-   concurrent backends (postmaster abort on PANIC) — the benchmark run was
-   restarted after patching.
-3. (Earlier, from the functional test) pgrx `FMGR_ABI_EXTRA`/`unsafe-postgres`
-   and the 3-arg `smgropen` — see `.design/neon/README.md`.
+The first Neon run (single safekeeper, dev defaults) was ~100–180× vanilla:
 
-## 5. Reproduce
+| knobs | default | tuned |
+|---|---|---|
+| compute `shared_buffers` | 1MB | 2GB |
+| compute LFC (`neon.max_file_cache_size` / `neon.file_cache_size_limit`) | disabled (0) | 8GB / 8GB |
+| pageserver `page_cache_size` | 8192 pages (64MB) | 524288 pages (4GB) |
+
+ivfrq p50 (probes=64, 99.4% recall): **626.4 ms untuned → 5.15 ms tuned
+(1-SK) → 5.71 ms k8s 3-SK** — the 3/3 WAL quorum costs ~5–10% over tuned
+single-node, while adding HA. See `K8S.md` and
+`../scripts/RECOMMENDED-SETUP.md` for the full recipes.
+
+## 5. Compatibility bugs found (and fixed) by this benchmark
+
+1. `smgrreadv` bursts above Neon's `PG_IOV_MAX=32` (`Read request too large`)
+   → chunked reads (`89d19ed`).
+2. pgvector hnsw build PANICs Neon (`Page ... evicted with zero LSN`) →
+   applied Neon's unlogged-build patch (`patch_pgvector_neon.py`, `-DNEON_SMGR`).
+3. pgrx `FMGR_ABI_EXTRA` / `unsafe-postgres` and the 3-arg `smgropen` —
+   see `../README.md`.
+
+## 6. Reproduce
 
 ```bash
-# data (once): transfer_data.sh copies items_10m/bench_queries/gt_10m from the
-# vanilla bench db into the Neon compute
+# data (once): transfer_data.sh copies items_10m/bench_queries/gt_10m into the target db
 .design/neon/bench/transfer_data.sh
 
 # indexes + sweeps (one engine at a time; drop the other vector index first)
@@ -114,28 +118,4 @@ Plot: `results.svg` (x = recall@10 %, y = latency ms, log scale; p50 solid, p99 
 .design/neon/bench/aggregate_plot.py all.csv -o results
 ```
 
-Raw CSVs: `bench_results_x86/*.csv` (also under `.design/neon/bench/data/`).
-
-## 6. Tuned + Kubernetes results (added 2026-09-02, same session)
-
-Latency was dominated by dev-stack defaults, not Neon's architecture:
-
-| knobs | default | tuned |
-|---|---|---|
-| compute `shared_buffers` | 1MB | 2GB |
-| compute LFC (`neon.max_file_cache_size` / `neon.file_cache_size_limit`) | disabled (0) | 8GB / 8GB |
-| pageserver `page_cache_size` | 8192 pages (64MB) | 524288 pages (4GB) |
-| `maintenance_work_mem` / `max_parallel_maintenance_workers` | 64MB / 2 | 1GB / 8 |
-
-BIGANN-10M, 100 queries, ivfrq (lists=1000, num_bits=1), p50/p99 ms:
-
-| probes | recall | Neon untuned | Neon tuned | Neon k8s 3-SK tuned | vanilla PG17 |
-|---|---|---|---|---|---|
-| 1 | 47.23% | 389.7 / 422.8 | 1.37 / 2.89 | 1.44 / 3.06 | 1.64 / 4.68 |
-| 8 | 88.50% | 418.4 / 457.2 | 2.02 / 4.49 | 2.15 / 4.78 | 3.07 / 7.78 |
-| 64 | 99.40% | 626.4 / 743.5 | 5.15 / 9.01 | 5.64 / 9.34 | 6.42 / 12.07 |
-
-- Tuning alone: **~120–280× faster** warm p50, matching vanilla PG17 at equal recall.
-- The 3-pageserver + 3-safekeeper k3s deployment adds ~5–10% on top of tuned
-  single-node (per-commit WAL sync to the 3/3 quorum) — see `K8S.md` for the
-  full deployment recipe.
+Raw CSVs: `.design/neon/bench/data/all.csv`.

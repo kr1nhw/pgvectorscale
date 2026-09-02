@@ -42,26 +42,26 @@
 <text x="880.0" y="516" font-size="11" text-anchor="middle" fill="#666">100</text>
 <text x="475" y="548" font-size="13" text-anchor="middle">recall@10 (%)</text>
 <text x="16" y="265" font-size="13" text-anchor="middle" transform="rotate(-90 16 265)">latency (ms, log)</text>
-<path d="M618.2 159.6 L710.5 145.6 L786.9 121.2 L840.3 94.4 L862.2 67.6 L871.9 40.8 L876.0 13.3" fill="none" stroke="#ff7f0e" stroke-width="2" stroke-dasharray=""/>
-<circle cx="618.2" cy="159.6" r="3" fill="#ff7f0e"/>
-<circle cx="710.5" cy="145.6" r="3" fill="#ff7f0e"/>
-<circle cx="786.9" cy="121.2" r="3" fill="#ff7f0e"/>
-<circle cx="840.3" cy="94.4" r="3" fill="#ff7f0e"/>
-<circle cx="862.2" cy="67.6" r="3" fill="#ff7f0e"/>
-<circle cx="871.9" cy="40.8" r="3" fill="#ff7f0e"/>
-<circle cx="876.0" cy="13.3" r="3" fill="#ff7f0e"/>
-<line x1="630" y1="46" x2="658" y2="46" stroke="#ff7f0e" stroke-width="2" stroke-dasharray=""/>
-<text x="666" y="50" font-size="12" fill="#ff7f0e">hnsw-neon p50</text>
-<path d="M618.2 133.9 L710.5 107.8 L786.9 95.4 L840.3 74.9 L862.2 53.4 L871.9 25.0 L876.0 -5.8" fill="none" stroke="#ff7f0e" stroke-width="2" stroke-dasharray="8,4"/>
-<circle cx="618.2" cy="133.9" r="3" fill="#ff7f0e"/>
-<circle cx="710.5" cy="107.8" r="3" fill="#ff7f0e"/>
-<circle cx="786.9" cy="95.4" r="3" fill="#ff7f0e"/>
-<circle cx="840.3" cy="74.9" r="3" fill="#ff7f0e"/>
-<circle cx="862.2" cy="53.4" r="3" fill="#ff7f0e"/>
-<circle cx="871.9" cy="25.0" r="3" fill="#ff7f0e"/>
-<circle cx="876.0" cy="-5.8" r="3" fill="#ff7f0e"/>
-<line x1="630" y1="46" x2="658" y2="46" stroke="#ff7f0e" stroke-width="2" stroke-dasharray="8,4"/>
-<text x="666" y="50" font-size="12" fill="#ff7f0e">hnsw-neon p99</text>
+<path d="M612.7 418.3 L695.3 400.4 L788.5 379.4 L839.5 361.6 L863.8 273.6 L872.7 178.3 L875.1 225.5" fill="none" stroke="#000000" stroke-width="2" stroke-dasharray=""/>
+<circle cx="612.7" cy="418.3" r="3" fill="#000000"/>
+<circle cx="695.3" cy="400.4" r="3" fill="#000000"/>
+<circle cx="788.5" cy="379.4" r="3" fill="#000000"/>
+<circle cx="839.5" cy="361.6" r="3" fill="#000000"/>
+<circle cx="863.8" cy="273.6" r="3" fill="#000000"/>
+<circle cx="872.7" cy="178.3" r="3" fill="#000000"/>
+<circle cx="875.1" cy="225.5" r="3" fill="#000000"/>
+<line x1="630" y1="46" x2="658" y2="46" stroke="#000000" stroke-width="2" stroke-dasharray=""/>
+<text x="666" y="50" font-size="12" fill="#000000">hnsw-k8s p50</text>
+<path d="M612.7 361.0 L695.3 355.7 L788.5 339.3 L839.5 323.2 L863.8 212.2 L872.7 112.4 L875.1 177.4" fill="none" stroke="#000000" stroke-width="2" stroke-dasharray="8,4"/>
+<circle cx="612.7" cy="361.0" r="3" fill="#000000"/>
+<circle cx="695.3" cy="355.7" r="3" fill="#000000"/>
+<circle cx="788.5" cy="339.3" r="3" fill="#000000"/>
+<circle cx="839.5" cy="323.2" r="3" fill="#000000"/>
+<circle cx="863.8" cy="212.2" r="3" fill="#000000"/>
+<circle cx="872.7" cy="112.4" r="3" fill="#000000"/>
+<circle cx="875.1" cy="177.4" r="3" fill="#000000"/>
+<line x1="630" y1="46" x2="658" y2="46" stroke="#000000" stroke-width="2" stroke-dasharray="8,4"/>
+<text x="666" y="50" font-size="12" fill="#000000">hnsw-k8s p99</text>
 <path d="M647.5 368.1 L724.5 355.1 L786.0 339.4 L833.8 319.6 L863.0 303.3 L871.9 286.5 L877.6 270.2" fill="none" stroke="#2ca02c" stroke-width="2" stroke-dasharray=""/>
 <circle cx="647.5" cy="368.1" r="3" fill="#2ca02c"/>
 <circle cx="724.5" cy="355.1" r="3" fill="#2ca02c"/>
@@ -82,30 +82,30 @@
 <circle cx="877.6" cy="211.3" r="3" fill="#2ca02c"/>
 <line x1="630" y1="80" x2="658" y2="80" stroke="#2ca02c" stroke-width="2" stroke-dasharray="8,4"/>
 <text x="666" y="84" font-size="12" fill="#2ca02c">hnsw-vanilla p99</text>
-<path d="M452.6 107.6 L568.1 106.7 L692.1 105.9 L786.9 104.2 L838.7 99.3 L864.6 93.9 L875.1 85.1 L876.8 73.3 L875.1 56.6" fill="none" stroke="#d62728" stroke-width="2" stroke-dasharray=""/>
-<circle cx="452.6" cy="107.6" r="3" fill="#d62728"/>
-<circle cx="568.1" cy="106.7" r="3" fill="#d62728"/>
-<circle cx="692.1" cy="105.9" r="3" fill="#d62728"/>
-<circle cx="786.9" cy="104.2" r="3" fill="#d62728"/>
-<circle cx="838.7" cy="99.3" r="3" fill="#d62728"/>
-<circle cx="864.6" cy="93.9" r="3" fill="#d62728"/>
-<circle cx="875.1" cy="85.1" r="3" fill="#d62728"/>
-<circle cx="876.8" cy="73.3" r="3" fill="#d62728"/>
-<circle cx="875.1" cy="56.6" r="3" fill="#d62728"/>
-<line x1="630" y1="114" x2="658" y2="114" stroke="#d62728" stroke-width="2" stroke-dasharray=""/>
-<text x="666" y="118" font-size="12" fill="#d62728">ivfrq-neon p50</text>
-<path d="M452.6 103.8 L568.1 103.2 L692.1 103.5 L786.9 100.0 L838.7 92.5 L864.6 88.0 L875.1 77.0 L876.8 64.7 L875.1 49.2" fill="none" stroke="#d62728" stroke-width="2" stroke-dasharray="8,4"/>
-<circle cx="452.6" cy="103.8" r="3" fill="#d62728"/>
-<circle cx="568.1" cy="103.2" r="3" fill="#d62728"/>
-<circle cx="692.1" cy="103.5" r="3" fill="#d62728"/>
-<circle cx="786.9" cy="100.0" r="3" fill="#d62728"/>
-<circle cx="838.7" cy="92.5" r="3" fill="#d62728"/>
-<circle cx="864.6" cy="88.0" r="3" fill="#d62728"/>
-<circle cx="875.1" cy="77.0" r="3" fill="#d62728"/>
-<circle cx="876.8" cy="64.7" r="3" fill="#d62728"/>
-<circle cx="875.1" cy="49.2" r="3" fill="#d62728"/>
-<line x1="630" y1="114" x2="658" y2="114" stroke="#d62728" stroke-width="2" stroke-dasharray="8,4"/>
-<text x="666" y="118" font-size="12" fill="#d62728">ivfrq-neon p99</text>
+<path d="M452.6 375.2 L568.1 367.2 L692.1 361.9 L786.9 355.5 L838.7 341.8 L864.6 326.9 L875.1 308.1 L876.8 283.4 L875.1 257.7" fill="none" stroke="#000000" stroke-width="2" stroke-dasharray=""/>
+<circle cx="452.6" cy="375.2" r="3" fill="#000000"/>
+<circle cx="568.1" cy="367.2" r="3" fill="#000000"/>
+<circle cx="692.1" cy="361.9" r="3" fill="#000000"/>
+<circle cx="786.9" cy="355.5" r="3" fill="#000000"/>
+<circle cx="838.7" cy="341.8" r="3" fill="#000000"/>
+<circle cx="864.6" cy="326.9" r="3" fill="#000000"/>
+<circle cx="875.1" cy="308.1" r="3" fill="#000000"/>
+<circle cx="876.8" cy="283.4" r="3" fill="#000000"/>
+<circle cx="875.1" cy="257.7" r="3" fill="#000000"/>
+<line x1="630" y1="114" x2="658" y2="114" stroke="#000000" stroke-width="2" stroke-dasharray=""/>
+<text x="666" y="118" font-size="12" fill="#000000">ivfrq-k8s p50</text>
+<path d="M452.6 337.4 L568.1 329.6 L692.1 320.0 L786.9 317.7 L838.7 308.0 L864.6 295.6 L875.1 283.6 L876.8 264.2 L875.1 243.2" fill="none" stroke="#000000" stroke-width="2" stroke-dasharray="8,4"/>
+<circle cx="452.6" cy="337.4" r="3" fill="#000000"/>
+<circle cx="568.1" cy="329.6" r="3" fill="#000000"/>
+<circle cx="692.1" cy="320.0" r="3" fill="#000000"/>
+<circle cx="786.9" cy="317.7" r="3" fill="#000000"/>
+<circle cx="838.7" cy="308.0" r="3" fill="#000000"/>
+<circle cx="864.6" cy="295.6" r="3" fill="#000000"/>
+<circle cx="875.1" cy="283.6" r="3" fill="#000000"/>
+<circle cx="876.8" cy="264.2" r="3" fill="#000000"/>
+<circle cx="875.1" cy="243.2" r="3" fill="#000000"/>
+<line x1="630" y1="114" x2="658" y2="114" stroke="#000000" stroke-width="2" stroke-dasharray="8,4"/>
+<text x="666" y="118" font-size="12" fill="#000000">ivfrq-k8s p99</text>
 <path d="M451.5 367.4 L566.6 351.9 L690.2 344.5 L782.8 337.5 L834.6 329.9 L862.2 319.1 L874.3 302.5 L878.4 284.4 L878.4 261.7" fill="none" stroke="#1f77b4" stroke-width="2" stroke-dasharray=""/>
 <circle cx="451.5" cy="367.4" r="3" fill="#1f77b4"/>
 <circle cx="566.6" cy="351.9" r="3" fill="#1f77b4"/>
