@@ -1,4 +1,4 @@
-# recall@10 vs latency — ivfrq & hnsw on vanilla PG17 vs Neon (x86)
+# recall@10 vs latency — ivfrq & hnsw: vanilla PG17 vs Neon on k8s (x86)
 
 | config | engine | param | value | recall@10 | p50 (ms) | p99 (ms) |
 |---|---|---|---|---|---|---|

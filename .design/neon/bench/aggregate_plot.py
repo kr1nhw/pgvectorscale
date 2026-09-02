@@ -33,7 +33,7 @@ for f in files:
 rows.sort(key=lambda r: (r["label"], r["engine"], float(r["param_value"])))
 
 # ---- markdown table ----
-md = ["# recall@10 vs latency — ivfrq & hnsw on vanilla PG17 vs Neon (x86)",
+md = ["# recall@10 vs latency — ivfrq & hnsw: vanilla PG17 vs Neon on k8s (x86)",
       "",
       "| config | engine | param | value | recall@10 | p50 (ms) | p99 (ms) |",
       "|---|---|---|---|---|---|---|"]
@@ -50,11 +50,23 @@ X0, Y0 = ML, H - MB
 XW, YH = W - ML - MR, H - MT - MB
 
 labels = sorted({r["label"] for r in rows})
-palette = {"ivfrq-vanilla": "#1f77b4", "hnsw-vanilla": "#2ca02c",
-           "ivfrq-neon": "#d62728", "hnsw-neon": "#ff7f0e"}
+
+# Distinct colors per label.  Explicit map for the benchmark's known labels;
+# unknown labels fall back to a deterministic cycle so nothing ever shares
+# (or silently defaults to) a color.
+PALETTE = {
+    "ivfrq-vanilla": "#1f77b4",  # blue
+    "ivfrq-k8s":     "#d62728",  # red
+    "hnsw-vanilla":  "#2ca02c",  # green
+    "hnsw-k8s":      "#ff7f0e",  # orange
+}
+CYCLE = ["#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
 def color(lab):
-    return palette.get(lab, "#000000")
+    if lab in PALETTE:
+        return PALETTE[lab]
+    i = labels.index(lab)
+    return CYCLE[i % len(CYCLE)]
 
 xmin, xmax = 0.0, 100.0
 ymin, ymax = 0.1, 2000.0
