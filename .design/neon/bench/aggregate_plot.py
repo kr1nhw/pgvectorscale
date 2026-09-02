@@ -43,13 +43,18 @@ for r in rows:
 md.append("")
 Path(OUT + ".md").write_text("\n".join(md))
 
-# ---- SVG plot: x = recall@10 (%), y = latency ms (log scale), line per config, p50 solid / p99 dashed ----
+# ---- SVG plot: x = latency ms (log), y = recall@10 % (linear, 80-100),
+#      line per config, p50 solid / p99 dashed, recall >= 0.8 only ----
+import math
+
+plot_rows = [r for r in rows if r["recall_at_10"] >= 80.0]
+
 W, H = 900, 560
-ML, MR, MT, MB = 70, 20, 30, 60
+ML, MR, MT, MB = 70, 240, 30, 60
 X0, Y0 = ML, H - MB
 XW, YH = W - ML - MR, H - MT - MB
 
-labels = sorted({r["label"] for r in rows})
+labels = sorted({r["label"] for r in plot_rows})
 
 # Distinct colors per label.  Explicit map for the benchmark's known labels;
 # unknown labels fall back to a deterministic cycle so nothing ever shares
@@ -68,44 +73,53 @@ def color(lab):
     i = labels.index(lab)
     return CYCLE[i % len(CYCLE)]
 
-xmin, xmax = 0.0, 100.0
-ymin, ymax = 0.1, 2000.0
+xmin, xmax = 0.5, 500.0     # latency ms (log)
+ymin, ymax = 80.0, 100.0    # recall % (linear)
 
-def X(v):  # linear recall
-    return X0 + (v - xmin) / (xmax - xmin) * XW
+def X(v):  # log latency
+    lx0, lx1 = math.log10(xmin), math.log10(xmax)
+    return X0 + (math.log10(max(v, xmin)) - lx0) / (lx1 - lx0) * XW
 
-def Y(v):  # log latency
-    import math
-    ly0, ly1 = math.log10(ymin), math.log10(ymax)
-    return Y0 - (math.log10(max(v, ymin)) - ly0) / (ly1 - ly0) * YH
+def Y(v):  # linear recall
+    return Y0 - (v - ymin) / (ymax - ymin) * YH
 
 parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
          f'viewBox="0 0 {W} {H}">',
          f'<rect width="{W}" height="{H}" fill="white"/>']
-# grid
-import math
-for g in [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]:
-    if g < ymin or g > ymax:
+# grid: latency (log) verticals, recall horizontals
+for g in [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]:
+    if g < xmin or g > xmax:
         continue
-    y = Y(g)
-    parts.append(f'<line x1="{X0}" y1="{y:.1f}" x2="{X0+XW}" y2="{y:.1f}" '
-                 f'stroke="#e0e0e0" stroke-width="1"/>')
-    parts.append(f'<text x="{X0-6}" y="{y+4:.1f}" font-size="11" text-anchor="end" '
-                 f'fill="#666">{g:g}</text>')
-for g in [0, 20, 40, 60, 80, 100]:
     x = X(g)
     parts.append(f'<line x1="{x:.1f}" y1="{Y0}" x2="{x:.1f}" y2="{MT}" '
                  f'stroke="#e0e0e0" stroke-width="1"/>')
     parts.append(f'<text x="{x:.1f}" y="{Y0+16}" font-size="11" text-anchor="middle" '
+                 f'fill="#666">{g:g}</text>')
+for g in [80, 85, 90, 95, 100]:
+    y = Y(g)
+    parts.append(f'<line x1="{X0}" y1="{y:.1f}" x2="{X0+XW}" y2="{y:.1f}" '
+                 f'stroke="#e0e0e0" stroke-width="1"/>')
+    parts.append(f'<text x="{X0-6}" y="{y+4:.1f}" font-size="11" text-anchor="end" '
                  f'fill="#666">{g}</text>')
 parts.append(f'<text x="{X0+XW/2:.0f}" y="{H-12}" font-size="13" text-anchor="middle">'
-             f'recall@10 (%)</text>')
+             f'latency (ms, log)</text>')
 parts.append(f'<text x="16" y="{MT+YH/2:.0f}" font-size="13" text-anchor="middle" '
-             f'transform="rotate(-90 16 {MT+YH/2:.0f})">latency (ms, log)</text>')
+             f'transform="rotate(-90 16 {MT+YH/2:.0f})">recall@10 (%)</text>')
+
+# legend in the right margin (solid = p50, dashed = p99)
+parts.append(f'<text x="{X0+XW+14}" y="{MT+4}" font-size="12" fill="#333">solid p50 / dashed p99</text>')
+for i, lab in enumerate(labels):
+    col = color(lab)
+    ly = MT + 24 + i * 34
+    parts.append(f'<line x1="{X0+XW+14}" y1="{ly}" x2="{X0+XW+42}" y2="{ly}" '
+                 f'stroke="{col}" stroke-width="2"/>')
+    parts.append(f'<line x1="{X0+XW+14}" y1="{ly+13}" x2="{X0+XW+42}" y2="{ly+13}" '
+                 f'stroke="{col}" stroke-width="2" stroke-dasharray="8,4"/>')
+    parts.append(f'<text x="{X0+XW+50}" y="{ly+16}" font-size="12" fill="{col}">{lab}</text>')
 
 for lab in labels:
     for pct, dash in (("p50", ""), ("p99", "8,4")):
-        pts = [(r["recall_at_10"], r[pct + "_ms"]) for r in rows if r["label"] == lab]
+        pts = [(r[pct + "_ms"], r["recall_at_10"]) for r in plot_rows if r["label"] == lab]
         if not pts:
             continue
         col = color(lab)
@@ -114,13 +128,6 @@ for lab in labels:
                      f'stroke-dasharray="{dash}"/>')
         for x, y in pts:
             parts.append(f'<circle cx="{X(x):.1f}" cy="{Y(y):.1f}" r="3" fill="{col}"/>')
-        # legend
-        i = labels.index(lab)
-        lx, ly = X0 + XW - 250, MT + 16 + i * 34
-        parts.append(f'<line x1="{lx}" y1="{ly}" x2="{lx+28}" y2="{ly}" stroke="{col}" '
-                     f'stroke-width="2" stroke-dasharray="{dash}"/>')
-        parts.append(f'<text x="{lx+36}" y="{ly+4}" font-size="12" fill="{col}">'
-                     f'{lab} {pct}</text>')
 
 parts.append("</svg>")
 Path(OUT + ".svg").write_text("\n".join(parts))

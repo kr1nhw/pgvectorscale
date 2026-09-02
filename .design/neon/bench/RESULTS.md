@@ -60,7 +60,7 @@ Date: 2026-09-02 — Server: `root@113.44.106.182` (Huawei Cloud EulerOS 2.0, x8
 | hnsw-k8s | hnsw | ef_search | 320 | 99.10 | 87.855 | 352.179 |
 | hnsw-k8s | hnsw | ef_search | 640 | 99.40 | 32.495 | 89.600 |
 
-Plot: `results.svg` (x = recall@10 %, y = latency ms, log scale; p50 solid, p99 dashed).
+Plot: `results.svg` (x = latency ms, log scale; y = recall@10 %, 80–100; p50 solid, p99 dashed; points below 80% recall omitted).
 
 ## 3. Headlines
 
