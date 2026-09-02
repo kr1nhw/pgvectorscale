@@ -115,3 +115,27 @@ Plot: `results.svg` (x = recall@10 %, y = latency ms, log scale; p50 solid, p99 
 ```
 
 Raw CSVs: `bench_results_x86/*.csv` (also under `.design/neon/bench/data/`).
+
+## 6. Tuned + Kubernetes results (added 2026-09-02, same session)
+
+Latency was dominated by dev-stack defaults, not Neon's architecture:
+
+| knobs | default | tuned |
+|---|---|---|
+| compute `shared_buffers` | 1MB | 2GB |
+| compute LFC (`neon.max_file_cache_size` / `neon.file_cache_size_limit`) | disabled (0) | 8GB / 8GB |
+| pageserver `page_cache_size` | 8192 pages (64MB) | 524288 pages (4GB) |
+| `maintenance_work_mem` / `max_parallel_maintenance_workers` | 64MB / 2 | 1GB / 8 |
+
+BIGANN-10M, 100 queries, ivfrq (lists=1000, num_bits=1), p50/p99 ms:
+
+| probes | recall | Neon untuned | Neon tuned | Neon k8s 3-SK tuned | vanilla PG17 |
+|---|---|---|---|---|---|
+| 1 | 47.23% | 389.7 / 422.8 | 1.37 / 2.89 | 1.44 / 3.06 | 1.64 / 4.68 |
+| 8 | 88.50% | 418.4 / 457.2 | 2.02 / 4.49 | 2.15 / 4.78 | 3.07 / 7.78 |
+| 64 | 99.40% | 626.4 / 743.5 | 5.15 / 9.01 | 5.64 / 9.34 | 6.42 / 12.07 |
+
+- Tuning alone: **~120–280× faster** warm p50, matching vanilla PG17 at equal recall.
+- The 3-pageserver + 3-safekeeper k3s deployment adds ~5–10% on top of tuned
+  single-node (per-commit WAL sync to the 3/3 quorum) — see `K8S.md` for the
+  full deployment recipe.
