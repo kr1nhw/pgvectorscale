@@ -86,9 +86,12 @@ pub unsafe extern "C-unwind" fn ambuild(
     let num_bits: u8 = options.get_num_bits();
 
     // ---- Pass 1: reservoir-sample the heap (bounded memory). ----
+    // `sample_size` reloption: 0 = auto (DEFAULT_SAMPLE_SIZE); the reservoir
+    // keeps every row when the table is smaller than the requested size.
+    let sample_size = options.get_sample_size().unwrap_or(DEFAULT_SAMPLE_SIZE);
     let mut sample_state = SampleState {
-        sample: Vec::with_capacity(DEFAULT_SAMPLE_SIZE),
-        sample_size: DEFAULT_SAMPLE_SIZE,
+        sample: Vec::with_capacity(sample_size.min(DEFAULT_SAMPLE_SIZE)),
+        sample_size,
         nrows: 0,
         rng: SmallRng::from_entropy(),
     };
