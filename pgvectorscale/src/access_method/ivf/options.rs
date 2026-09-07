@@ -12,6 +12,10 @@ const DEFAULT_LISTS: i32 = 100;
 /// Default RaBitQ bits-per-dimension for the IVF index.
 const DEFAULT_NUM_BITS: i32 = 1;
 
+/// Default k-means training sample size: 0 means "auto" (the build-time
+/// `DEFAULT_SAMPLE_SIZE` in build.rs, currently 30000).
+const DEFAULT_SAMPLE_SIZE_OPTION: i32 = 0;
+
 /// Default storage type string for IVF index.  The IVF access method is a
 /// RaBitQ index, so its (only) storage layout is `rabitq_compression`.
 const IVF_DEFAULT_STORAGE_TYPE_STR: &str = "rabitq_compression";
@@ -27,6 +31,7 @@ pub struct TSVIvfOptions {
     pub storage_layout_offset: i32,
     pub lists: i32,
     pub num_bits: i32,
+    pub sample_size: i32,
 }
 
 impl TSVIvfOptions {
@@ -40,6 +45,7 @@ impl TSVIvfOptions {
             ops.storage_layout_offset = 0;
             ops.lists = DEFAULT_LISTS;
             ops.num_bits = DEFAULT_NUM_BITS;
+            ops.sample_size = DEFAULT_SAMPLE_SIZE_OPTION;
             unsafe {
                 set_varsize_4b(
                     ops.as_ptr().cast(),
@@ -75,6 +81,23 @@ impl TSVIvfOptions {
             panic!("num_bits must be between 1 and 8");
         }
         self.num_bits as u8
+    }
+
+    /// Get the k-means training sample size, if set explicitly.
+    ///
+    /// Returns `None` when the option is 0 (auto: use the build-time
+    /// `DEFAULT_SAMPLE_SIZE`); `Some(n)` for an explicit positive value.
+    /// The reservoir sampler naturally keeps every row when the table is
+    /// smaller than the requested size.
+    pub fn get_sample_size(&self) -> Option<usize> {
+        if self.sample_size < 0 {
+            panic!("sample_size must be >= 0 (0 = auto)");
+        }
+        if self.sample_size == 0 {
+            None
+        } else {
+            Some(self.sample_size as usize)
+        }
     }
 
     /// Helper to extract a string option from the options struct.
@@ -234,6 +257,16 @@ pub unsafe fn init() {
         8,
         pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
     );
+
+    pg_sys::add_int_reloption(
+        RELOPT_KIND_IVF,
+        "sample_size".as_pg_cstr(),
+        "Vectors reservoir-sampled for k-means training (0 = auto, 30000)".as_pg_cstr(),
+        DEFAULT_SAMPLE_SIZE_OPTION,
+        0,
+        1_000_000,
+        pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
+    );
 }
 
 #[pg_guard]
@@ -282,7 +315,7 @@ pub unsafe extern "C-unwind" fn amoptions(
         }
     }
 
-    let tab: [pg_sys::relopt_parse_elt; 3] = [
+    let tab: [pg_sys::relopt_parse_elt; 4] = [
         make_relopt_parse_elt(
             "storage_layout",
             pg_sys::relopt_type::RELOPT_TYPE_STRING,
@@ -297,6 +330,11 @@ pub unsafe extern "C-unwind" fn amoptions(
             "num_bits",
             pg_sys::relopt_type::RELOPT_TYPE_INT,
             offset_of!(TSVIvfOptions, num_bits) as i32,
+        ),
+        make_relopt_parse_elt(
+            "sample_size",
+            pg_sys::relopt_type::RELOPT_TYPE_INT,
+            offset_of!(TSVIvfOptions, sample_size) as i32,
         ),
     ];
 

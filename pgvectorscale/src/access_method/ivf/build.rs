@@ -13,25 +13,48 @@ use crate::access_method::ivf::entry::{seal_entries, IvfEntry};
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::IvfMetaPage;
 use crate::access_method::ivf::options::TSVIvfOptions;
-use crate::access_method::ivf::segment::{IvfListHeader, IvfSegmentList};
+use crate::access_method::ivf::segment::{IvfListHeader, IvfSegment, IvfSegmentList};
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::access_method::quantization::rabitq::{RabitqQuantizer, RabitqVector};
 use crate::util::ItemPointer;
 use rayon::prelude::*;
 
-/// Default number of samples for K-means training
-const DEFAULT_SAMPLE_SIZE: usize = 10000;
+/// Default number of samples for K-means training (reservoir-sampled during
+/// the first heap pass, so this bounds the build's sample memory).
+const DEFAULT_SAMPLE_SIZE: usize = 30000;
 
 /// Maximum iterations for Lloyd's algorithm
 const MAX_KMEANS_ITERATIONS: usize = 100;
 
-/// Build state for collecting vectors during index build
-struct IvfBuildState {
-    vectors: Vec<Vec<f32>>,
-    heap_tids: Vec<ItemPointer>,
+/// Entries sealed per segment during the streaming second pass (bounds the
+/// per-list buffer memory to `num_lists × SEGMENT_ENTRIES × sizeof(IvfEntry)`).
+const SEGMENT_ENTRIES: usize = 10_000;
+
+/// Build state for the first heap pass: reservoir-sampled vectors only.
+struct SampleState {
+    sample: Vec<Vec<f32>>,
+    sample_size: usize,
+    nrows: u64,
+    rng: SmallRng,
 }
 
-/// Build a new IVF index (serial version).
+/// Build state for the second heap pass: per-list entry buffers + sealed
+/// segments, so the full dataset is never held in memory.
+struct AssignState {
+    centroids: Vec<Vec<f32>>,
+    quantizer: RabitqQuantizer,
+    distance_type: DistanceType,
+    index: pg_sys::Relation,
+    list_buffers: Vec<Vec<IvfEntry>>,
+    segments: Vec<Vec<IvfSegment>>,
+}
+
+/// Build a new IVF index (streaming two-pass version).
+///
+/// Memory is bounded independent of the table size: pass 1 keeps only a
+/// reservoir sample for K-means, and pass 2 assigns/quantizes/seals rows in
+/// per-list batches, so a 100M-row build needs ~`num_lists x SEGMENT_ENTRIES`
+/// entries in flight instead of the full dataset.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambuild(
     heap: pg_sys::Relation,
@@ -59,78 +82,210 @@ pub unsafe extern "C-unwind" fn ambuild(
         panic!("Cannot determine vector dimensions from index");
     }
 
-    // Phase 1: Scan heap and collect all vectors using the standard index build
-    // heap scan (this is more reliable than a manual table scan and matches the
-    // diskann access method).
-    let mut build_state = IvfBuildState {
-        vectors: Vec::new(),
-        heap_tids: Vec::new(),
-    };
+    let num_lists = options.get_lists() as usize;
+    let num_bits: u8 = options.get_num_bits();
 
+    // ---- Pass 1: reservoir-sample the heap (bounded memory). ----
+    // `sample_size` reloption: 0 = auto (DEFAULT_SAMPLE_SIZE); the reservoir
+    // keeps every row when the table is smaller than the requested size.
+    let sample_size = options.get_sample_size().unwrap_or(DEFAULT_SAMPLE_SIZE);
+    let mut sample_state = SampleState {
+        sample: Vec::with_capacity(sample_size.min(DEFAULT_SAMPLE_SIZE)),
+        sample_size,
+        nrows: 0,
+        rng: SmallRng::from_entropy(),
+    };
     unsafe {
         pg_sys::IndexBuildHeapScan(
             heap_rel.as_ptr(),
             index_rel.as_ptr(),
             index_info,
-            Some(build_callback),
-            &mut build_state,
+            Some(sample_callback),
+            &mut sample_state,
+        );
+    }
+    let reltuples = sample_state.nrows as f64;
+
+    if sample_state.sample.is_empty() {
+        // PG calls ambuild (not ambuildempty) even for empty tables.
+        write_empty_index(&index_rel, &options, num_dimensions as u32);
+        let mut pg_result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
+        pg_result.heap_tuples = reltuples;
+        pg_result.index_tuples = 0.0;
+        return pg_result.into_pg();
+    }
+
+    // ---- K-means on the sample. ----
+    let mut rng = SmallRng::from_entropy();
+    let rotation_seed: u64 = rng.gen();
+    let quantizer = RabitqQuantizer::new(num_bits, rotation_seed, num_dimensions);
+    let mut centroids = kmeans_plus_plus_init(&sample_state.sample, num_lists, distance_type);
+    centroids = lloyds_algorithm(
+        &sample_state.sample,
+        &mut centroids,
+        MAX_KMEANS_ITERATIONS,
+        distance_type,
+    );
+    drop(sample_state);
+
+    // ---- Write meta + empty directory + centroid page (before pass 2 so the
+    // segment allocator sees the reserved ranges, as in the old flow). ----
+    let storage_type = options.get_storage_type();
+    let mut meta_page = unsafe {
+        IvfMetaPage::create(
+            &index_rel,
+            num_dimensions as u32,
+            distance_type,
+            num_lists as u16,
+            storage_type,
+            num_bits,
+            rotation_seed,
+        )
+    };
+    let mut list_directory = IvfListDirectory::new(num_lists as u16);
+    unsafe {
+        list_directory.store(&index_rel, true);
+    }
+    let centroid_page = IvfCentroidPage::new(centroids.clone());
+    let centroid_ptr = unsafe { centroid_page.store(&index_rel, None) };
+    unsafe {
+        meta_page.set_list_directory_pointer(ItemPointer::new(1, 1));
+        meta_page.set_centroids_pointer(centroid_ptr);
+        meta_page.store(&index_rel, false);
+    }
+
+    // ---- Pass 2: assign + quantize + seal in per-list batches. ----
+    let mut assign_state = AssignState {
+        centroids,
+        quantizer,
+        distance_type,
+        index: index_rel.as_ptr(),
+        list_buffers: (0..num_lists).map(|_| Vec::new()).collect(),
+        segments: (0..num_lists).map(|_| Vec::new()).collect(),
+    };
+    unsafe {
+        pg_sys::IndexBuildHeapScan(
+            heap_rel.as_ptr(),
+            index_rel.as_ptr(),
+            index_info,
+            Some(assign_callback),
+            &mut assign_state,
         );
     }
 
-    let reltuples = build_state.vectors.len() as f64;
+    // Flush the remaining per-list buffers and publish one segment list +
+    // header per list.
+    let mut num_tuples = 0u64;
+    for list_id in 0..num_lists {
+        let entries = std::mem::take(&mut assign_state.list_buffers[list_id]);
+        if !entries.is_empty() {
+            let segment = seal_entries(&index_rel, entries);
+            if !segment.is_empty() {
+                assign_state.segments[list_id].push(segment);
+            }
+        }
+        let count: u64 = assign_state.segments[list_id]
+            .iter()
+            .map(|s| s.num_entries)
+            .sum();
+        num_tuples += count;
 
-    // Phase 2: Build the index
-    let result = build_ivf_index_serial(
-        &index_rel,
-        &build_state.vectors,
-        &build_state.heap_tids,
-        &options,
-        distance_type,
-        num_dimensions as u32,
-    );
+        let segment_list =
+            IvfSegmentList::new(std::mem::take(&mut assign_state.segments[list_id]));
+        let (segment_list_ptr, segment_list_blocks) = unsafe { segment_list.store(&index_rel) };
+        let header = IvfListHeader::new(segment_list_ptr, segment_list_blocks);
+        let header_ptr = unsafe { header.store_new(&index_rel) };
+        if let Some(list_meta) = list_directory.get_list_mut(list_id as u16) {
+            list_meta.header = header_ptr;
+            list_meta.num_tuples = count;
+        }
+    }
 
-    // Return the build result
+    unsafe {
+        list_directory.store(&index_rel, false);
+        // Bulk smgr scans need the built entry blocks on disk first.
+        pg_sys::FlushRelationBuffers(index_rel.as_ptr());
+    }
+
     let mut pg_result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
     pg_result.heap_tuples = reltuples;
-    pg_result.index_tuples = result.num_tuples as f64;
+    pg_result.index_tuples = num_tuples as f64;
     pg_result.into_pg()
 }
 
-/// Callback function for IndexBuildHeapScan.
+/// Pass-1 callback: reservoir sampling (Algorithm R) with a row counter.
 #[pg_guard]
-unsafe extern "C-unwind" fn build_callback(
+unsafe extern "C-unwind" fn sample_callback(
     _index: pg_sys::Relation,
+    _tid: pg_sys::ItemPointer,
+    values: *mut pg_sys::Datum,
+    isnull: *mut bool,
+    _tuple_is_alive: bool,
+    state: *mut std::os::raw::c_void,
+) {
+    if *isnull {
+        return;
+    }
+    let sample_state = &mut *(state as *mut SampleState);
+
+    let datum = *values;
+    let datum_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
+    let detoasted_ptr = pg_sys::pg_detoast_datum(datum_ptr);
+    let detoasted_datum = pg_sys::Datum::from(detoasted_ptr);
+    let pg_vec_internal = detoasted_datum.cast_mut_ptr::<PgVectorInternal>();
+    let vec_slice = unsafe { (*pg_vec_internal).to_slice() };
+
+    let i = sample_state.nrows;
+    sample_state.nrows += 1;
+    if sample_state.sample.len() < sample_state.sample_size {
+        sample_state.sample.push(vec_slice.to_vec());
+    } else {
+        let j = sample_state.rng.gen_range(0..=i);
+        if j < sample_state.sample_size as u64 {
+            sample_state.sample[j as usize] = vec_slice.to_vec();
+        }
+    }
+}
+
+/// Pass-2 callback: assign to the nearest centroid, quantize the residual,
+/// and buffer the entry; seals a segment whenever a list buffer fills.
+#[pg_guard]
+unsafe extern "C-unwind" fn assign_callback(
+    index: pg_sys::Relation,
     tid: pg_sys::ItemPointer,
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
     _tuple_is_alive: bool,
     state: *mut std::os::raw::c_void,
 ) {
-    let build_state = &mut *(state as *mut IvfBuildState);
-
-    // Skip null vectors.
     if *isnull {
         return;
     }
+    let assign_state = &mut *(state as *mut AssignState);
 
-    // Extract the vector datum (first column).
     let datum = *values;
-
-    // Detoast the datum if needed.
     let datum_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
     let detoasted_ptr = pg_sys::pg_detoast_datum(datum_ptr);
     let detoasted_datum = pg_sys::Datum::from(detoasted_ptr);
-
-    // Get the heap TID.
-    let item_ptr = ItemPointer::with_item_pointer_data(*tid);
-
-    // Extract vector data from the detoasted datum.
     let pg_vec_internal = detoasted_datum.cast_mut_ptr::<PgVectorInternal>();
     let vec_slice = unsafe { (*pg_vec_internal).to_slice() };
-    let vec = vec_slice.to_vec();
 
-    build_state.vectors.push(vec);
-    build_state.heap_tids.push(item_ptr);
+    let list_id =
+        nearest_centroid(vec_slice, &assign_state.centroids, assign_state.distance_type) as usize;
+    let code = assign_state
+        .quantizer
+        .quantize_residual(&assign_state.centroids[list_id], vec_slice);
+    let item_ptr = ItemPointer::with_item_pointer_data(*tid);
+    let entry = IvfEntry::new(item_ptr, code);
+
+    assign_state.list_buffers[list_id].push(entry);
+    if assign_state.list_buffers[list_id].len() >= SEGMENT_ENTRIES {
+        let entries = std::mem::take(&mut assign_state.list_buffers[list_id]);
+        let segment = seal_entries(&PgRelation::from_pg(assign_state.index), entries);
+        if !segment.is_empty() {
+            assign_state.segments[list_id].push(segment);
+        }
+    }
 }
 
 /// Build an empty IVF index (for CREATE INDEX on empty table).
