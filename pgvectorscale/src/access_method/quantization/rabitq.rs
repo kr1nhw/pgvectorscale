@@ -1485,7 +1485,14 @@ mod four_bit_tests {
     #[test]
     fn real_bigann_8bit_ranking() {
         // Uses /tmp/est_test.csv (real bigann vectors: query 0 = id -1).
-        let raw = std::fs::read_to_string("/tmp/est_test.csv").expect("est_test.csv");
+        // The file is a locally-supplied data extract, so skip when absent.
+        let raw = match std::fs::read_to_string("/tmp/est_test.csv") {
+            Ok(raw) => raw,
+            Err(_) => {
+                eprintln!("skipping: /tmp/est_test.csv not present");
+                return;
+            }
+        };
         let mut vectors: Vec<(i32, Vec<f32>)> = Vec::new();
         for line in raw.lines() {
             let line = line.trim();

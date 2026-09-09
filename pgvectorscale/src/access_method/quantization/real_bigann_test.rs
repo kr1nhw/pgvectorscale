@@ -5,9 +5,18 @@ mod real_bigann_tests {
 
 /// Loads /tmp/est_test.csv: "id,\"v1,v2,...\"" and checks the 8-bit
 /// estimator ranking on REAL bigann vectors (query 0 = id -1).
+///
+/// The file is a locally-supplied extract of real BIGANN data, so the test
+/// skips (instead of failing) when it is absent.
 #[test]
 fn real_bigann_8bit_ranking() {
-    let raw = fs::read_to_string("/tmp/est_test.csv").expect("est_test.csv");
+    let raw = match fs::read_to_string("/tmp/est_test.csv") {
+        Ok(raw) => raw,
+        Err(_) => {
+            eprintln!("skipping: /tmp/est_test.csv not present");
+            return;
+        }
+    };
     let mut vectors: Vec<(i32, Vec<f32>)> = Vec::new();
     for line in raw.lines() {
         let line = line.trim();
