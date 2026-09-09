@@ -101,9 +101,14 @@ pub fn lloyds_algorithm(
     let k = centroids.len();
     let dim = vectors[0].len();
 
+    // Allocate once and reuse across iterations: re-allocating these on every
+    // pass is pure churn (the buffers are zeroed/reset in place below).
+    let mut assignments = vec![0usize; vectors.len()];
+    let mut new_centroids = vec![vec![0.0f32; dim]; k];
+    let mut counts = vec![0usize; k];
+
     for _iter in 0..max_iterations {
         // Step 1: Assign each vector to nearest centroid
-        let mut assignments = vec![0usize; vectors.len()];
         for (i, vec) in vectors.iter().enumerate() {
             let mut best_cluster = 0;
             let mut best_dist = dist_fn(vec, &centroids[0]);
@@ -118,8 +123,10 @@ pub fn lloyds_algorithm(
         }
 
         // Step 2: Recompute centroids as mean of assigned vectors
-        let mut new_centroids = vec![vec![0.0f32; dim]; k];
-        let mut counts = vec![0usize; k];
+        for row in &mut new_centroids {
+            row.fill(0.0);
+        }
+        counts.fill(0);
 
         for (i, vec) in vectors.iter().enumerate() {
             let c = assignments[i];
