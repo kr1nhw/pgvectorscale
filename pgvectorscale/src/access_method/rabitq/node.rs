@@ -159,6 +159,9 @@ impl NodeVacuum for ArchivedClassicRabitqNode {
 
     fn delete(self: Pin<&mut Self>) {
         //TODO: actually optimize the deletes by removing index tuples. For now just mark it.
+        // SAFETY: `with_data` hands out a Pin<&mut Self> over the item's bytes;
+        // projecting the first field keeps the pinned-struct invariants (the
+        // returned field stays inside the same allocation and is unique).
         let mut heap_pointer = unsafe { self.map_unchecked_mut(|s| &mut s.heap_item_pointer) };
         heap_pointer.offset = InvalidOffsetNumber;
         heap_pointer.block_number = InvalidBlockNumber;
@@ -171,6 +174,8 @@ impl NodeVacuum for ArchivedLabeledRabitqNode {
     }
 
     fn delete(self: Pin<&mut Self>) {
+        // SAFETY: same field projection as `ArchivedClassicRabitqNode::delete`;
+        // the pinned struct is only borrowed structurally, never moved.
         let mut heap_pointer = unsafe { self.map_unchecked_mut(|s| &mut s.heap_item_pointer) };
         heap_pointer.offset = InvalidOffsetNumber;
         heap_pointer.block_number = InvalidBlockNumber;
@@ -419,6 +424,8 @@ impl Debug for ArchivedLabeledRabitqNode {
 impl<'a> ArchivedMutRabitqNode<'a> {
     fn neighbor_index_pointer(&'a mut self) -> Pin<&'a mut ArchivedVec<ArchivedItemPointer>> {
         match self {
+            // SAFETY: structural field projection of a pinned archived node;
+            // the returned field borrows the same allocation and is never moved.
             ArchivedMutRabitqNode::Classic(node) => unsafe {
                 node.as_mut()
                     .map_unchecked_mut(|s| &mut s.neighbor_index_pointers)

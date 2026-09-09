@@ -142,6 +142,10 @@ impl<'a> RabitqSpeedupStorage<'a> {
     ) {
         match gns {
             GraphNeighborStore::Disk => {
+                // SAFETY: `lsn_index_pointer` addresses a live RaBitQ node item
+                // written by the build path; nodes are immutable once sealed, so
+                // reinterpreting the item bytes as the archived node is sound, and
+                // `self.has_labels` (from the meta page) matches the variant written.
                 let rn_visiting = unsafe {
                     RabitqNode::read(
                         self.index,
@@ -158,6 +162,9 @@ impl<'a> RabitqSpeedupStorage<'a> {
                         continue;
                     }
 
+                    // SAFETY: `neighbor_index_pointer` came from the stored
+                    // neighbor list of a sealed node, so it addresses a live node
+                    // item; same immutability/variant argument as above.
                     let rn_neighbor = unsafe {
                         RabitqNode::read(
                             self.index,
@@ -301,6 +308,10 @@ impl Storage for RabitqSpeedupStorage<'_> {
             .chain(once(index_pointer));
         cache.preload(iter, self, stats);
 
+        // SAFETY: `index_pointer` addresses a live RaBitQ node item; `modify`
+        // takes the page's exclusive lock so no concurrent reader/writer can
+        // race the neighbor update, and `self.has_labels` matches the stored
+        // variant (both derive from the meta page).
         let mut node = unsafe { RabitqNode::modify(self.index, index_pointer, self.has_labels, stats) };
         let mut archived = node.get_archived_node();
         archived.set_neighbors(neighbors, self.num_neighbors);
@@ -350,6 +361,9 @@ impl Storage for RabitqSpeedupStorage<'_> {
         neighbors_of: ItemPointer,
         stats: &mut S,
     ) -> Vec<NeighborWithDistance> {
+        // SAFETY: `neighbors_of` addresses a sealed, immutable RaBitQ node
+        // (obtained from the graph's stored neighbor lists); the variant flag
+        // `self.has_labels` matches what was written.
         let rn = unsafe { RabitqNode::read(self.index, neighbors_of, self.has_labels, stats) };
         let archived = rn.get_archived_node();
         let data = archived.get_rabitq_data();
@@ -357,6 +371,8 @@ impl Storage for RabitqSpeedupStorage<'_> {
         rn.get_archived_node()
             .iter_neighbors()
             .map(|n| {
+                // SAFETY: `n` is a neighbor index pointer stored in a sealed
+                // node; same liveness/immutability/variant argument as above.
                 let rn1 = unsafe { RabitqNode::read(self.index, n, self.has_labels, stats) };
                 let arch = rn1.get_archived_node();
                 let other = arch.get_rabitq_data();
@@ -400,6 +416,9 @@ impl Storage for RabitqSpeedupStorage<'_> {
             return None;
         }
 
+        // SAFETY: `index_pointer` is the graph's entry/start node pointer
+        // (written by the build path and live while the scan runs); the node is
+        // sealed and immutable, and `self.has_labels` matches the stored variant.
         let rn = unsafe { RabitqNode::read(self.index, index_pointer, self.has_labels, &mut lsr.stats) };
         let node = rn.get_archived_node();
         let distance = lsr.sdm.as_ref().unwrap().calculate_bq_distance(
@@ -433,6 +452,8 @@ impl Storage for RabitqSpeedupStorage<'_> {
         stats: &mut GreedySearchStats,
     ) -> HeapPointer {
         let lsn_index_pointer = lsn.index_pointer;
+        // SAFETY: `lsn_index_pointer` comes from the LSN store, which only holds
+        // pointers to live, sealed nodes; same argument as the other read sites.
         let rn = unsafe { RabitqNode::read(self.index, lsn_index_pointer, self.has_labels, stats) };
         let node = rn.get_archived_node();
 
@@ -455,6 +476,10 @@ impl Storage for RabitqSpeedupStorage<'_> {
             .chain(once(index_pointer));
         cache.preload(iter, self, stats);
 
+        // SAFETY: `index_pointer` addresses a live RaBitQ node item; `modify`
+        // takes the page's exclusive lock so no concurrent reader/writer can
+        // race the neighbor update, and `self.has_labels` matches the stored
+        // variant (both derive from the meta page).
         let mut node = unsafe { RabitqNode::modify(self.index, index_pointer, self.has_labels, stats) };
         let mut archived = node.get_archived_node();
         archived.set_neighbors(neighbors, self.num_neighbors);
@@ -473,6 +498,9 @@ impl Storage for RabitqSpeedupStorage<'_> {
         if !self.has_labels {
             return None;
         }
+        // SAFETY: caller passes a live node pointer; `self.has_labels` is true
+        // here (checked above), so parsing the stored node as the Labeled
+        // variant matches what was written.
         let rn = unsafe { RabitqNode::read(self.index, index_pointer, true, stats) };
         let node = rn.get_archived_node();
         node.get_labels().map(Into::into)
@@ -523,6 +551,9 @@ impl RabitqVectorCache {
         stats: &mut S,
     ) -> RabitqNodeData<'_> {
         if !self.cache.contains(&index_pointer) {
+            // SAFETY: callers only pass pointers to live, sealed RaBitQ nodes
+            // (neighbor lists of the node being visited); `storage.get_has_labels()`
+            // matches the variant written to disk.
             let node = unsafe {
                 RabitqNode::read(
                     storage.index,
@@ -561,6 +592,9 @@ impl RabitqVectorCache {
         for index_pointer in index_pointers {
             let item_pointer = ItemPointer::new(index_pointer.block_number, index_pointer.offset);
             if !self.cache.contains(&item_pointer) {
+                // SAFETY: preload iterates pointers to live, sealed RaBitQ nodes
+                // (the neighbors being written); the variant flag matches the
+                // disk representation via `storage.get_has_labels()`.
                 let node = unsafe {
                     RabitqNode::read(storage.index, item_pointer, storage.get_has_labels(), stats)
                 };
