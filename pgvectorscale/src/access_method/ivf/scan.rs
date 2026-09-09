@@ -387,6 +387,10 @@ pub unsafe extern "C-unwind" fn amendscan(scan: pg_sys::IndexScanDesc) {
     let scan_state = unsafe { (*scan).opaque as *mut IvfScanState };
     if !scan_state.is_null() {
         unsafe {
+            // Run the Rust destructor first: pfree only releases the palloc'd
+            // struct, it does not drop the Vec<f32> query / results buffers,
+            // which would leak their Rust-heap allocations on every scan.
+            std::ptr::drop_in_place(scan_state);
             pg_sys::pfree(scan_state as *mut std::os::raw::c_void);
         }
         unsafe {
