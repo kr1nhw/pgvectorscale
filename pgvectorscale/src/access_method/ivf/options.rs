@@ -372,7 +372,7 @@ mod tests {
         let indexrel = PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid));
         let options = TSVIvfOptions::from_relation(&indexrel);
         assert_eq!(options.get_lists(), DEFAULT_LISTS);
-        assert_eq!(options.get_storage_type(), StorageType::RabbitqCompression);
+        assert_eq!(options.get_storage_type(), StorageType::RabitqCompression);
         Ok(())
     }
 

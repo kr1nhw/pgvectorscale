@@ -75,7 +75,7 @@ pub extern "C-unwind" fn ambulkdelete(
                 callback_state,
             );
         }
-        StorageType::RabbitqCompression => match meta_page.has_labels() {
+        StorageType::RabitqCompression => match meta_page.has_labels() {
             true => {
                 bulk_delete_for_storage::<RabitqSpeedupStorage, ArchivedLabeledRabitqNode>(
                     &index_relation,

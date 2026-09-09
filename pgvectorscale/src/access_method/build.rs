@@ -340,7 +340,7 @@ pub extern "C-unwind" fn ambuild(
     let workers = if cfg!(feature = "build_parallel")
         && !meta_page.has_labels()
         && (meta_page.get_storage_type() == StorageType::SbqCompression
-            || meta_page.get_storage_type() == StorageType::RabbitqCompression)
+            || meta_page.get_storage_type() == StorageType::RabitqCompression)
     {
         // Check if we have a forced worker count setting
         let forced_workers = crate::access_method::guc::TSV_FORCE_PARALLEL_WORKERS.get();
@@ -548,7 +548,7 @@ unsafe fn aminsert_internal(
                 &mut stats,
             );
         }
-        StorageType::RabbitqCompression => {
+        StorageType::RabitqCompression => {
             let bq = RabitqSpeedupStorage::load_for_insert(
                 &heap_relation,
                 &index_relation,
@@ -643,7 +643,7 @@ fn maybe_train_quantizer(
                 meta_page.set_quantizer_metadata_pointer(index_pointer);
             }
         }
-        StorageType::RabbitqCompression => {
+        StorageType::RabitqCompression => {
             // RaBitQ needs only a rotation seed; for L2 datasets with a
             // large DC component (e.g. BIGANN u8 data) we also train a
             // global center (dataset mean) so sign bits capture the
@@ -900,7 +900,7 @@ fn do_heap_scan(
                 // Just need to handle any remaining cached nodes and update meta page
                 finalize_remaining_parallel_nodes(&mut bq, bs, index_relation, write_stats)
             }
-            StorageType::RabbitqCompression => {
+            StorageType::RabitqCompression => {
                 let mut bq = unsafe {
                     RabitqSpeedupStorage::new_for_build(
                         index_relation,
@@ -1010,7 +1010,7 @@ fn do_heap_scan(
 
                 finalize_index_build(&mut bq, bs, index_relation, write_stats)
             }
-            StorageType::RabbitqCompression => {
+            StorageType::RabitqCompression => {
                 let mut bq = unsafe {
                     RabitqSpeedupStorage::new_for_build(
                         index_relation,

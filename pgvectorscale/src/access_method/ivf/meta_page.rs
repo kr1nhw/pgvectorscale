@@ -47,7 +47,7 @@ pub struct IvfMetaPage {
     distance_type: u16,
     /// Number of vector dimensions
     num_dimensions: u32,
-    /// Storage type (Plain, SbqCompression, RabbitqCompression)
+    /// Storage type (Plain, SbqCompression, RabitqCompression)
     storage_type: u8,
     /// Number of inverted lists (centroids)
     lists: u16,

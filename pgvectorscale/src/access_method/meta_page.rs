@@ -278,7 +278,7 @@ impl MetaPage {
         match self.get_storage_type() {
             StorageType::Plain => None,
             StorageType::SbqCompression => Some(self.quantizer_metadata),
-            StorageType::RabbitqCompression => Some(self.quantizer_metadata),
+            StorageType::RabitqCompression => Some(self.quantizer_metadata),
         }
     }
 
@@ -288,7 +288,7 @@ impl MetaPage {
             match (*opt).get_storage_type() {
                 StorageType::Plain => 50,
                 StorageType::SbqCompression => 50,
-                StorageType::RabbitqCompression => 50,
+                StorageType::RabitqCompression => 50,
             }
         } else {
             num_neighbors as u32
@@ -330,7 +330,7 @@ impl MetaPage {
         }
         if bq_num_bits_per_dimension > 1
             && (*opt).get_storage_type() != StorageType::SbqCompression
-            && (*opt).get_storage_type() != StorageType::RabbitqCompression
+            && (*opt).get_storage_type() != StorageType::RabitqCompression
         {
             pgrx::error!(
                 "More than 1 bit per dimension is only supported with the memory_optimized or rabitq_compression storage layout"

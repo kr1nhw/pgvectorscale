@@ -89,7 +89,7 @@ impl TSVScanState {
                     TSVResponseIterator::new(&bq, index, query, search_list_size, meta_page, stats);
                 StorageState::SbqSpeedup(quantizer, it)
             }
-            StorageType::RabbitqCompression => {
+            StorageType::RabitqCompression => {
                 let mut stats = QuantizerStats::default();
                 let quantizer = unsafe {
                     let qip = meta_page.get_quantizer_metadata_pointer().unwrap_or_else(|| {
