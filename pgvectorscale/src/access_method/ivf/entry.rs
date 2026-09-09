@@ -96,11 +96,13 @@ pub fn serialize_entries(entries: &[IvfEntry]) -> Vec<u8> {
             );
             buf.extend_from_slice(&transposed);
         } else {
-            let mut sign_plane = Vec::with_capacity(n * plane_len);
-            let mut ex_plane = Vec::with_capacity(n * plane_len);
-            for e in entries {
-                let mut sp = vec![0u8; plane_len];
-                let mut ep = vec![0u8; plane_len];
+            // Pre-size both planes once and write each entry directly into its
+            // slot instead of allocating a fresh sp/ep pair per entry.
+            let mut sign_plane = vec![0u8; n * plane_len];
+            let mut ex_plane = vec![0u8; n * plane_len];
+            for (i, e) in entries.iter().enumerate() {
+                let sp = &mut sign_plane[i * plane_len..(i + 1) * plane_len];
+                let ep = &mut ex_plane[i * plane_len..(i + 1) * plane_len];
                 for (byte_idx, &b) in e.code.packed_code.iter().enumerate() {
                     for j in 0..4usize {
                         let d = byte_idx * 4 + j;
@@ -112,8 +114,6 @@ pub fn serialize_entries(entries: &[IvfEntry]) -> Vec<u8> {
                         }
                     }
                 }
-                sign_plane.extend_from_slice(&sp);
-                ex_plane.extend_from_slice(&ep);
             }
             buf.extend_from_slice(&crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
                 &sign_plane, n, plane_len,
