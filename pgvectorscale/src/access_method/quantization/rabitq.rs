@@ -141,11 +141,21 @@ pub fn code_hamming(a: &[u8], b: &[u8]) -> usize {
 /// Dot of a stored code with a full-precision rotated vector `rot`, given the
 /// primitive fields directly.
 ///
+/// `sum_rot = Σ rot` is precomputed once per query by the caller (the scan
+/// path reuses `RabitqQuery::sum_q`): this function runs once per candidate
+/// entry, so recomputing the O(dim) sum here would dominate the dot itself.
+///
 /// This mirrors `RabitqVector::dot_with_rotated` but operates on borrowed
 /// slices so the zero-copy (archived) scan path never allocates an owned
 /// `RabitqVector` per entry.
 #[inline]
-pub fn dot_with_rotated_fields(num_bits: u8, dim: u32, packed_code: &[u8], rot: &[f32]) -> f32 {
+pub fn dot_with_rotated_fields(
+    num_bits: u8,
+    dim: u32,
+    packed_code: &[u8],
+    rot: &[f32],
+    sum_rot: f32,
+) -> f32 {
     match num_bits {
         2 => {
             // 1 sign bit + 1 ex bit per dim, 4 dims per byte (bits 2j = sign,
@@ -168,9 +178,7 @@ pub fn dot_with_rotated_fields(num_bits: u8, dim: u32, packed_code: &[u8], rot: 
                     ex_dist += ((b >> (2 * j + 1)) & 1) as f32 * r;
                 }
             }
-            code_scale * binary_ip
-                + ex_dist
-                + code_bias * rot[..dim as usize].iter().sum::<f32>()
+            code_scale * binary_ip + ex_dist + code_bias * sum_rot
         }
         4 => {
             let code_scale = 8.0;
@@ -188,9 +196,7 @@ pub fn dot_with_rotated_fields(num_bits: u8, dim: u32, packed_code: &[u8], rot: 
                     ex_dist += (nib & 0x07) as f32 * r;
                 }
             }
-            code_scale * binary_ip
-                + ex_dist
-                + code_bias * rot[..dim as usize].iter().sum::<f32>()
+            code_scale * binary_ip + ex_dist + code_bias * sum_rot
         }
         8 => {
             let code_scale = 128.0;
@@ -203,11 +209,9 @@ pub fn dot_with_rotated_fields(num_bits: u8, dim: u32, packed_code: &[u8], rot: 
                 binary_ip += if b & 0x80 != 0 { r } else { 0.0 };
                 ex_dist += (b & 0x7F) as f32 * r;
             }
-            code_scale * binary_ip
-                + ex_dist
-                + code_bias * rot[..dim as usize].iter().sum::<f32>()
+            code_scale * binary_ip + ex_dist + code_bias * sum_rot
         }
-        _ => code_dot_with_rotated(packed_code, rot, rot[..dim as usize].iter().sum()),
+        _ => code_dot_with_rotated(packed_code, rot, sum_rot),
     }
 }
 
@@ -451,7 +455,8 @@ impl RabitqVector {
     /// For 4/8-bit: `full_dot = code_scale·binary_ip + ex_dist + code_bias·Σrot`.
     #[inline]
     pub fn dot_with_rotated(&self, rot: &[f32]) -> f32 {
-        dot_with_rotated_fields(self.num_bits, self.dim, &self.packed_code, rot)
+        let sum_rot: f32 = rot[..self.dim as usize].iter().sum();
+        dot_with_rotated_fields(self.num_bits, self.dim, &self.packed_code, rot, sum_rot)
     }
 
     /// Code-to-code signed agreement count `m12 = Σ sign(c1)ᵢ·sign(c2)ᵢ`
@@ -813,7 +818,7 @@ pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
         l1_of_rotated: f32,
         rq: &RabitqQuery,
     ) -> f32 {
-        let full_dot = dot_with_rotated_fields(num_bits, dim, packed_code, &rq.rotated);
+        let full_dot = dot_with_rotated_fields(num_bits, dim, packed_code, &rq.rotated, rq.sum_q);
         let res_dot = l1_of_rotated.max(1e-9);
         let scale = -2.0 * sum_of_x2 / res_dot;
         let est = full_dot * scale + sum_of_x2 + rq.sum_of_x2;
@@ -1156,7 +1161,9 @@ mod tests {
             let qv = q.quantize(&v);
             let rot: Vec<f32> = (0..dim).map(|i| ((i % 9) as f32) - 4.0).collect();
 
-            let full_dot = dot_with_rotated_fields(num_bits, dim as u32, &qv.packed_code, &rot);
+            let sum_rot: f32 = rot.iter().sum();
+            let full_dot =
+                dot_with_rotated_fields(num_bits, dim as u32, &qv.packed_code, &rot, sum_rot);
 
             // Unpack the code and compute the reference Σ (full_code + bias)·rot.
             let mut reference = 0.0f32;
@@ -1193,8 +1200,13 @@ mod tests {
             let rq = q.rotate_query(&v);
             let fastscan = RabitqFastScan::new(&rq, num_bits, q.dim());
             let actual = fastscan.full_dot_multi(&qv.packed_code);
-            let expected =
-                dot_with_rotated_fields(num_bits, dim as u32, &qv.packed_code, &rq.rotated);
+            let expected = dot_with_rotated_fields(
+                num_bits,
+                dim as u32,
+                &qv.packed_code,
+                &rq.rotated,
+                rq.sum_q,
+            );
             assert!(
                 (actual - expected).abs() <= 1e-3 * expected.abs().max(1.0),
                 "num_bits={} {} vs {}",
@@ -1539,7 +1551,8 @@ mod two_bit_tests {
         assert_eq!(qv.packed_code.len(), dim / 4, "2-bit packs 4 dims per byte");
         let rot: Vec<f32> = (0..dim).map(|i| ((i % 9) as f32) - 4.0).collect();
 
-        let full_dot = dot_with_rotated_fields(2, dim as u32, &qv.packed_code, &rot);
+        let sum_rot: f32 = rot.iter().sum();
+        let full_dot = dot_with_rotated_fields(2, dim as u32, &qv.packed_code, &rot, sum_rot);
 
         let mut reference = 0.0f32;
         for (byte_idx, &b) in qv.packed_code.iter().enumerate() {
