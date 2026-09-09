@@ -213,7 +213,11 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
 
     unsafe {
         list_directory.store(&index_rel, false);
-        (*results).pages_deleted = total_dead as u32;
+        // `total_dead` counts index *tuples*, not pages: report it through
+        // tuples_removed (f64, no truncation).  This AM never physically
+        // truncates pages in bulkdelete — old segments are retired for reuse
+        // by the reclamation phase — so pages_deleted stays 0.
+        (*results).tuples_removed = total_dead as f64;
         (*results).num_index_tuples = total_live as f64;
     }
 
