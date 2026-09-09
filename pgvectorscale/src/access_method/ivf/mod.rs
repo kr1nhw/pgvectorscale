@@ -248,7 +248,7 @@ pub unsafe extern "C-unwind" fn ivf_amcostestimate(
     if !root.is_null() && !path.is_null() {
         pg_sys::genericcostestimate(root, path, loop_count, &mut generic_costs);
 
-        *index_startup_cost = generic_costs.indexTotalCost;
+        *index_startup_cost = generic_costs.indexStartupCost;
         *index_total_cost = generic_costs.indexTotalCost;
         *index_selectivity = generic_costs.indexSelectivity;
         *index_correlation = generic_costs.indexCorrelation;
