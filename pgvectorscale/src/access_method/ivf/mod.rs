@@ -52,8 +52,6 @@ pub const IVF_DISTANCE_PROC: u16 = 1;
     $$;
 ")]
 fn ivf_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
-    warning!("IVF handler: entering ivf_amhandler");
-    
     let mut amroutine =
         unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine) };
 
@@ -182,8 +180,10 @@ pub unsafe extern "C-unwind" fn ivf_amcostestimate(
     index_correlation: *mut f64,
     index_pages: *mut f64,
 ) {
-    warning!("IVF amcostestimate: entering");
-    
+    // NOTE: no logging in here — the planner calls amcostestimate for many
+    // candidate paths per query, so a WARNING per call floods the server log
+    // and measurably slows planning.
+
     // Initialize with safe defaults
     *index_startup_cost = 0.0;
     *index_total_cost = 0.0;
@@ -193,21 +193,18 @@ pub unsafe extern "C-unwind" fn ivf_amcostestimate(
 
     // Check for null pointers
     if path.is_null() || root.is_null() {
-        warning!("IVF amcostestimate: null pointers detected");
         return;
     }
 
     let path_ref = match path.as_ref() {
         Some(p) => p,
         None => {
-            warning!("IVF amcostestimate: path.as_ref() failed");
             return;
         }
     };
 
     // Check if indexinfo is null
     if path_ref.indexinfo.is_null() {
-        warning!("IVF amcostestimate: path.indexinfo is null");
         return;
     }
 
@@ -217,7 +214,6 @@ pub unsafe extern "C-unwind" fn ivf_amcostestimate(
     // expose stale TIDs to index-only heap fetches.  Refuse to estimate so the
     // planner never chooses it for non-ORDER-BY queries.
     if path_ref.indexorderbys.is_null() || pg_sys::list_length(path_ref.indexorderbys) == 0 {
-        warning!("IVF amcostestimate: no orderby keys, refusing estimate");
         *index_startup_cost = f64::MAX;
         *index_total_cost = f64::MAX;
         *index_selectivity = 1.0;
@@ -229,12 +225,9 @@ pub unsafe extern "C-unwind" fn ivf_amcostestimate(
     let indexinfo_ref = match path_ref.indexinfo.as_ref() {
         Some(info) => info,
         None => {
-            warning!("IVF amcostestimate: indexinfo.as_ref() failed");
             return;
         }
     };
-
-    warning!("IVF amcostestimate: got indexinfo, tuples={}", indexinfo_ref.tuples);
 
     // Estimate cost based on index size
     let total_index_tuples = if indexinfo_ref.tuples > 0.0 {
@@ -253,7 +246,6 @@ pub unsafe extern "C-unwind" fn ivf_amcostestimate(
 
     // Only call genericcostestimate if we have valid parameters
     if !root.is_null() && !path.is_null() {
-        warning!("IVF amcostestimate: calling genericcostestimate");
         pg_sys::genericcostestimate(root, path, loop_count, &mut generic_costs);
 
         *index_startup_cost = generic_costs.indexTotalCost;
@@ -261,6 +253,5 @@ pub unsafe extern "C-unwind" fn ivf_amcostestimate(
         *index_selectivity = generic_costs.indexSelectivity;
         *index_correlation = generic_costs.indexCorrelation;
         *index_pages = generic_costs.numIndexPages;
-        warning!("IVF amcostestimate: completed");
     }
 }
