@@ -217,11 +217,20 @@ pub unsafe extern "C-unwind" fn amgettuple(
                                 fastscan.sum_batch(view.code_batch(batch), &mut sums);
                                 let base = batch * 32;
                                 let count = (view.len() - base).min(32);
+                                // The packed f32 regions are not guaranteed
+                                // 4-byte aligned, so copy them into aligned
+                                // stack buffers (byte-exact, no reordering).
+                                let mut scales = [0f32; 32];
+                                let mut sx2s = [0f32; 32];
+                                let mut mfs = [0f32; 32];
+                                view.copy_scales(base, &mut scales[..count]);
+                                view.copy_sums(base, &mut sx2s[..count]);
+                                view.copy_margin_factors(base, &mut mfs[..count]);
                                 fastscan.estimate_batch(
                                     &sums[..count],
-                                    &view.scale_slice()[base..base + count],
-                                    &view.sum_of_x2_slice()[base..base + count],
-                                    &view.margin_factor_slice()[base..base + count],
+                                    &scales[..count],
+                                    &sx2s[..count],
+                                    &mfs[..count],
                                     &mut dists[..count],
                                     count,
                                 );
@@ -249,12 +258,20 @@ pub unsafe extern "C-unwind" fn amgettuple(
                                 fastscan.sum_batch(view.code_batch_plane1(batch), &mut sums1);
                                 let base = batch * 32;
                                 let count = (view.len() - base).min(32);
+                                // See the 1-bit branch: the packed f32 regions
+                                // are not alignment-safe to alias, so copy.
+                                let mut scales = [0f32; 32];
+                                let mut sx2s = [0f32; 32];
+                                let mut mfs = [0f32; 32];
+                                view.copy_scales(base, &mut scales[..count]);
+                                view.copy_sums(base, &mut sx2s[..count]);
+                                view.copy_margin_factors(base, &mut mfs[..count]);
                                 fastscan.estimate_batch_2bit(
                                     &sums0[..count],
                                     &sums1[..count],
-                                    &view.scale_slice()[base..base + count],
-                                    &view.sum_of_x2_slice()[base..base + count],
-                                    &view.margin_factor_slice()[base..base + count],
+                                    &scales[..count],
+                                    &sx2s[..count],
+                                    &mfs[..count],
                                     &mut dists[..count],
                                     count,
                                 );

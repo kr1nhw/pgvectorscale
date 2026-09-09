@@ -280,27 +280,48 @@ impl<'a> IvfEntrySlice<'a> {
         f32::from_le_bytes(self.sums[i * 4..(i + 1) * 4].try_into().unwrap())
     }
 
-    /// The `sum_of_x2` array as `f32` (little-endian; x86/ARM only).
+    /// Copy the packed little-endian f32 region starting at entry `base` for
+    /// `out.len()` entries into the caller-provided (properly aligned) `out`.
+    ///
+    /// The SoA stream is tightly packed with no alignment padding, so the
+    /// f32 regions can start at any byte offset (e.g. an odd entry count
+    /// misaligns them); casting them to `&[f32]` in place would violate
+    /// f32's 4-byte alignment.  Copying the raw bytes into the aligned
+    /// destination is sound: every bit pattern is a valid f32, and the write
+    /// goes through a u8 pointer into a fully initialized `&mut [f32]`.
     #[inline]
-    pub fn sum_of_x2_slice(&self) -> &'a [f32] {
-        unsafe { std::slice::from_raw_parts(self.sums.as_ptr() as *const f32, self.num_entries) }
-    }
-
-    /// The precomputed `scale` array as `f32`.
-    #[inline]
-    pub fn scale_slice(&self) -> &'a [f32] {
-        unsafe { std::slice::from_raw_parts(self.scales.as_ptr() as *const f32, self.num_entries) }
-    }
-
-    /// The precomputed `margin_factor` array as `f32`.
-    #[inline]
-    pub fn margin_factor_slice(&self) -> &'a [f32] {
+    fn copy_f32_region(src: &'a [u8], base: usize, out: &mut [f32]) {
+        assert!(base + out.len() <= src.len() / 4, "f32 region out of bounds");
+        // SAFETY: `src[base*4 ..]` holds `out.len()*4` initialized bytes
+        // (asserted above); writing them into `out` through a u8 pointer is
+        // valid because all f32 bit patterns are valid values.
         unsafe {
-            std::slice::from_raw_parts(
-                self.margin_factors.as_ptr() as *const f32,
-                self.num_entries,
-            )
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr().add(base * 4),
+                out.as_mut_ptr() as *mut u8,
+                out.len() * 4,
+            );
         }
+    }
+
+    /// Copy `out.len()` `sum_of_x2` values starting at entry `base` (see
+    /// `copy_f32_region` for the alignment rationale).
+    #[inline]
+    pub fn copy_sums(&self, base: usize, out: &mut [f32]) {
+        Self::copy_f32_region(self.sums, base, out);
+    }
+
+    /// Copy `out.len()` precomputed `scale` values starting at entry `base`.
+    #[inline]
+    pub fn copy_scales(&self, base: usize, out: &mut [f32]) {
+        Self::copy_f32_region(self.scales, base, out);
+    }
+
+    /// Copy `out.len()` precomputed `margin_factor` values starting at entry
+    /// `base`.
+    #[inline]
+    pub fn copy_margin_factors(&self, base: usize, out: &mut [f32]) {
+        Self::copy_f32_region(self.margin_factors, base, out);
     }
 
     /// Precomputed `scale = -2*sum_of_x2/l1` of entry `i`.
@@ -887,6 +908,70 @@ mod two_bit_plane_slice_tests {
                 "entry {} code round-trip mismatch",
                 i
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod f32_region_alignment_tests {
+    use super::*;
+    use crate::access_method::quantization::rabitq::{padded_dim, RabitqQuantizer};
+
+    /// Odd entry counts leave the packed f32 regions (sums/scales/margin
+    /// factors) at 2-mod-4 byte offsets — the case the old `from_raw_parts`
+    /// casts got wrong.  The byte-copy accessors must agree with the scalar
+    /// per-entry readers for every entry, for every num_bits width.
+    #[test]
+    fn copy_accessors_match_scalar_for_misaligned_layouts() {
+        for num_bits in [1u8, 2u8, 4u8, 8u8] {
+            for n in [1usize, 3usize, 33usize, 100usize] {
+                let dim = 128usize;
+                let q = RabitqQuantizer::new(num_bits, 5, dim);
+                let entries: Vec<IvfEntry> = (0..n)
+                    .map(|i| {
+                        let v: Vec<f32> =
+                            (0..dim).map(|d| ((i * 13 + d * 7) % 23) as f32 - 11.0).collect();
+                        IvfEntry {
+                            heap_tid: ItemPointer::new(i as u32, 1),
+                            code: q.quantize(&v),
+                        }
+                    })
+                    .collect();
+
+                let bytes = serialize_entries(&entries);
+                let view = IvfEntrySlice::parse(&bytes);
+                assert_eq!(view.len(), n);
+
+                // Assert the misalignment the test is about: the sums region
+                // offset (16 + 6n + codes_len) mod 4 — the old cast was UB
+                // whenever this is non-zero.
+                let codes_len = if num_bits == 1 || num_bits == 2 {
+                    n.div_ceil(32) * 32 * view.code_len()
+                } else {
+                    n * view.code_len()
+                };
+                let sums_off = ENTRY_HEADER_SIZE + n * TID_SIZE + codes_len;
+                if num_bits == 1 {
+                    // 1-bit: 32-row transposed batches force codes_len to a
+                    // multiple of 4; 6n misaligns when n is odd.
+                    assert_eq!(sums_off % 4, if n % 2 == 0 { 0 } else { 2 });
+                }
+
+                for base in (0..n).step_by(7) {
+                    let count = (n - base).min(5);
+                    let mut scales = [0f32; 5];
+                    let mut sx2s = [0f32; 5];
+                    let mut mfs = [0f32; 5];
+                    view.copy_scales(base, &mut scales[..count]);
+                    view.copy_sums(base, &mut sx2s[..count]);
+                    view.copy_margin_factors(base, &mut mfs[..count]);
+                    for r in 0..count {
+                        assert_eq!(scales[r], view.scale(base + r));
+                        assert_eq!(sx2s[r], view.sum_of_x2(base + r));
+                        assert_eq!(mfs[r], view.margin_factor(base + r));
+                    }
+                }
+            }
         }
     }
 }
