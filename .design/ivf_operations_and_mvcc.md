@@ -61,7 +61,7 @@ search-key (WHERE) strategies (`amstrategies = 0`, `amcanorder = false`,
 |---|---|---|---|---|
 | `lists` | int | 100 | 1–32768 | number of inverted lists (k-means centroids). More lists = fewer candidates/query and finer granularity (higher recall at the same probe count). |
 | `num_bits` | int | 1 | 1–8 | RaBitQ bits/dimension: `1` = sign bit; `4` = 1 sign + 3 magnitude; `8` = 1 sign + 7 magnitude. |
-| `storage_layout` | string | `plain` | — | **Parsed but ignored** — the build always uses `RabbitqCompression`. |
+| `storage_layout` | string | `plain` | — | **Parsed but ignored** — the build always uses `RabitqCompression`. |
 
 > `storage_layout` is a leftover diskann option; it does not change behavior.
 > `num_bits ∈ {1,4,8}` are the tested values; other values use the scalar
