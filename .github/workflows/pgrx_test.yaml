@@ -79,6 +79,8 @@ jobs:
 
     - name: Run tests (${{ matrix.parallel_build.name }})
       id: runtests 
+      env:
+        RUST_TEST_THREADS: 1
       run: |
         cd pgvectorscale
         cargo pgrx test --no-default-features --features '${{ matrix.parallel_build.features }} pg${{ matrix.pg.major }}${{ matrix.parallel_build.enabled && ' build_parallel' || '' }}' -- pg${{ matrix.pg.major }}
