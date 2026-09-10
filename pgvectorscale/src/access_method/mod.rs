@@ -4,6 +4,7 @@ use pgrx::*;
 mod build;
 mod cost_estimate;
 mod debugging;
+pub mod agentvec;
 pub mod distance;
 mod graph;
 pub mod guc;

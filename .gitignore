@@ -33,3 +33,4 @@ __pycache__/
 .design/.pgrx-home/
 target-old/
 .pgrx-home/
+.avtest/

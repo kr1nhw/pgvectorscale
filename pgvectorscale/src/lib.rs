@@ -19,6 +19,7 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     access_method::options::init();
     access_method::guc::init();
     access_method::ivf::options::init();
+    access_method::agentvec::options::init();
 }
 
 #[allow(non_snake_case)]
