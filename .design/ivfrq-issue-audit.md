@@ -32,3 +32,27 @@ item, with the fixing commit; validation status on vanilla PG17
   `fix_ivf_operator_classes.sql` (recreated here from a box-local copy).
 - Performance guard: sweeps vs the `.design/neon/bench/RESULTS.md` baselines
   (see sweep CSVs on the box).
+
+## Performance guard (vs .design baselines, same boxes/indexes)
+
+| config | point | recall | p50 | p99 |
+|---|---|---|---|---|
+| vanilla x86 10M (baseline) | p64 | 99.30 | 6.421 | 12.066 |
+| vanilla x86 10M (fixed build) | p64 | 99.60 | **6.076** | **10.424** |
+| neon k8s 10M (baseline) | p64 | 99.40 | 5.707 | 9.561 |
+| neon k8s 10M (fixed build) | p64 | 99.70 | **6.009** | **10.447** |
+| vanilla x86 100M (baseline) | p64 | 98.30 | 29.253 | 49.517 |
+| vanilla x86 100M (fixed build) | p64 | 98.30 | **29.982** | **49.476** |
+
+All probe points (1–256) within ±6% of baseline latency, most equal or
+faster; 100M recall bit-identical at every point (same index, confirming
+the estimator arithmetic is unchanged).  ARM aarch64 has no prior baseline;
+its curve (99.00% @ 12.17 ms p50 at p64) is a healthy match for the x86
+shape.  Zero `amcostestimate`/`amhandler` WARNING lines in any sweep log
+(issue 9 verified on all three engines).
+
+Note: the Neon `benchk8s` endpoint had drifted from its documented tuning
+(512MB shared_buffers / 2GB LFC → 2GB / 8GB restored from
+`RECOMMENDED-SETUP.md`; the drift made the first k8s sweep run at ~260–600 ms
+per query purely from environment, not from these changes — backup kept as
+`postgresql.conf.bak512mb`).
