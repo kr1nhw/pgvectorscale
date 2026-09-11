@@ -7,6 +7,7 @@ mod debugging;
 pub mod distance;
 mod graph;
 pub mod guc;
+pub mod hnswsq;
 pub mod ivf;
 mod labels;
 mod meta_page;

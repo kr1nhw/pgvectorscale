@@ -3,6 +3,18 @@ use pgrx::prelude::*;
 
 pgrx::pg_module_magic!();
 
+// On Linux, `cargo pgrx test` links a standalone unit-test executable that
+// references PostgreSQL backend symbols from `#[pg_test]` bodies that
+// `--gc-sections` cannot discard.  Those symbols exist only inside the
+// postgres executable, so test builds link weak stub definitions (compiled
+// by build.rs from test_stubs.c; see its module docs).  This link attribute
+// applies only when the crate is compiled as a test on Linux — the extension
+// shared library never sees the stubs, so the real backend symbols are used
+// inside postgres.
+#[cfg(all(test, target_os = "linux"))]
+#[link(name = "test_stubs", kind = "static")]
+extern "C" {}
+
 pub mod access_method;
 mod util;
 
@@ -19,6 +31,7 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     access_method::options::init();
     access_method::guc::init();
     access_method::ivf::options::init();
+    access_method::hnswsq::options::init();
 }
 
 #[allow(non_snake_case)]

@@ -46,6 +46,10 @@ pub enum PageType {
     IvfSegmentList = 17,
     IvfActiveBuffer = 18,
     IvfFreeList = 19,
+    HnswMeta = 20,
+    HnswNode = 21,
+    HnswCalibration = 22,
+    HnswFreePages = 23,
 }
 
 impl PageType {
@@ -71,6 +75,10 @@ impl PageType {
             17 => PageType::IvfSegmentList,
             18 => PageType::IvfActiveBuffer,
             19 => PageType::IvfFreeList,
+            20 => PageType::HnswMeta,
+            21 => PageType::HnswNode,
+            22 => PageType::HnswCalibration,
+            23 => PageType::HnswFreePages,
             _ => panic!("Unknown PageType number {}", value),
         }
     }
@@ -89,6 +97,7 @@ impl PageType {
             || matches!(self, PageType::IvfListHeader)
             || matches!(self, PageType::IvfSegmentList)
             || matches!(self, PageType::IvfFreeList)
+            || matches!(self, PageType::HnswCalibration)
     }
 }
 
