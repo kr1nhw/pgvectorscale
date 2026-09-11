@@ -80,7 +80,35 @@ Same 3000-node/dim-16 measurement as above, after the change:
 
 The build is now dominated by the actual graph searches (46% search, 20%
 neighbor selection for the new node's own lists) rather than by list
-maintenance.  In-memory build benchmarks (600-vector clustered graphs,
+maintenance.
+
+### The split changes with scale
+
+100k rows, dim 128, plain, 32-vCPU box (121.37.117.106), `build_stats` on:
+
+```
+nodes=100000 backlink_lists=3306955 pair_lookups=185980982 pair_misses=66123417
+search=630758.6ms select=153311.9ms backlink_pairs=12857.4ms backlink_select=496008.6ms
+flush=3398.1ms accounted_total=1296334.7ms
+```
+
+Total 1 296 s (21.6 min for 100k on that box), split: **search 49 %,
+backlink_select 38 %, select 12 %, backlink_pairs 1 %, flush 0.3 %**.  Two
+things follow:
+
+* the pair-distance cache thrashes at this size (66M misses / 186M lookups =
+  36 % miss) because `PAIR_CACHE_MAX` clears it repeatedly; entry lists are
+  also much longer relative to the cache window;
+* the backlink path is still material, because entries whose mask bit is clear
+  (never occlusion-evaluated, or re-added by a backfill) take the full re-check
+  path, and the "extras" that those accept add further checks.
+
+So the next levers, in order, are (a) the search path itself (allocation and
+hash churn per visited node — 49 % and growing with dataset size), (b) the
+backlink entries that still take the full re-check, and (c) parallelism, which
+is the only route to the single-digit-minute 1M builds the Lance reference
+shows (IVF_HNSW_SQ: 19.6 s for 1M) without giving up the page-based,
+transactional design.  In-memory build benchmarks (600-vector clustered graphs,
 `cargo test mem_build`): 91 s → 42 s (pair cache) → **34 s** (incremental
 prune) on the same machine.
 
