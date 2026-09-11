@@ -60,6 +60,18 @@ pub(crate) fn lock_suite_for_test() {
     }
 }
 
+/// Build RNG: entropy in production, or the pinned `hnswsq.build_seed` value
+/// (tests set it so builds — and recall assertions — are deterministic).
+pub(crate) fn build_rng() -> rand::rngs::SmallRng {
+    use rand::SeedableRng;
+    let seed = options::HNSWSQ_BUILD_SEED.get();
+    if seed < 0 {
+        rand::rngs::SmallRng::from_entropy()
+    } else {
+        rand::rngs::SmallRng::seed_from_u64(seed as u64)
+    }
+}
+
 /// hnswsq access method support function numbers:
 ///   1 = distance type function (matches the diskann/ivf convention)
 pub const HNSWSQ_DISTANCE_TYPE_PROC: u16 = 1;

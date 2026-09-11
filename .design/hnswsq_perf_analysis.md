@@ -30,6 +30,60 @@ Incremental insert (100K fresh rows into the existing index): pgvector
 no per-row index maintenance at all (append-only fragments; bulk
 compaction/optimize instead).
 
+## Phase-0 instrumented baseline (`hnswsq.build_stats`)
+
+Counters added to the build path (GUC `hnswsq.build_stats = on`), 3000 nodes,
+dim 16, m=16, ef_construction=64, plain layout, local macOS/pg18:
+
+```
+nodes=3000 backlink_lists=99104 pair_lookups=52196960 pair_misses=98862
+search=794.9ms select=343.8ms backlink_pairs=1003.7ms backlink_select=10615.0ms
+flush=22.5ms accounted_total=12779.9ms rows_total=3000 disk_mode=false
+```
+
+Reading: the pair-distance cache is working (98 862 misses for 52 196 960
+lookups = 0.19%), so distance *computation* is no longer the cost.  The cost
+is the number of pair *comparisons* the backlink re-prune performs —
+**83% of build time is `select_neighbors_heuristic` runs on backlink lists**,
+~527 occlusion checks per list, 33 lists per inserted node.
+
+This is an algorithmic constant, not an allocation or kernel problem: each
+backlink list is re-derived from scratch even though the existing list is
+already the output of the same heuristic, so all of its internal occlusion
+relations are already known.
+
+## Phase-1 result: exact incremental backlink prune
+
+`backlink_prune_mem` replaces the per-backlink re-run of the full heuristic.
+The existing list is itself heuristic output, so an incoming link can only
+*add* occlusion relations: entries before the new node keep their status, and
+entries after it need exactly one new check (against the new node, if it was
+accepted).  A per-list mask records which entries the occlusion rule actually
+accepted, so entries that were only re-added by the closest-pruned backfill
+are re-checked instead of trusted.  The result is bit-identical to the full
+heuristic — asserted by `test_backlink_prune_fuzz` (2000 randomized
+function-level cases), `test_backlink_prune_matches_full_heuristic` and
+`test_backlink_incremental_matches_every_insert` (whole graphs, lists +
+distances + masks compared after every insert).
+
+Same 3000-node/dim-16 measurement as above, after the change:
+
+| phase | before | after |
+|---|---|---|
+| pair-distance lookups | 52 196 960 | 1 739 703 (30x fewer) |
+| `backlink_select` | 10 615 ms | 297 ms (36x) |
+| `backlink_pairs` | 1 004 ms | 232 ms (4.3x) |
+| `search` | 795 ms | 753 ms |
+| `select` (own lists) | 344 ms | 336 ms |
+| `flush` | 22 ms | 22 ms |
+| **accounted total** | **12 780 ms** | **1 639 ms (7.8x)** |
+
+The build is now dominated by the actual graph searches (46% search, 20%
+neighbor selection for the new node's own lists) rather than by list
+maintenance.  In-memory build benchmarks (600-vector clustered graphs,
+`cargo test mem_build`): 91 s → 42 s (pair cache) → **34 s** (incremental
+prune) on the same machine.
+
 ## Where the time goes (profiling)
 
 ### Build

@@ -115,6 +115,22 @@ impl TSVHnswOptions {
 /// recall/latency dial).  Must be >= the query LIMIT for full recall.
 pub static HNSWSQ_EF_SEARCH: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(40);
 
+/// `hnswsq.build_stats`: emit per-phase build timing counters (search,
+/// neighbor selection, backlink pair distances, backlink selection) as a
+/// WARNING when a build finishes.  Off by default; used by the benchmark
+/// harness to see where build time goes.
+pub static HNSWSQ_BUILD_STATS: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(false);
+
+/// `hnswsq.build_seed`: RNG seed for the build (level assignment and the SQ8
+/// calibration sample).  -1 keeps the production behaviour (entropy); tests pin
+/// it so index builds — and therefore recall assertions — are deterministic.
+pub static HNSWSQ_BUILD_SEED: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(-1);
+
+/// `hnswsq.build_workers`: worker threads used for parallel backlink pruning
+/// during an in-memory build (0 = auto).  Purely in-process parallelism over
+/// the in-memory graph; the transactional insert path is unaffected.
+pub static HNSWSQ_BUILD_WORKERS: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
+
 static mut RELOPT_KIND_HNSW: pg_sys::relopt_kind::Type = 0;
 
 /// Initialize GUC variables and reloptions for the hnswsq access method.
@@ -136,6 +152,64 @@ pub unsafe fn init() {
         &HNSWSQ_EF_SEARCH,
         1,
         1000,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_bool_guc(
+        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_stats".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Report per-phase hnswsq build timing counters when a build finishes".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Diagnostic only: adds a few Instant::now() calls per inserted node.".as_pg_cstr(),
+            )
+        },
+        &HNSWSQ_BUILD_STATS,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_seed".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "RNG seed for hnswsq index builds (-1 = entropy)".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Pins the level-assignment RNG so repeated builds of the same data are                  identical; -1 (default) seeds from entropy as in production."
+                    .as_pg_cstr(),
+            )
+        },
+        &HNSWSQ_BUILD_SEED,
+        -1,
+        i32::MAX,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_workers".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Worker threads for in-memory build backlink pruning (0 = auto)".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Parallelizes only the in-memory build; index contents and transactional \
+                 behaviour are unchanged. 0 selects min(cores, 4); 1 disables parallelism."
+                    .as_pg_cstr(),
+            )
+        },
+        &HNSWSQ_BUILD_WORKERS,
+        0,
+        64,
         pgrx::GucContext::Userset,
         pgrx::GucFlags::default(),
     );
