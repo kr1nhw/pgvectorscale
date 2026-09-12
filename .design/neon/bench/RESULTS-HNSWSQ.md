@@ -1,77 +1,86 @@
-# hnswsq vs pgvector-hnsw: 100K-row A/B (113.44.106.182, PG 17.11)
+# hnswsq vs pgvector-hnsw: same-host 1M A/B (121.37.117.106, 32 vCPU, PG 17.11)
 
-Serverless-scale dataset (100K rows, BIGANN SIFT 128-dim, first 100 queries,
-subset-exact top-10 ground truth).  Both engines: `m=16, ef_construction=64`,
+Dataset: BIGANN 1M rows, dim 128, first 100 queries, exact top-10 ground truth
+(`items_1m` / `gt_1m`).  Both engines: `m=16`, `ef_construction=64`,
 `maintenance_work_mem=8GB`.  hnswsq index: `storage_layout=plain`.
 
-The VM is a shared-CPU box (16 vCPUs, "General Purpose Processor") — absolute
-build times are much higher than on dedicated hardware; the ratios and the
-query numbers are the meaningful part.
+Both engines are **release builds** on the same box and the same table, measured
+back to back with `.design/neon/bench/cycle.sh` (which kills stale builds by PID,
+drops and recreates the index, and records build time + stats + sweep in one
+row).  This replaces the earlier 100k/113 comparison, whose hnswsq side was a
+*debug* build of the extension — see "History" at the bottom.
 
 ## Build + size
 
 | engine | build_s | size_bytes | bytes/vector |
 |--------|---------|------------|--------------|
-| pgvector hnsw | 13 | 83,165,184 | 832 |
-| hnswsq plain | 2938 (pre-opt code) | 86,204,416 | 862 |
-| hnswsq plain | 3556 (optimized code) | 86,138,880 | 861 |
+| pgvector hnsw | 105 | 832,184,320 | 832 |
+| hnswsq plain | **517** | 861,921,280 | 862 (+3.6%) |
 
-Both hnswsq numbers are from this VM; the second is the current code (decode-free
-distance kernels + pair-distance cache).  On the local dev machine the same
-optimizations cut the in-memory build+search tests 91s → 43s and the full pgrx
-suite 264s → 124s, so the VM measurement (shared, throttled CPU) is dominated
-by host noise; treat the hnswsq build as ~35ms/node here vs ~8ms/node locally.
+hnswsq is single-backend; pgvector's C build parallelizes across the box.  The
+phase split of the hnswsq build (from `hnswsq.build_stats`):
+
+```
+search=372079ms (76%) backlink_select=97912ms (20%) flush=10810ms select=6990ms
+backlink_pairs=2000ms  accounted_total=489791ms of 517s wall
+```
+
+For scale: the same build on this table before this branch's optimizations was
+measured at ~170 nodes/s (interrupted at 48 min ≈ 97 min projected for 1M, and
+that was the *debug* profile); the current release build is 11x faster, and the
+remaining 76% is the graph search, which is what a parallel build would attack.
 
 ## Recall@10 and latency sweep (ef_search 10..640)
 
-| engine | ef | recall@10 | p50 ms | p99 ms |
-|--------|----|-----------|--------|--------|
-| pgvector | 10 | 85.15 | 0.31 | 5.14 |
-| pgvector | 20 | 91.30 | 0.39 | 5.38 |
-| pgvector | 40 | 97.10 | 0.58 | 5.80 |
-| pgvector | 80 | 99.20 | 0.80 | 6.82 |
-| pgvector | 160 | 100.00 | 1.34 | 7.81 |
-| pgvector | 320 | 100.00 | 2.27 | 9.54 |
-| pgvector | 640 | 100.00 | 3.72 | 11.53 |
-| hnswsq | 10 | 84.20 | 3.79 | 9.41 |
-| hnswsq | 20 | 91.70 | 5.58 | 14.33 |
-| hnswsq | 40 | 97.10 | 8.64 | 17.83 |
-| hnswsq | 80 | 99.10 | 14.16 | 26.52 |
-| hnswsq | 160 | 100.00 | 24.29 | 40.13 |
-| hnswsq | 320 | 100.00 | 41.63 | 62.17 |
-| hnswsq | 640 | 100.00 | 68.02 | 98.71 |
-
-(hnswsq numbers are the final optimized-code sweep.)
-
-Recall parity is near-exact: 84.2% vs 85.2% at ef=10, 100% by ef=160 for
-hnswsq (pgvector reaches 100% at ef=160 as well).
+| ef | pgvector recall | pgvector p50 ms | hnswsq recall | hnswsq p50 ms | hnswsq p99 ms |
+|----|-----------------|-----------------|---------------|---------------|---------------|
+| 10 | 77.47 | 0.655 | **78.30** | 1.020 | 5.864 |
+| 20 | 88.40 | 0.824 | **88.30** | 1.335 | 7.171 |
+| 40 | 93.70 | 1.056 | **94.00** | 1.919 | 9.012 |
+| 80 | 97.30 | 1.577 | **97.60** | 2.905 | 12.155 |
+| 160 | 98.90 | 2.520 | **99.30** | 4.629 | 18.197 |
+| 320 | 99.80 | 4.146 | **99.90** | 7.831 | 28.373 |
+| 640 | 100.00 | 7.013 | **100.00** | 13.787 | 43.785 |
 
 ## Interpretation
 
-- **Recall**: hnswsq-plain matches pgvector at every ef point within ±1%.
-- **Size**: hnswsq (861 B/vector) ≈ pgvector (832 B/vector), +3.5%.
-- **Latency**: hnswsq is ~10-13x higher p50 at equal recall.  This is the
-  architectural tradeoff of a page-based, buffer-managed index: each search
-  hop loads a page through the shared-buffer manager and deserializes the
-  node (rkyv), while pgvector's hnsw keeps the whole graph memory-mapped.
-  hnswsq's page-based design buys MVCC-safe online inserts/deletes, WAL
-  safety, vacuumability, and serverless-friendly per-page storage — at a
-  per-hop page-load cost.
-- **Build cost**: hnswsq's in-memory HNSW build is single-backend and much
-  slower per node than pgvector's parallel C build.  This branch's
-  optimizations (decode-free distance kernels + a build-scoped pair-distance
-  cache for backlink re-pruning) roughly halve local build time; on this
-  shared-CPU VM the build remains the dominant cost.  hnswsq targets
-  serverless-scale datasets (1M-10M rows); for larger builds use pgvector's
-  hnsw or batch `REINDEX`.
+- **Recall**: hnswsq-plain matches or slightly beats pgvector at every ef point
+  (+0.4 to +0.8 points at ef 10-320) with a single-threaded build.
+- **Size**: +3.6% over pgvector (862 vs 832 B/vector) — the page-based node
+  format stores ItemPointers, and each node carries one extra list slot.
+- **Build**: 4.9x pgvector's build time *single-threaded* (517s vs 105s).  This
+  is now an algorithmic/parallelism gap, not a constant-factor one: 76% of the
+  hnswsq build is the graph search, which is per-insert independent and is the
+  target of the planned parallel build (`.design/hnswsq_perf_analysis.md`,
+  "Next-round plan").
+- **Query latency**: ~1.6-2.0x higher p50 across the sweep (1.9ms vs 1.1ms at
+  ef=40; 13.8ms vs 7.0ms at ef=640).  The earlier "10-13x" figure in this file
+  was a debug-build artifact.  The remaining gap is the architectural tradeoff
+  of a page-based, buffer-managed index: each search hop loads a page through
+  the shared-buffer manager and deserializes the node (rkyv) instead of walking
+  a memory-mapped graph — which is what buys MVCC-safe online inserts/deletes,
+  WAL safety, vacuumability, and serverless-friendly per-page storage.
+
+## History (not comparable — debug profile)
+
+The first version of this file recorded a 100k BIGANN (dim 128) A/B on
+113.44.106.182 with hnswsq built **without `--release`** (that is what
+`cargo pgrx install` does by default): pgvector 13s vs hnswsq 3556s to build,
+and p50 3.79ms vs 0.31ms at ef=10.  A debug build of this extension is ~12x
+slower than release, which accounts for most of that spread; the numbers are
+kept only as a reminder to compare like with like (all current local and remote
+measurements use `cargo pgrx install --release`).
 
 ## Commands
 
 ```bash
-# build + size
-build_indexes_hnswsq.sh <psql> hnsw   builds.csv
-build_indexes_hnswsq.sh <psql> hnswsq builds.csv
-# recall/latency sweep (drops the other engine's index first)
-run_sweep_hnswsq.sh <psql> hnsw   pgvector-hnsw sweep.csv
-run_sweep_hnswsq.sh <psql> hnswsq hnswsq-plain sweep.csv
+# same-host cycle (build + stats + recall sweep + insert bench) — 121
+PGPORT=54330 PGUSER=pgtest PGDATABASE=postgres \
+PSQL_BIN=/root/.pgrx-hnswsq/17.11/pgrx-install/bin/psql \
+  bash .design/neon/bench/cycle.sh hnswsq postgres <label> 1m
+PGPORT=54330 ... bash .design/neon/bench/cycle.sh hnsw postgres pgvector-1m 1m
+
+# local (single host, pinned seed, reproducible dataset)
+.design/neon/bench/local_dataset.sh 1000000
+.design/neon/bench/local_cycle.sh <label> plain t100kdb 1000000
 ```

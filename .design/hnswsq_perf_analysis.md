@@ -279,6 +279,61 @@ next phases:
   pair lookup cost ~2.5us, i.e. under a cost model that no longer holds; it has
   to be re-measured with distances at SIMD cost before the default stays exact.
 
+## Next-round plan, driven by the measurements above
+
+Three measured facts set the order:
+
+1. `search` is the largest phase at every size (51% at 100k, 60% at 300k, 65% at
+   1M) and grows faster than the row count.  At 1M it is 103us per insert for 64
+   hits (1.6us per hit), which is ~10x the cost of the distance kernels
+   themselves: the phase is memory-latency bound.  Every visited node touches
+   `vectors[id]` (its own heap allocation) and `neighbors[id][layer]` (two levels
+   of `Vec` indirection).
+2. Backlink admission is 30-42% and is dominated by the entries that cannot take
+   the O(1) fast path (357M of them at 1M): a candidate whose mask bit is clear
+   (never occlusion-evaluated, or re-added by the closest-pruned backfill) is
+   re-checked against the whole accepted prefix.
+3. Nothing in the two phases above is inherently sequential, but the build is
+   single-threaded; that is the gap to Lance (19.6s for a 1M IVF_HNSW_SQ build).
+
+Next steps, in benefit order:
+
+**(a) Contiguous memory-graph layout** (Lance's flat adjacency +
+`prefetch_distance`): one vector arena with `stride = dim x elem_bytes`, and flat
+per-`(node, layer)` neighbour/distance/mask slabs.  Visiting a node then touches
+one cache line instead of chasing allocations.  Expected 1.3-2x on `search`
+(15-30% of total build time).  No semantic change, no on-disk format change; the
+existing equivalence tests keep it honest.
+
+**(b) Parallel build (Phase E, Lance's `into_par_iter` + `RwLock<GraphBuilderNode>`)**: the row
+stream is a PostgreSQL table scan, so it stays on the main thread; rows are
+buffered into batches, and each batch is inserted by N worker threads over a
+graph with one `RwLock` per node.  Levels are pre-drawn on the main thread so
+node ids and heap TIDs stay deterministic (only the link structure becomes
+interleaving-dependent); each worker owns its node's slot; backlink updates take
+one node's write lock at a time — never two — so the protocol stays
+deadlock-free, and searches take read locks.  Expected 3-5x wall on an 8-16 core
+box.  Must be validated for recall parity at `workers > 1` and stays off by
+default behind `hnswsq.build_workers`.
+*Why not PostgreSQL parallel workers* (the mechanism the diskann path in this
+repo already uses): those workers share state through DSM, and the hnswsq memory
+graph is plain process-local Rust data (`Vec`/`Box`), not shared-memory pages, so
+it would have to be rewritten as a shared-memory arena with swizzled offsets.
+In-process threads behind per-node locks are the smaller, safer change and are
+exactly what Lance does.
+
+**(c) Occluder memo for clear-mask backlink entries**: store the id of the entry
+that occluded each rejected candidate (a build-only side table, like
+`list_masks`), so a clear-mask entry that is still occluded by an entry that is
+still accepted resolves in O(1) instead of a re-check against the whole accepted
+prefix.  Attacks most of `backlink_select`; the "an accepted entry never loses
+acceptance" argument is exactly what the full-heuristic equivalence tests
+(`test_backlink_prune_*`) can validate.
+
+**(d) SQ integer kernels for `f8`** (Lance's `dot_u8`/`l2_u8` with a pre-folded
+query and closed-form bias) for the scan-side distance cost of the quantized
+layouts.
+
 ## Phase-B result: Lance's ranked/cutoff admission is not a win here
 
 `lance-index` admits a backlink edge only if it beats the target's current worst

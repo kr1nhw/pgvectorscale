@@ -52,7 +52,7 @@ collect_recall() { # $1=param_value ; echoes recall_at_10
     fi
     echo 'DROP TABLE IF EXISTS res_cur;'
     echo 'CREATE TABLE res_cur (qid int PRIMARY KEY, ids int[]);'
-    cat <<'SQL'
+    cat <<SQL
 INSERT INTO res_cur
 SELECT qid, (SELECT array_agg(id) FROM (
   SELECT id FROM ${TABLE} ORDER BY embedding <-> q.q LIMIT 10) t)

@@ -147,8 +147,9 @@ out of the box (standard callbacks, no reloption tuning required).
 - Single `vector` column only (no label filtering, no multi-column indexes).
 - No `amgetbitmap`; no iterative scan for WHERE-filtered queries (a pgvector
   0.8 feature) — `ef_search` bounds the candidate set.
-- Builds are single-backend (the in-memory phase is sequential; parallel
-  build is future work).
+- Builds are single-backend: the in-memory phase is sequential (parallel build
+  is the next planned phase; `hnswsq.build_workers` is reserved and currently
+  has no effect).
 - `ieeefp8`'s accuracy assumes in-range data (±448); out-of-range components
   clamp (cosine-normalized data is unaffected).
 - As with any approximate index, crash windows are transactional: a crash
@@ -166,7 +167,7 @@ out of the box (standard callbacks, no reloption tuning required).
 
 ## 9. Testing
 
-The full hnswsq test suite (53 tests: recall matrix across the four storage
+The full hnswsq test suite (60 tests: recall matrix across the four storage
 layouts and three distance types, incremental builds, transaction rollback,
 planner behavior, dimension limits, NULLs, REINDEX, vacuum lifecycle, and
 page-packing extremes) runs with:
@@ -196,21 +197,48 @@ INSERT/SELECT/DELETE/VACUUM, quantized layouts) is in
 
 ## 10. Build performance notes
 
-The in-memory build path has two optimizations that keep 1M-row builds
-practical on serverless-class boxes:
+The in-memory build path carries four optimizations, each measured against the
+revision before it (details, counters and A/B tables in
+`.design/hnswsq_perf_analysis.md`):
 
 - **Decode-free distance kernels** (`Codec::distance_encoded_direct`):
   distances are accumulated directly over the encoded bytes (f32/f16/fp8/sq8)
   with no per-call scratch decode copy; semantics match the SIMD kernels
   exactly (L2 is squared-sum, IP is negative — `<#>` ordering — and cosine
   is `1 − Σq·v` clamped at zero).
-- **Build-scoped pair-distance cache**: backlink re-pruning recomputed every
-  neighbor-list pair distance on each revision; the cache turns that into one
-  computation per unordered pair (bounded at ~4M entries ≈ 250MB, cleared on
-  overflow), roughly halving build time.
+- **Exact incremental backlink re-prune** (`backlink_prune_mem`): the existing
+  neighbor list is itself the output of the selection heuristic, so an incoming
+  backlink only *adds* occlusion relations.  Entries before the new node keep
+  their recorded status (a per-list mask marks heuristic-accepted entries vs
+  ones re-added by the closest-pruned backfill) and entries after it need one
+  new check instead of a full heuristic re-run.  The result is bit-identical to
+  re-running the full heuristic, asserted on randomized graphs and on whole
+  builds after every insert.
+- **Memory-graph beam search** (`search_layer_mem`): epoch-stamped visited /
+  expanded mark arrays instead of per-search hash sets, borrowed neighbor
+  slices instead of clones, and heaps plus marks reused across the layered
+  searches of one insert (5.1x on the search phase; asserted to return exactly
+  the same hits, in the same order, as the generic disk-path search).
+- **Decode-once distance buffer** (`DistBuf`) instead of a build-scoped
+  `HashMap<(u32,u32),f32>`: both pair-heavy loops work on a small id set per
+  call, so each vector is decoded once into a flat `f32` buffer and pairs are
+  evaluated straight through the SIMD distance kernels — no hashing and no
+  random access into a ~100MB table (12.3x on own-list selection, 4.7x on
+  backlink admission).
 
-Builds are still single-backend and slower per node than pgvector's parallel
-C build; see `.design/neon/bench/RESULTS-HNSWSQ.md` for the 100K A/B numbers
-(recall parity within ±1%, size parity within +4%, query latency ~10-13x
-higher p50 — the cost of the page-based, buffer-managed design that buys
-MVCC-safe online mutation, WAL safety, and vacuumability).
+Measured builds (`m=16`, `ef_construction=64`, `maintenance_work_mem=2GB`,
+release profile, single-threaded, pinned build seed, 200-cluster dim-16 data):
+
+| rows | wall | search | backlink admission | selection | flush |
+|---|---|---|---|---|---|
+| 100k | 12.5 s | 6.07 s | 4.96 s | 0.32 s | 0.38 s |
+| 300k | 45.4 s | 25.4 s | 15.2 s | 0.97 s | 0.77 s |
+| 1M | 183 s | 110 s | 51 s | 3.3 s | 3.5 s |
+
+For calibration: the same 100k build took 36.3 s before the decode-once buffer
+and 439 s in a debug build.  Builds are single-backend (the in-memory phase is
+sequential, and `hnswsq.build_workers` is reserved but unused); the remaining
+cost is graph traversal (`search`) plus the entries that cannot take the O(1)
+backlink fast path, which is what a parallel build would attack next.
+`.design/neon/bench/RESULTS-HNSWSQ.md` has the cross-engine comparisons
+(recall parity within ±1%, index size parity within +4%).
