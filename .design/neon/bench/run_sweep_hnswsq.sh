@@ -26,15 +26,19 @@ ENGINE="$2"
 LABEL="$3"
 OUT_CSV="$4"
 
+# Dataset table names (defaults keep the original BIGANN-10M harness working).
+TABLE="${TABLE:-items_10m}"
+GT="${GT:-gt_10m}"
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # Exactly one usable index: drop the OTHER engine's index so the planner
 # cannot route queries to it (cost estimates tie on small tables).
 if [ "$ENGINE" = hnsw ]; then
-  $PSQL -X -q -v ON_ERROR_STOP=1 -c "DROP INDEX IF EXISTS items_10m_hnswsq;" >/dev/null
+  $PSQL -X -q -v ON_ERROR_STOP=1 -c "DROP INDEX IF EXISTS ${TABLE}_hnswsq;" >/dev/null
 else
-  $PSQL -X -q -v ON_ERROR_STOP=1 -c "DROP INDEX IF EXISTS items_10m_hnsw;" >/dev/null
+  $PSQL -X -q -v ON_ERROR_STOP=1 -c "DROP INDEX IF EXISTS ${TABLE}_hnsw;" >/dev/null
 fi
 
 collect_recall() { # $1=param_value ; echoes recall_at_10
@@ -51,13 +55,13 @@ collect_recall() { # $1=param_value ; echoes recall_at_10
     cat <<'SQL'
 INSERT INTO res_cur
 SELECT qid, (SELECT array_agg(id) FROM (
-  SELECT id FROM items_10m ORDER BY embedding <-> q.q LIMIT 10) t)
+  SELECT id FROM ${TABLE} ORDER BY embedding <-> q.q LIMIT 10) t)
 FROM (SELECT qid, q FROM bench_queries ORDER BY qid) q;
 SELECT round(100.0 * sum(cnt) / (count(*) * 10.0), 2)
 FROM (
   SELECT r.qid, count(*) AS cnt
   FROM res_cur r
-  JOIN gt_10m g ON g.qid = r.qid,
+  JOIN ${GT} g ON g.qid = r.qid,
   LATERAL unnest(r.ids) x(id)
   WHERE x.id = ANY (g.ids)
   GROUP BY r.qid) s;
@@ -84,7 +88,7 @@ collect_times() { # $1=param_value ; fills $WORK/times.txt with per-query ms
     fi
     echo '\timing on'
     for qid in $(seq 0 99); do
-      echo "SELECT id FROM items_10m ORDER BY embedding <-> (SELECT q FROM bench_queries WHERE qid=$qid) LIMIT 10;"
+      echo "SELECT id FROM ${TABLE} ORDER BY embedding <-> (SELECT q FROM bench_queries WHERE qid=$qid) LIMIT 10;"
     done
     echo '\timing off'
   } > "$WORK/timed.sql"

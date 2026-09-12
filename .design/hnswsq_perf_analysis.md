@@ -112,6 +112,39 @@ transactional design.  In-memory build benchmarks (600-vector clustered graphs,
 `cargo test mem_build`): 91 s → 42 s (pair cache) → **34 s** (incremental
 prune) on the same machine.
 
+## Phase-0/A instrumented baseline, 100k rows dim 16 (local, 2GB budget)
+
+The per-caller counters split the remaining cost unambiguously:
+
+```
+nodes=100000 accounted_total=58362ms rows_total=100000
+search=26654.6ms (46%)  select=12277.2ms (21%)
+backlink_select=10144.9ms (17%)  backlink_pairs=8430.3ms (14%)  flush=855.6ms
+fast_entries=104037120  full_entries=0  extras_seen=0
+pair(select)  = 50533540 lookups /     849 misses   (99.998% hit)
+pair(backlink)=  3304313 lookups / 3284915 misses   (99.4% miss)
+search_calls=106575  search_hits=3510129
+```
+
+Reading, and what each number implies:
+
+* **`select` is pure lookup cost.**  50.5 M pair-cache lookups with essentially
+  no misses: the own-list heuristic's O(candidates × selected) occlusion checks
+  (~500 per list) each pay a hash probe for a distance that is already known.
+  The fix is not a better cache but *not* using one: decode the candidate set
+  once into a contiguous scratch and run SIMD distances (Lance's storage-backed
+  `DistCalculator` does exactly this).
+* **`backlink_pairs` is write-once traffic.**  3.3 M lookups, 99.4% misses: these
+  are the `(target, new_node)` distances, one per backlink list, never queried
+  again.  They should be computed decode-free (`distance_encoded_direct`)
+  without touching or polluting the cache.
+* **`backlink_select` is dominated by re-sorting**, not by checks:
+  `fast_entries = 104 037 120` over 3.3 M lists means every backlink re-walks and
+  re-sorts the whole ~33-entry list, and `full_entries = 0` shows the
+  mask/extras machinery now costs nothing.  Lance's `cutoff` admission avoids
+  most of this work entirely by skipping edges that cannot enter the list.
+* `extras_seen = 0` at this scale — the extras path is a rare-case guard only.
+
 ## Where the time goes (profiling)
 
 ### Build

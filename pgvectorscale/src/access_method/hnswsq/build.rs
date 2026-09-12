@@ -202,6 +202,29 @@ pub struct BuildStats {
     pub fast_entries: u64,
     pub full_entries: u64,
     pub extras_seen: u64,
+    /// Pair-cache traffic split by caller, so a high miss rate can be
+    /// attributed (own-list selection vs backlink admission vs extras).
+    pub pair_lookups_select: u64,
+    pub pair_misses_select: u64,
+    pub pair_lookups_backlink: u64,
+    pub pair_misses_backlink: u64,
+    pub pair_lookups_extras: u64,
+    pub pair_misses_extras: u64,
+    /// Beam-search calls and the neighbour hits they returned (proxy for the
+    /// work the search path does per insert).
+    pub search_calls: u64,
+    pub search_hits: u64,
+}
+
+/// Which hot loop is asking the pair cache for a distance.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairCaller {
+    /// Neighbour selection for the inserted node's own lists.
+    Select,
+    /// Backlink admission/re-prune distances.
+    Backlink,
+    /// Checks against entries newly accepted in this pass ("extras").
+    Extras,
 }
 
 impl BuildStats {
@@ -219,7 +242,8 @@ impl BuildStats {
         format!(
             "hnswsq build stats: nodes={} backlink_lists={} pair_lookups={} pair_misses={} \
              search={:.1}ms select={:.1}ms backlink_pairs={:.1}ms backlink_select={:.1}ms \
-             flush={:.1}ms accounted_total={:.1}ms fast_entries={} full_entries={} extras_seen={}",
+             flush={:.1}ms accounted_total={:.1}ms fast_entries={} full_entries={} extras_seen={} \
+             pair(select)={}/{} pair(backlink)={}/{} pair(extras)={}/{} search_calls={} search_hits={}",
             self.nodes,
             self.backlink_lists,
             self.pair_lookups,
@@ -233,6 +257,14 @@ impl BuildStats {
             self.fast_entries,
             self.full_entries,
             self.extras_seen,
+            self.pair_lookups_select,
+            self.pair_misses_select,
+            self.pair_lookups_backlink,
+            self.pair_misses_backlink,
+            self.pair_lookups_extras,
+            self.pair_misses_extras,
+            self.search_calls,
+            self.search_hits,
         )
     }
 }
@@ -248,6 +280,7 @@ fn cached_pair_dist(
     g: &MemGraph,
     cache: &mut std::collections::HashMap<(u32, u32), f32>,
     stats: &mut BuildStats,
+    caller: PairCaller,
     a: u32,
     b: u32,
 ) -> f32 {
@@ -257,12 +290,22 @@ fn cached_pair_dist(
     let key = if a < b { (a, b) } else { (b, a) };
     if stats.enabled {
         stats.pair_lookups += 1;
+        match caller {
+            PairCaller::Select => stats.pair_lookups_select += 1,
+            PairCaller::Backlink => stats.pair_lookups_backlink += 1,
+            PairCaller::Extras => stats.pair_lookups_extras += 1,
+        }
     }
     if let Some(&d) = cache.get(&key) {
         return d;
     }
     if stats.enabled {
         stats.pair_misses += 1;
+        match caller {
+            PairCaller::Select => stats.pair_misses_select += 1,
+            PairCaller::Backlink => stats.pair_misses_backlink += 1,
+            PairCaller::Extras => stats.pair_misses_extras += 1,
+        }
     }
     let va = codec.decode(&g.vectors[a as usize]);
     let d = dist_fn(&va, &codec.decode(&g.vectors[b as usize]));
@@ -299,7 +342,8 @@ pub(crate) fn select_neighbors_heuristic_mem(
         for (i, &(d, id)) in sorted.iter().enumerate() {
             let mut keep = true;
             for sel in &accepted {
-                if cached_pair_dist(codec, dist_fn, g, cache, stats, id, sel.1) < d {
+                if cached_pair_dist(codec, dist_fn, g, cache, stats, PairCaller::Select, id, sel.1) < d
+                {
                     keep = false;
                     break;
                 }
@@ -326,7 +370,17 @@ pub(crate) fn select_neighbors_heuristic_mem(
         }
         let mut keep = true;
         for sel in &selected {
-            if cached_pair_dist(codec, dist_fn, g, cache, stats, cand.1, sel.1) < cand.0 {
+            if cached_pair_dist(
+                codec,
+                dist_fn,
+                g,
+                cache,
+                stats,
+                PairCaller::Select,
+                cand.1,
+                sel.1,
+            ) < cand.0
+            {
                 keep = false;
                 break;
             }
@@ -426,7 +480,8 @@ fn backlink_prune_mem(
         for (i, &(d, id, _)) in merged.iter().enumerate() {
             let mut keep = true;
             for sel in &accepted {
-                if cached_pair_dist(codec, dist_fn, g, cache, stats, id, sel.1) < d {
+                if cached_pair_dist(codec, dist_fn, g, cache, stats, PairCaller::Select, id, sel.1) < d
+                {
                     keep = false;
                     break;
                 }
@@ -461,7 +516,17 @@ fn backlink_prune_mem(
             // The new node: full occlusion check against the accepted prefix.
             let mut keep = true;
             for sel in &selected {
-                if cached_pair_dist(codec, dist_fn, g, cache, stats, id, sel.1) < d {
+                if cached_pair_dist(
+                    codec,
+                    dist_fn,
+                    g,
+                    cache,
+                    stats,
+                    PairCaller::Backlink,
+                    id,
+                    sel.1,
+                ) < d
+                {
                     keep = false;
                     break;
                 }
@@ -478,13 +543,33 @@ fn backlink_prune_mem(
             // `extras` accepted in this run that were not accepted before.
             let mut keep = true;
             if i > p && new_selected {
-                if cached_pair_dist(codec, dist_fn, g, cache, stats, id, new_id) < d {
+                if cached_pair_dist(
+                    codec,
+                    dist_fn,
+                    g,
+                    cache,
+                    stats,
+                    PairCaller::Backlink,
+                    id,
+                    new_id,
+                ) < d
+                {
                     keep = false;
                 }
             }
             if keep {
                 for &extra in &extras {
-                    if cached_pair_dist(codec, dist_fn, g, cache, stats, id, extra) < d {
+                    if cached_pair_dist(
+                        codec,
+                        dist_fn,
+                        g,
+                        cache,
+                        stats,
+                        PairCaller::Extras,
+                        id,
+                        extra,
+                    ) < d
+                    {
                         keep = false;
                         break;
                     }
@@ -500,7 +585,17 @@ fn backlink_prune_mem(
             // contains the new node when it was accepted.
             let mut keep = true;
             for sel in &selected {
-                if cached_pair_dist(codec, dist_fn, g, cache, stats, id, sel.1) < d {
+                if cached_pair_dist(
+                    codec,
+                    dist_fn,
+                    g,
+                    cache,
+                    stats,
+                    PairCaller::Backlink,
+                    id,
+                    sel.1,
+                ) < d
+                {
                     keep = false;
                     break;
                 }
@@ -892,6 +987,10 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
         if let Some(best) = hits.first() {
             cur = (best.dist, best.id);
         }
+        if timed {
+            state.stats.search_calls += 1;
+            state.stats.search_hits += hits.len() as u64;
+        }
         let cands: Vec<(f32, u32)> = hits
             .iter()
             .filter(|h| h.id != id)
@@ -931,6 +1030,7 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
                 &*g,
                 &mut state.pair_dist_cache,
                 &mut state.stats,
+                PairCaller::Backlink,
                 n,
                 id,
             );
