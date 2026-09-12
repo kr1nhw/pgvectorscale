@@ -175,6 +175,8 @@ struct BuildState {
     /// `test_backlink_prune_matches_full_heuristic` to prove the incremental
     /// result is identical; always false in production builds.
     reference_backlinks: bool,
+    /// Backlink admission policy (`hnswsq.build_backlink_mode`).
+    backlink_mode: BacklinkMode,
     /// True after the memory graph was flushed (or for concurrent builds);
     /// remaining rows go through the disk insert path.
     disk_mode: bool,
@@ -214,6 +216,21 @@ pub struct BuildStats {
     /// work the search path does per insert).
     pub search_calls: u64,
     pub search_hits: u64,
+    /// Backlink admission outcome in ranked mode: edges skipped by the cutoff
+    /// test, edges admitted, and how many of those needed an overflow prune.
+    pub cutoff_skips: u64,
+    pub ranked_admits: u64,
+    pub ranked_prunes: u64,
+}
+
+/// Backlink admission policy for the in-memory build.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BacklinkMode {
+    /// Lance-style ranked list: append the edge if it beats the target's current
+    /// worst neighbour (`cutoff`), prune only when the list overflows.
+    Ranked,
+    /// Exact incremental re-prune (bit-identical to a full heuristic re-run).
+    Exact,
 }
 
 /// Which hot loop is asking the pair cache for a distance.
@@ -243,7 +260,8 @@ impl BuildStats {
             "hnswsq build stats: nodes={} backlink_lists={} pair_lookups={} pair_misses={} \
              search={:.1}ms select={:.1}ms backlink_pairs={:.1}ms backlink_select={:.1}ms \
              flush={:.1}ms accounted_total={:.1}ms fast_entries={} full_entries={} extras_seen={} \
-             pair(select)={}/{} pair(backlink)={}/{} pair(extras)={}/{} search_calls={} search_hits={}",
+             pair(select)={}/{} pair(backlink)={}/{} pair(extras)={}/{} search_calls={} search_hits={} \
+             cutoff_skips={} ranked_admits={} ranked_prunes={}",
             self.nodes,
             self.backlink_lists,
             self.pair_lookups,
@@ -265,6 +283,9 @@ impl BuildStats {
             self.pair_misses_extras,
             self.search_calls,
             self.search_hits,
+            self.cutoff_skips,
+            self.ranked_admits,
+            self.ranked_prunes,
         )
     }
 }
@@ -412,6 +433,115 @@ pub(crate) fn select_neighbors_heuristic_mem(
         dists.push(d);
     }
     (ids, dists, mask)
+}
+
+/// Sort a ranked neighbour list by `(distance, id)` — the invariant `cutoff`
+/// and the ranked insertion position both depend on — carrying each entry's
+/// mask bit along with it.
+fn sort_ranked_list(ids: &mut Vec<u32>, dists: &mut Vec<f32>, mask: &mut [u64; LIST_MASK_WORDS]) {
+    let mut entries: Vec<(f32, u32, bool)> = ids
+        .iter()
+        .copied()
+        .zip(dists.iter().copied())
+        .enumerate()
+        .map(|(i, (id, d))| (d, id, (i < LIST_MASK_WORDS * 64) && (mask[i / 64] >> (i % 64)) & 1 == 1))
+        .collect();
+    entries.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut new_mask = [0u64; LIST_MASK_WORDS];
+    for (i, (d, id, was_selected)) in entries.into_iter().enumerate() {
+        ids[i] = id;
+        dists[i] = d;
+        if was_selected && i < LIST_MASK_WORDS * 64 {
+            new_mask[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    *mask = new_mask;
+}
+
+/// Lance-style backlink admission: append the edge to the target's ranked
+/// neighbour list and prune only when the list overflows.
+///
+/// The cheap part is the *cutoff* test — the edge is dropped outright when the
+/// new node is not closer to the target than the target's current worst
+/// neighbour and the list is already full.  In a saturated graph that skips the
+/// great majority of backlink work (no list copy, no sort, no heuristic), which
+/// is precisely what `lance-index` does in
+/// `GraphBuilderNode::cutoff` + `Builder::insert`.
+///
+/// Returns `None` when the edge is skipped (the target's list is unchanged).
+/// The mask is not maintained in this mode: only [`BacklinkMode::Exact`]
+/// consumes [`MemGraph::list_masks`].
+#[allow(clippy::too_many_arguments)]
+fn backlink_add_ranked_mem(
+    codec: &Codec,
+    dist_fn: DistanceFn,
+    g: &MemGraph,
+    cache: &mut std::collections::HashMap<(u32, u32), f32>,
+    stats: &mut BuildStats,
+    existing_ids: &[u32],
+    existing_dists: &[f32],
+    d_new: f32,
+    new_id: u32,
+    cap: usize,
+    always_admit: bool,
+) -> Option<(Vec<u32>, Vec<f32>, [u64; LIST_MASK_WORDS])> {
+    debug_assert_eq!(existing_ids.len(), existing_dists.len());
+
+    // 1. cutoff admission (O(1)): only a full list can reject an edge, and then
+    //    only when the new node is no better than the current worst neighbour.
+    //    The ranked list is kept ascending, so the worst is the last entry.
+    //
+    //    `always_admit` bypasses the test for the new node's own nearest
+    //    neighbour: without it, a node inserted into an already-saturated dense
+    //    cluster can end up with no incoming edge at all and become unreachable
+    //    from the entry point (measured: recall 0.63-0.76 vs 1.00 exact).
+    if !always_admit && existing_ids.len() >= cap {
+        if let Some(&worst) = existing_dists.last() {
+            if d_new >= worst {
+                if stats.enabled {
+                    stats.cutoff_skips += 1;
+                }
+                return None;
+            }
+        }
+    }
+    if stats.enabled {
+        stats.ranked_admits += 1;
+    }
+
+    // 2. insert into the ranked list (ascending, ties broken by id — the same
+    //    order the neighbor-selection heuristic would produce).
+    let pos = existing_ids
+        .iter()
+        .zip(existing_dists.iter())
+        .position(|(&id, &d)| d > d_new || (d == d_new && id > new_id))
+        .unwrap_or(existing_ids.len());
+    let mut ids = existing_ids.to_vec();
+    let mut dists = existing_dists.to_vec();
+    ids.insert(pos, new_id);
+    dists.insert(pos, d_new);
+
+    let mut mask = [0u64; LIST_MASK_WORDS];
+    for i in 0..ids.len().min(LIST_MASK_WORDS * 64) {
+        mask[i / 64] |= 1u64 << (i % 64);
+    }
+
+    // 3. prune only on overflow, with the same heuristic as everywhere else.
+    if ids.len() <= cap {
+        return Some((ids, dists, mask));
+    }
+    if stats.enabled {
+        stats.ranked_prunes += 1;
+    }
+    let cands: Vec<(f32, u32)> = dists.iter().copied().zip(ids.iter().copied()).collect();
+    let (mut ids, mut dists, mut mask) =
+        select_neighbors_heuristic_mem(codec, dist_fn, g, cache, stats, cands, cap);
+    // The heuristic emits accepted entries followed by backfilled ones, which
+    // is not globally ascending; the ranked-list invariant (`cutoff`, insertion
+    // position) needs a true order, so re-sort.  The SET is unchanged, so
+    // recall is unaffected.
+    sort_ranked_list(&mut ids, &mut dists, &mut mask);
+    Some((ids, dists, mask))
 }
 
 /// Exact incremental backlink re-prune.
@@ -778,6 +908,14 @@ pub unsafe extern "C-unwind" fn ambuild(
         pair_dist_cache: std::collections::HashMap::new(),
         stats: BuildStats::new(),
         reference_backlinks: false,
+        backlink_mode: if unsafe {
+            crate::access_method::hnswsq::options::HNSWSQ_BACKLINK_MODE.get()
+        } == 1
+        {
+            BacklinkMode::Exact
+        } else {
+            BacklinkMode::Ranked
+        },
         disk_mode: is_concurrent || budget_bytes == 0,
         nrows: 0,
         rng: crate::access_method::hnswsq::build_rng(),
@@ -1012,14 +1150,22 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
         if let Some(t) = t_phase {
             state.stats.select_ns += t.elapsed().as_nanos() as u64;
         }
-        g.set_list(id, l, selected.clone(), sel_dists, sel_mask);
+        if state.backlink_mode == BacklinkMode::Ranked {
+            // Ranked mode appends into these lists and reads their last entry as
+            // the cutoff, so they must be globally ascending from the start.
+            let (mut ids, mut dists, mut mask) = (selected.clone(), sel_dists, sel_mask);
+            sort_ranked_list(&mut ids, &mut dists, &mut mask);
+            g.set_list(id, l, ids, dists, mask);
+        } else {
+            g.set_list(id, l, selected.clone(), sel_dists, sel_mask);
+        }
 
         // Backlinks with heuristic re-pruning (RAM: no two-phase needed).
         // Pair distances come from the build-scoped cache: each (n, mm)
         // pair is decoded and evaluated once per build, not once per
         // neighbor-list revision.
         let cap = cap_for(l);
-        for &n in &selected {
+        for (sel_idx, &n) in selected.iter().enumerate() {
             if timed {
                 state.stats.backlink_lists += 1;
             }
@@ -1042,6 +1188,33 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
             let existing_ids: Vec<u32> = g.neighbors[n_i][l].clone();
             let existing_dists: Vec<f32> = g.list_dists[n_i][l].clone();
             let existing_mask = g.list_masks[n_i][l];
+            let ranked = if state.reference_backlinks || state.backlink_mode == BacklinkMode::Exact {
+                None
+            } else {
+                Some(backlink_add_ranked_mem(
+                    &state.codec,
+                    state.dist_fn,
+                    &*g,
+                    &mut state.pair_dist_cache,
+                    &mut state.stats,
+                    &existing_ids,
+                    &existing_dists,
+                    d_self,
+                    id,
+                    cap,
+                    sel_idx == 0,
+                ))
+            };
+            if let Some(ranked) = ranked {
+                // Ranked mode: the edge may have been skipped by the cutoff test.
+                if let Some((ids, dists, mask)) = ranked {
+                    g.set_list(n, l, ids, dists, mask);
+                }
+                if let Some(t) = t_phase {
+                    state.stats.backlink_select_ns += t.elapsed().as_nanos() as u64;
+                }
+                continue;
+            }
             let (new_ids, new_dists, new_mask) = if state.reference_backlinks {
                 // Reference: full heuristic over existing ∪ {new}.
                 let mut cands: Vec<(f32, u32)> = Vec::with_capacity(existing_ids.len() + 1);
@@ -1473,6 +1646,7 @@ mod mem_tests {
                 pair_dist_cache: std::collections::HashMap::new(),
                 stats: BuildStats::default(),
                 reference_backlinks: reference,
+                backlink_mode: BacklinkMode::Exact,
                 disk_mode: false,
                 nrows: 0,
                 rng: SmallRng::seed_from_u64(seed),
@@ -1543,6 +1717,7 @@ mod mem_tests {
                 pair_dist_cache: std::collections::HashMap::new(),
                 stats: BuildStats::default(),
                 reference_backlinks: reference,
+                backlink_mode: BacklinkMode::Exact,
                 disk_mode: false,
                 nrows: 0,
                 rng: SmallRng::seed_from_u64(7),
@@ -1601,7 +1776,107 @@ mod mem_tests {
         }
     }
 
-    /// Builds the same random graph twice — once with the incremental backlink
+    /// Temporary diagnostic: ranked-mode counters + recall on one graph.
+    #[test]
+    fn test_backlink_ranked_mode_diag() {
+        let dim = 16;
+        let (rows, queries) = clustered(20, 50, dim, 0.05, 12345);
+        let codec = Codec::new(HnswPrecision::Plain, dim);
+        let (m, m0) = (16usize, 32usize);
+        let mut state = BuildState {
+            codec,
+            dist_fn: distance_l2,
+            distance_type: DistanceType::L2,
+            m,
+            m0,
+            ef_construction: 64,
+            ml: 1.0 / (m as f64).ln() as f32,
+            max_level: compute_max_level(dim, 4, m, m0).unwrap(),
+            budget_bytes: u64::MAX,
+            mem_used: 0,
+            graph: MemGraph::new(),
+            pair_dist_cache: std::collections::HashMap::new(),
+            stats: BuildStats {
+                enabled: true,
+                ..Default::default()
+            },
+            reference_backlinks: false,
+            backlink_mode: BacklinkMode::Ranked,
+            disk_mode: false,
+            nrows: 0,
+            rng: SmallRng::seed_from_u64(7),
+        };
+        for (i, v) in rows.iter().enumerate() {
+            mem_insert(&mut state, ItemPointer::new(i as u32 + 1, 1), v);
+        }
+        println!("{}", state.stats.summary());
+        // recall of the ranked graph
+        let mut hit = 0usize;
+        let mut total = 0usize;
+        for q in &queries {
+            let cand = mem_search(&state, q, 100);
+            let mut exact: Vec<(f32, u32)> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (distance_l2(q, v), i as u32))
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let top: Vec<u32> = exact.iter().take(10).map(|(_, i)| *i).collect();
+            for t in &top {
+                if cand.contains(t) {
+                    hit += 1;
+                }
+                total += 1;
+            }
+        }
+        println!("ranked recall = {}", hit as f64 / total as f64);
+        // Also dump the degree distribution of layer 0 to spot missing backlinks.
+        let mut degs: Vec<usize> = state
+            .graph
+            .neighbors
+            .iter()
+            .map(|layers| layers[0].len())
+            .collect();
+        degs.sort_unstable();
+        println!(
+            "layer0 degree: min={} p50={} max={} avg={:.1}",
+            degs[0],
+            degs[degs.len() / 2],
+            degs[degs.len() - 1],
+            degs.iter().sum::<usize>() as f64 / degs.len() as f64
+        );
+    }
+
+    /// Ranked (Lance-style) admission must not cost recall    /// The ranked (Lance-style `cutoff`) admission mode is kept as an
+    /// experimental knob, not as a default: measured against the exact mode on
+    /// the same data and build seed it is both slower (a full heuristic per
+    /// admitted edge) and lower recall.  This test pins the *observed* deficit
+    /// so a future change that makes the mode worse is caught, and documents
+    /// why the exact mode is the default.
+    #[test]
+    fn test_backlink_ranked_mode_recall_floor() {
+        let mut worst_shortfall = 0.0f64;
+        for seed in 0..16u64 {
+            let exact = run_sim_mode(12345, seed, BacklinkMode::Exact);
+            let ranked = run_sim_mode(12345, seed, BacklinkMode::Ranked);
+            assert!(
+                exact >= 0.90,
+                "seed {seed}: exact mode recall regressed to {exact:.4}"
+            );
+            assert!(
+                ranked >= 0.85,
+                "seed {seed}: ranked mode recall {ranked:.4} below the documented floor"
+            );
+            worst_shortfall = worst_shortfall.max(exact - ranked);
+        }
+        println!("worst ranked-vs-exact recall shortfall = {worst_shortfall:.4}");
+        assert!(
+            worst_shortfall <= 0.06,
+            "ranked mode deficit grew to {worst_shortfall:.4} (was <= 0.03 when measured)"
+        );
+    }
+
+    /// Builds the same random graph twice — once with the incremental backlink    /// Builds the same random graph twice — once with the incremental backlink
     /// re-prune, once with the full neighbor-selection heuristic over the
     /// merged candidate set — and asserts every neighbor list is identical
     /// (ids, order and length).  Proves `backlink_prune_mem` is exact.
@@ -1629,6 +1904,7 @@ mod mem_tests {
                 pair_dist_cache: std::collections::HashMap::new(),
                 stats: BuildStats::default(),
                 reference_backlinks: reference,
+                backlink_mode: BacklinkMode::Exact,
                 disk_mode: false,
                 nrows: 0,
                 rng: SmallRng::seed_from_u64(7),
@@ -1701,6 +1977,10 @@ mod mem_tests {
     }
 
     fn run_sim(data_seed: u64, build_seed: u64) -> f64 {
+        run_sim_mode(data_seed, build_seed, BacklinkMode::Exact)
+    }
+
+    fn run_sim_mode(data_seed: u64, build_seed: u64, mode: BacklinkMode) -> f64 {
         let dim = 16;
         let (rows, queries) = clustered(20, 50, dim, 0.05, data_seed);
         let codec = Codec::new(HnswPrecision::Plain, dim);
@@ -1721,6 +2001,7 @@ mod mem_tests {
             pair_dist_cache: std::collections::HashMap::new(),
             stats: BuildStats::default(),
             reference_backlinks: false,
+            backlink_mode: mode,
             disk_mode: false,
             nrows: 0,
             rng: SmallRng::seed_from_u64(build_seed),

@@ -145,6 +145,37 @@ Reading, and what each number implies:
   most of this work entirely by skipping edges that cannot enter the list.
 * `extras_seen = 0` at this scale — the extras path is a rare-case guard only.
 
+## Phase-B result: Lance's ranked/cutoff admission is not a win here
+
+`lance-index` admits a backlink edge only if it beats the target's current worst
+neighbour (`GraphBuilderNode::cutoff`) and prunes that list only when it
+overflows.  Implemented behind `hnswsq.build_backlink_mode` (0 = ranked,
+1 = exact; **exact stays the default**) and measured on the same 100k/dim-16
+dataset and on the clustered memory harness:
+
+| | exact (default) | ranked (cutoff) |
+|---|---|---|
+| build accounted total, 100k | **58.2 s** | 60.9 s |
+| backlink lists skipped | 0 | 3 199 342 (97 %) |
+| pair lookups in own-list select | 50.5 M / 855 misses | 100.8 M / 0 misses |
+| backlink_select, 1k-node harness | 294 ms | 508 ms |
+| recall@10 (same build seed, clustered) | 1.000 | 0.970-0.995 |
+
+Why it loses: the cutoff test is genuinely cheap and skips 97 % of backlink
+lists, but every *admitted* edge pays a full neighbor-selection heuristic over
+the merged list (that is what the doubling of select-path lookups is), while the
+exact incremental re-prune resolves an admitted edge with an O(len) walk over
+state it already has.  A second finding: the cutoff rule alone starves nodes in
+already-saturated dense clusters of *incoming* edges (recall fell to 0.63-0.76);
+admitting the new node's nearest backlink unconditionally restores it to
+0.97-0.995, still short of exact.
+
+Conclusion: keep the ranked mode as an experiment knob (`build_backlink_mode = 0`)
+guarded by `test_backlink_ranked_mode_recall_floor`, and keep the exact mode as
+the default.  The Lance items that *did* carry over are the ranked-list
+representation (lists are now kept globally sorted, which is what makes a
+`cutoff`-style check meaningful at all) and the mode switch itself for A/B work.
+
 ## Where the time goes (profiling)
 
 ### Build

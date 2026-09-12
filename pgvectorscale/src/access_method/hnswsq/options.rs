@@ -126,6 +126,19 @@ pub static HNSWSQ_BUILD_STATS: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>
 /// it so index builds — and therefore recall assertions — are deterministic.
 pub static HNSWSQ_BUILD_SEED: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(-1);
 
+/// `hnswsq.build_backlink_mode`: how backlink edges are admitted during an
+/// in-memory build.  1 (default) = the exact incremental re-prune, whose output
+/// is bit-identical to re-running the full neighbor-selection heuristic over
+/// the merged candidate set; 0 = the Lance-style ranked list (append, prune on
+/// overflow, skip edges that cannot beat the target's current worst neighbour).
+///
+/// Measured on clustered 16-dim data (1 k nodes, same build seed): ranked is
+/// *slower* (backlink_select 508 ms vs 294 ms) and slightly lower recall
+/// (0.995 vs 1.000), so the exact mode stays the default; ranked is kept for
+/// experimentation on other data shapes and m0/ef_construction settings.  Both modes are WAL/format-neutral: this is in-memory build
+/// bookkeeping only.
+pub static HNSWSQ_BACKLINK_MODE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(1);
+
 /// `hnswsq.build_workers`: worker threads used for parallel backlink pruning
 /// during an in-memory build (0 = auto).  Purely in-process parallelism over
 /// the in-memory graph; the transactional insert path is unaffected.
@@ -169,6 +182,29 @@ pub unsafe fn init() {
             )
         },
         &HNSWSQ_BUILD_STATS,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_backlink_mode".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Backlink admission during hnswsq builds (0 = ranked/cutoff, 1 = exact)".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "0 selects the Lance-style ranked list (append, prune on overflow, skip edges \
+                 worse than the target's current worst neighbour); 1 selects the exact \
+                 incremental re-prune.  Build-only; index contents and transactional \
+                 behaviour are otherwise unchanged."
+                    .as_pg_cstr(),
+            )
+        },
+        &HNSWSQ_BACKLINK_MODE,
+        0,
+        1,
         pgrx::GucContext::Userset,
         pgrx::GucFlags::default(),
     );
