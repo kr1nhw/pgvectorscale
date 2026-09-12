@@ -43,8 +43,8 @@ Flat profile of the backend running `ORDER BY embedding <-> q LIMIT 10`:
 | `PinBuffer`-adjacent: unpin + private refcount | 1.5 % | 2.6 % |
 | buffer hash lookup (`hash_search_with_hash_value`) | 5.1 % | 5.7 % |
 | content lock (`LWLockRelease` + `LWLockAttemptLock`) | 10.5 % | 8.1 % |
-| `randomize_mem` (buffer manager memset) | 2.7 % | 9.7 % |
-| **buffer manager subtotal** | **~33 %** | **~50 %** |
+| `randomize_mem` (memory-context reset churn, `generation.c`) | 2.7 % | 9.7 % |
+| **buffer manager subtotal** (pin + lookup + locks + unpin) | **~30 %** | **~40 %** |
 | page opaque parse (`TsvPageOpaqueData::read_from_page`) | 9.5 % | (inline flag test) |
 | element load: copies + Vec growth (`Vec<ItemPointer>::from_iter`, `finish_grow`, `realloc`) | 19.0 % | 25.8 % (`HnswLoadElementImpl`, mostly in-page, no copies) |
 | distance kernel | 4.5 % (`distance_encoded_direct`) | 5.0 % (`vector_l2_squared_distance`) |
@@ -57,7 +57,7 @@ Scale-free reading (absolute ms per query at ef=160, from the sweep means):
 | component | hnswsq (4.71 ms) | pgvector (2.53 ms) | delta |
 |---|---|---|---|
 | buffer pin + lookup + locks | 1.36 ms | 0.94 ms | +0.42 |
-| buffer manager `randomize_mem` | 0.13 ms | 0.25 ms | -0.12 |
+| memory-context/allocator churn (`randomize_mem`) | 0.13 ms | 0.25 ms | -0.12 |
 | page opaque parse | 0.45 ms | ~0 | +0.45 |
 | element/neighbour materialization | 0.90 ms | 0.65 ms | +0.25 |
 | libc allocation | 0.74 ms | 0.04 ms | +0.70 |
@@ -69,8 +69,11 @@ So the 2.18 ms gap is *not* distance arithmetic (0.08 ms of it) and not the hash
 sets (0.02 ms). It is:
 
 1. **memory allocation and copying per visited node** — 1.64 ms of the 2.18 ms
-   (`libc` 0.70 + materialization 0.25 + the Rust alloc glue inside
-   `finish_grow`/`realloc` that lands in the "materialization" row),
+   (`libc` malloc/free 0.70 + materialization 0.25 + the Rust alloc glue inside
+   `finish_grow`/`realloc` that lands in the "materialization" row).  pgvector
+   allocates its per-candidate elements from a PostgreSQL generation context
+   (bump/freelist, visible as `randomize_mem`), so its allocator share is 1.4 %
+   libc + 9.7 % context churn instead of 15.6 % malloc + 8 % `finish_grow`,
 2. **re-parsing the page opaque header on every load** (0.45 ms),
 3. buffer-manager mechanics we do slightly more expensively (0.42 ms).
 
@@ -138,15 +141,16 @@ The three structural differences, in order of size:
 `hnswsq.build_stats` on the same 1M build (single backend):
 
 ```
-search=372.1s (76%)  backlink_select=97.9s (20%)  flush=10.8s  select=7.0s
+search=403.7s (72%)  backlink_select=107.3s (19%)  flush=10.7s  select=7.4s
+backlink_pairs=2.1s   accounted_total=531.3s of 562s wall
 ```
 
-* 76 % is the graph search per inserted row — the part a parallel build attacks
+* 72 % is the graph search per inserted row — the part a parallel build attacks
   directly; the same code path is what the earlier parallel attempt failed to
   parallelize *safely* (see the perf-notes "parallel build" section: the batched
   plan/apply design loses connectivity, so a parallel build needs search-time
   visibility of in-flight inserts, i.e. the per-node-lock design).
-* 20 % is the exact backlink re-prune. pgvector does not do this at all: it
+* 19 % is the exact backlink re-prune. pgvector does not do this at all: it
   appends and only repairs a list when it overflows (`HnswUpdateConnection`),
   which is cheap per insertion but leaves a lower-quality graph — its recall at
   ef 160 is 98.9 % against our 99.3 %.
@@ -184,8 +188,10 @@ the 1M/dim-128 workload above.
    `plain` path.
 4. **A real plain-layout distance kernel (top build cost).** `distance_encoded_direct`
    walks `bytes.chunks_exact(4)` through `Map`/`Enumerate` iterator adapters
-   calling `f32::from_le_bytes`. The *build* profile shows this chain at ~65 % of
-   samples while the SIMD kernel it feeds (`distance_l2_x86_avx2`) is 3.3 %:
+   calling `f32::from_le_bytes`. The *build* profile shows this chain at ~66 % of
+   samples (`Map::next` 17 %, `_mm256_loadu_ps` 19 %, the closure 14 %,
+   `Enumerate::next` 9 %, `ChunksExact::next` 5 %, `split_at_unchecked` 3 %) while
+   the SIMD kernel it feeds (`distance_l2_x86_avx2`) is 3.6 %:
    for `plain` (and `ieeefp16`, where half→f32 is vectorizable) the bytes can be
    read directly as `&[f32]` and handed to `dist_fn`, skipping the per-element
    decode entirely. This is the single biggest CPU item in a dim-128 build.
