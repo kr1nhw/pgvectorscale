@@ -452,6 +452,12 @@ Instrumented experiments on the in-memory graph (24K inserts, local):
 
 ## Optimization directions for hnswsq (ordered by impact/effort)
 
+> Superseded by "Next-round plan, driven by the measurements above": the phases
+> below were the plan written *before* the instrumented runs, and the measured
+> splits moved several of them (the pair cache became a decode-once buffer, the
+> ranked/cutoff admission was measured negative twice, and the parallel build
+> was attempted and rejected).  Kept for the record.
+
 1. **Build: prune backlinks once per node, not once per insert.**
    Accumulate the incoming-link set per node during the build and run the
    re-prune heuristic once when a node's list actually changes (or at flush
