@@ -279,6 +279,19 @@ next phases:
   pair lookup cost ~2.5us, i.e. under a cost model that no longer holds; it has
   to be re-measured with distances at SIMD cost before the default stays exact.
 
+### Validation of this revision
+
+The full hnswsq suite (60 tests) is green on all four hosts with the decode-once
+buffer in place, and the exactness tests are what back the bit-identity claim
+above:
+
+| host | arch / PG | result | time |
+|---|---|---|---|
+| local (dev Mac) | aarch64 / 18.4 | 60 passed | 363 s |
+| 113.44.106.182 | x86_64 / 17.11 | 60 passed | 277 s |
+| 121.37.117.106 | x86_64 / 17.11 | 60 passed | 277 s |
+| 116.204.102.142 | aarch64 / 17.11 | 60 passed | 964 s |
+
 ## Next-round plan, driven by the measurements above
 
 Three measured facts set the order:
