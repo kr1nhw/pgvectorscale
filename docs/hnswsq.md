@@ -147,9 +147,12 @@ out of the box (standard callbacks, no reloption tuning required).
 - Single `vector` column only (no label filtering, no multi-column indexes).
 - No `amgetbitmap`; no iterative scan for WHERE-filtered queries (a pgvector
   0.8 feature) — `ef_search` bounds the candidate set.
-- Builds are single-backend: the in-memory phase is sequential (parallel build
-  is the next planned phase; `hnswsq.build_workers` is reserved and currently
-  has no effect).
+- Builds are single-backend: the in-memory phase is sequential.
+  `hnswsq.build_workers` exists but currently has no effect — the batched
+  plan/apply parallel design was implemented, measured and rejected (it costs
+  connectivity, hence recall), and the working design needs search-time
+  visibility of in-flight inserts; see `.design/hnswsq_perf_analysis.md`
+  ("Parallel build — attempted, measured, rejected").
 - `ieeefp8`'s accuracy assumes in-range data (±448); out-of-range components
   clamp (cosine-normalized data is unaffected).
 - As with any approximate index, crash windows are transactional: a crash

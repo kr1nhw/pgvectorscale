@@ -305,22 +305,49 @@ one cache line instead of chasing allocations.  Expected 1.3-2x on `search`
 (15-30% of total build time).  No semantic change, no on-disk format change; the
 existing equivalence tests keep it honest.
 
-**(b) Parallel build (Phase E, Lance's `into_par_iter` + `RwLock<GraphBuilderNode>`)**: the row
-stream is a PostgreSQL table scan, so it stays on the main thread; rows are
-buffered into batches, and each batch is inserted by N worker threads over a
-graph with one `RwLock` per node.  Levels are pre-drawn on the main thread so
-node ids and heap TIDs stay deterministic (only the link structure becomes
-interleaving-dependent); each worker owns its node's slot; backlink updates take
-one node's write lock at a time — never two — so the protocol stays
-deadlock-free, and searches take read locks.  Expected 3-5x wall on an 8-16 core
-box.  Must be validated for recall parity at `workers > 1` and stays off by
-default behind `hnswsq.build_workers`.
-*Why not PostgreSQL parallel workers* (the mechanism the diskann path in this
+**(b) Parallel build (Phase E) — attempted, measured, rejected; needs the
+per-node-lock design.**  The cheap variant was implemented and does not work:
+
+*Design tried.*  Rows are buffered on the main thread (the row stream is a
+PostgreSQL table scan and has to stay there), each batch is *planned* by N
+worker threads over a read-only graph, then the plans are *applied* one after
+another on the main thread (so every mutation still happens in one order, and no
+locking is needed anywhere).  Levels are drawn on the main thread, so node ids
+and heap TIDs stay deterministic.
+
+*Why it fails.*  A node planned inside a batch cannot see its batch-mates'
+edges, so all of them attach to the same pre-batch nodes; those layer-0 lists
+are already full (`m0` = 32), the excess is pruned away, and whole groups of
+nodes end up with **no incoming edge at all** — disconnected components, which
+is exactly what recall measures.  Clustered 1000-node harness, `m=16`, `m0=32`,
+same seed (`test_mem_build_parallel_recall_floor` asserted the shipped width,
+the other rows come from the diagnostics test that was used to find it):
+
+| batch (rows invisible to each other) | threads | nodes with no incoming edge | recall@10 |
+|---|---|---|---|
+| 1 (sequential) | 1 | 0 | 0.9550 |
+| 2 | 2 | 11 | 0.9400 |
+| 32 | 4 | 201 | 0.7950 |
+| 64 | 4 | 402 | 0.6250 |
+| 256 | 8 | 452 | 0.5800 |
+
+The loss starts at a batch width of 2 and grows roughly linearly with the width,
+while throughput needs a width of at least the thread count — so the two-phase
+design has no useful operating point.  It was reverted rather than shipped
+behind a default-off GUC.
+
+*What a working parallel build needs*: search-time visibility of in-flight
+inserts, i.e. the Lance model (`Arc<RwLock<GraphBuilderNode>>`, edges published
+as each node is linked, backlinks taken with a per-node write lock, searches
+with read locks) so that a node being inserted concurrently is already reachable
+while its peers search.  That is a structural change to `MemGraph` (per-node
+locks or shared-memory pages) and has to be validated with the same
+connectivity/recall checks used above.
+
+*And why not PostgreSQL parallel workers* (the mechanism the diskann path in this
 repo already uses): those workers share state through DSM, and the hnswsq memory
 graph is plain process-local Rust data (`Vec`/`Box`), not shared-memory pages, so
 it would have to be rewritten as a shared-memory arena with swizzled offsets.
-In-process threads behind per-node locks are the smaller, safer change and are
-exactly what Lance does.
 
 **(c) Occluder memo for clear-mask backlink entries**: store the id of the entry
 that occluded each rejected candidate (a build-only side table, like
