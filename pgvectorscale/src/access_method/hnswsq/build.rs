@@ -25,7 +25,8 @@ use rand::{Rng, SeedableRng};
 
 use crate::access_method::distance::{preprocess_cosine, DistanceFn, DistanceType};
 use crate::access_method::hnswsq::graph::{
-    distance_encoded, greedy_descent, random_level, search_layer, GraphAccess, VisitData,
+    distance_encoded, greedy_descent, random_level, search_layer, GraphAccess, HeapItem, SearchHit,
+    VisitData,
 };
 use crate::access_method::hnswsq::insert::{codec_for, insert_vector, InsertCtx};
 use crate::access_method::hnswsq::meta_page::HnswMetaPage;
@@ -169,6 +170,8 @@ struct BuildState {
     pair_dist_cache: std::collections::HashMap<(u32, u32), f32>,
     /// Per-phase timing counters (`hnswsq.build_stats`).
     stats: BuildStats,
+    /// Reusable search state (epoch marks + heaps) for the memory beam search.
+    search_scratch: SearchScratch,
     /// Test-only reference path: re-run the *full* neighbor-selection
     /// heuristic for every backlink instead of the incremental
     /// [`backlink_prune_mem`].  Used by
@@ -456,6 +459,153 @@ fn sort_ranked_list(ids: &mut Vec<u32>, dists: &mut Vec<f32>, mask: &mut [u64; L
         }
     }
     *mask = new_mask;
+}
+
+/// Reusable per-search state for the memory-graph beam search.
+///
+/// Lance's builder passes a `VisitedGenerator` (bitmap + recently-visited list)
+/// into every insert; the equivalent here is an epoch-stamped mark array plus
+/// reusable heaps, so a search allocates nothing per visited node and does no
+/// hashing at all.
+struct SearchScratch {
+    /// Per node id: the epoch in which it was visited.
+    visited_epoch: Vec<u32>,
+    /// Per node id: the epoch in which its neighbour list was expanded.
+    expanded_epoch: Vec<u32>,
+    epoch: u32,
+    candidates: std::collections::BinaryHeap<std::cmp::Reverse<HeapItem<u32>>>,
+    results: std::collections::BinaryHeap<HeapItem<u32>>,
+}
+
+impl SearchScratch {
+    fn new() -> Self {
+        Self {
+            visited_epoch: Vec::new(),
+            expanded_epoch: Vec::new(),
+            epoch: 0,
+            candidates: std::collections::BinaryHeap::new(),
+            results: std::collections::BinaryHeap::new(),
+        }
+    }
+
+    /// Start a new search epoch, growing the mark arrays as the graph grows.
+    fn begin(&mut self, nodes: usize) {
+        if self.visited_epoch.len() < nodes {
+            self.visited_epoch.resize(nodes, 0);
+            self.expanded_epoch.resize(nodes, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            // Wrapped: clear both arrays so epoch 0 stays "never visited".
+            self.visited_epoch.iter_mut().for_each(|e| *e = 0);
+            self.expanded_epoch.iter_mut().for_each(|e| *e = 0);
+            self.epoch = 1;
+        }
+        self.candidates.clear();
+        self.results.clear();
+    }
+}
+
+/// Memory-graph beam search: same semantics as the generic
+/// [`crate::access_method::hnswsq::graph::search_layer`], but with borrowed
+/// neighbour slices, epoch-stamped visited marks and reused heaps instead of
+/// per-visit clones plus `HashSet`/`HashMap` bookkeeping.  The memory graph has
+/// no tombstones and no vanished ids, which is what makes the simplification
+/// safe.  `test_search_layer_mem_matches_generic` asserts the two agree.
+fn search_layer_mem(
+    codec: &Codec,
+    dist_type: DistanceType,
+    query: &[f32],
+    g: &MemGraph,
+    entries: &[(f32, u32)],
+    ef: usize,
+    layer: usize,
+    scratch: &mut SearchScratch,
+) -> Vec<SearchHit<u32>> {
+    let ef = ef.max(1);
+    scratch.begin(g.len());
+    let SearchScratch {
+        visited_epoch,
+        expanded_epoch,
+        epoch,
+        candidates,
+        results,
+    } = scratch;
+    let epoch = *epoch;
+
+    for &(d, id) in entries {
+        let i = id as usize;
+        if i >= visited_epoch.len() || visited_epoch[i] == epoch {
+            continue;
+        }
+        visited_epoch[i] = epoch;
+        candidates.push(std::cmp::Reverse(HeapItem {
+            dist: d,
+            id,
+            deleted: false,
+        }));
+        results.push(HeapItem {
+            dist: d,
+            id,
+            deleted: false,
+        });
+    }
+
+    while let Some(std::cmp::Reverse(cur)) = candidates.pop() {
+        // Same termination rule as the generic version: stop once the closest
+        // unexpanded candidate is worse than the worst kept result.
+        if results.len() >= ef {
+            if let Some(worst) = results.peek() {
+                if cur.dist > worst.dist {
+                    break;
+                }
+            }
+        }
+
+        let ci = cur.id as usize;
+        if ci >= expanded_epoch.len() || expanded_epoch[ci] == epoch {
+            continue;
+        }
+        expanded_epoch[ci] = epoch;
+        let Some(level_neighbors) = g.neighbors.get(ci).and_then(|l| l.get(layer)) else {
+            continue;
+        };
+        for &nb in level_neighbors {
+            let ni = nb as usize;
+            if ni >= visited_epoch.len() || visited_epoch[ni] == epoch {
+                continue;
+            }
+            visited_epoch[ni] = epoch;
+            let Some(enc) = g.vectors.get(ni) else {
+                continue;
+            };
+            let d = distance_encoded(codec, dist_type, query, enc);
+            let item = HeapItem {
+                dist: d,
+                id: nb,
+                deleted: false,
+            };
+            candidates.push(std::cmp::Reverse(item.clone()));
+            if results.len() < ef {
+                results.push(item);
+            } else if let Some(mut worst) = results.peek_mut() {
+                if item.dist < worst.dist {
+                    *worst = item;
+                }
+            }
+        }
+    }
+
+    results
+        .clone()
+        .into_sorted_vec()
+        .into_iter()
+        .map(|i| SearchHit {
+            dist: i.dist,
+            id: i.id,
+            deleted: false,
+        })
+        .collect()
 }
 
 /// Lance-style backlink admission: append the edge to the target's ranked
@@ -907,6 +1057,7 @@ pub unsafe extern "C-unwind" fn ambuild(
         graph: MemGraph::new(),
         pair_dist_cache: std::collections::HashMap::new(),
         stats: BuildStats::new(),
+        search_scratch: SearchScratch::new(),
         reference_backlinks: false,
         backlink_mode: if unsafe {
             crate::access_method::hnswsq::options::HNSWSQ_BACKLINK_MODE.get()
@@ -1113,14 +1264,15 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
     let timed = state.stats.enabled;
     for l in (0..=top).rev() {
         let t_phase = timed.then(std::time::Instant::now);
-        let hits = search_layer(
+        let hits = search_layer_mem(
             &state.codec,
             state.distance_type,
             &subject,
             &*g,
-            vec![cur],
+            &[cur],
             state.ef_construction,
             l,
+            &mut state.search_scratch,
         );
         if let Some(best) = hits.first() {
             cur = (best.dist, best.id);
@@ -1645,6 +1797,7 @@ mod mem_tests {
                 graph: MemGraph::new(),
                 pair_dist_cache: std::collections::HashMap::new(),
                 stats: BuildStats::default(),
+                search_scratch: SearchScratch::new(),
                 reference_backlinks: reference,
                 backlink_mode: BacklinkMode::Exact,
                 disk_mode: false,
@@ -1716,6 +1869,7 @@ mod mem_tests {
                 graph: MemGraph::new(),
                 pair_dist_cache: std::collections::HashMap::new(),
                 stats: BuildStats::default(),
+                search_scratch: SearchScratch::new(),
                 reference_backlinks: reference,
                 backlink_mode: BacklinkMode::Exact,
                 disk_mode: false,
@@ -1800,6 +1954,7 @@ mod mem_tests {
                 enabled: true,
                 ..Default::default()
             },
+            search_scratch: SearchScratch::new(),
             reference_backlinks: false,
             backlink_mode: BacklinkMode::Ranked,
             disk_mode: false,
@@ -1847,7 +2002,81 @@ mod mem_tests {
         );
     }
 
-    /// Ranked (Lance-style) admission must not cost recall    /// The ranked (Lance-style `cutoff`) admission mode is kept as an
+    /// Ranked (Lance-style) admission must not cost recall    /// The memory search must agree exactly with the generic `search_layer`
+    /// (which the disk path uses): same hits, same order.
+    #[test]
+    fn test_search_layer_mem_matches_generic() {
+        use crate::access_method::hnswsq::graph::search_layer;
+        let dim = 12;
+        let (rows, queries) = clustered(16, 40, dim, 0.08, 4242);
+        let codec = Codec::new(HnswPrecision::Plain, dim);
+        let (m, m0) = (16usize, 32usize);
+        let mut state = BuildState {
+            codec,
+            dist_fn: distance_l2,
+            distance_type: DistanceType::L2,
+            m,
+            m0,
+            ef_construction: 64,
+            ml: 1.0 / (m as f64).ln() as f32,
+            max_level: compute_max_level(dim, 4, m, m0).unwrap(),
+            budget_bytes: u64::MAX,
+            mem_used: 0,
+            graph: MemGraph::new(),
+            pair_dist_cache: std::collections::HashMap::new(),
+            stats: BuildStats::default(),
+            search_scratch: SearchScratch::new(),
+            reference_backlinks: false,
+            backlink_mode: BacklinkMode::Exact,
+            disk_mode: false,
+            nrows: 0,
+            rng: SmallRng::seed_from_u64(3),
+        };
+        for (i, v) in rows.iter().enumerate() {
+            mem_insert(&mut state, ItemPointer::new(i as u32 + 1, 1), v);
+        }
+
+        let g = &state.graph;
+        let ep = g.entry.expect("entry");
+        for q in queries.iter().take(40) {
+            for ef in [1usize, 4, 17, 64] {
+                for layer in 0..=(g.entry_level.min(2)) {
+                    let entry_dist = distance_encoded(&state.codec, DistanceType::L2, q, &g.vectors[ep as usize]);
+                    let entries = vec![(entry_dist, ep)];
+                    let generic = search_layer(
+                        &state.codec,
+                        DistanceType::L2,
+                        q,
+                        g,
+                        entries.clone(),
+                        ef,
+                        layer,
+                    );
+                    let mem = search_layer_mem(
+                        &state.codec,
+                        DistanceType::L2,
+                        q,
+                        g,
+                        &entries,
+                        ef,
+                        layer,
+                        &mut state.search_scratch,
+                    );
+                    let gids: Vec<(u32, u32)> = generic
+                        .iter()
+                        .map(|h| (h.id, h.dist.to_bits()))
+                        .collect();
+                    let mids: Vec<(u32, u32)> = mem.iter().map(|h| (h.id, h.dist.to_bits())).collect();
+                    assert_eq!(
+                        gids, mids,
+                        "ef={ef} layer={layer}: memory search diverged from the generic path"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The ranked (Lance-style `cutoff`) admission mode is kept as an    /// The ranked (Lance-style `cutoff`) admission mode is kept as an
     /// experimental knob, not as a default: measured against the exact mode on
     /// the same data and build seed it is both slower (a full heuristic per
     /// admitted edge) and lower recall.  This test pins the *observed* deficit
@@ -1903,6 +2132,7 @@ mod mem_tests {
                 graph: MemGraph::new(),
                 pair_dist_cache: std::collections::HashMap::new(),
                 stats: BuildStats::default(),
+                search_scratch: SearchScratch::new(),
                 reference_backlinks: reference,
                 backlink_mode: BacklinkMode::Exact,
                 disk_mode: false,
@@ -2000,6 +2230,7 @@ mod mem_tests {
             graph: MemGraph::new(),
             pair_dist_cache: std::collections::HashMap::new(),
             stats: BuildStats::default(),
+            search_scratch: SearchScratch::new(),
             reference_backlinks: false,
             backlink_mode: mode,
             disk_mode: false,

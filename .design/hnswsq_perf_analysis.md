@@ -145,6 +145,36 @@ Reading, and what each number implies:
   most of this work entirely by skipping edges that cannot enter the list.
 * `extras_seen = 0` at this scale — the extras path is a rare-case guard only.
 
+## Phase-C result: memory beam search (Lance's VisitedGenerator + borrowed access)
+
+The memory build's search called the generic `search_layer`, which clones the
+encoded vector *and* the neighbour list per visited node, hashes into a
+`HashSet` + `HashMap` cache per search, and allocates fresh heaps each call.
+
+`search_layer_mem` replaces that for the memory graph (which has no tombstones
+and no vanished ids) with: epoch-stamped visited/expanded mark arrays (no
+hashing, O(visited) reset — Lance's `VisitedGenerator` pattern), borrowed
+`&[u8]`/`&[u32]` access, and heaps reused across the layered searches of one
+insert.  `test_search_layer_mem_matches_generic` asserts it returns exactly the
+same hits, in the same order, as the generic path.
+
+100k dim 16, same machine, same dataset:
+
+| phase | before | after |
+|---|---|---|
+| `search` | 26 655 ms | **5 216 ms (5.1x)** |
+| `select` | 12 277 ms | 11 542 ms |
+| `backlink_select` | 10 145 ms | 9 887 ms |
+| `backlink_pairs` | 8 430 ms | 8 210 ms |
+| flush | 856 ms | 907 ms |
+| **accounted total** | **58 362 ms** | **35 762 ms (1.63x)** |
+
+The build is no longer search-bound: the remaining cost is the own-list
+heuristic's pair-cache lookups (`select`, 50.5 M lookups for 853 misses — pure
+hashing, to be replaced by a decoded candidate buffer + SIMD distances) and the
+write-once backlink distances (`backlink_pairs`, 3.3 M lookups with 99.4 %
+misses — to be computed decode-free without touching the cache).
+
 ## Phase-B result: Lance's ranked/cutoff admission is not a win here
 
 `lance-index` admits a backlink edge only if it beats the target's current worst
