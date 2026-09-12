@@ -18,7 +18,19 @@ row).  This replaces the earlier 100k/113 comparison, whose hnswsq side was a
 | hnswsq plain | **517** | 861,921,280 | 862 (+3.6%) |
 
 hnswsq is single-backend; pgvector's C build parallelizes across the box.  The
-phase split of the hnswsq build (from `hnswsq.build_stats`):
+gap is parallelism, not algorithm — measured on the same box with both engines
+in release and `max_parallel_maintenance_workers` varied (see
+`.design/hnswsq_vs_pgvector_gap.md`):
+
+| build | workers | seconds |
+|---|---|---|
+| hnswsq | 1 | 562 |
+| pgvector | 1 | 442 |
+| pgvector | 4 (server default) | 103 |
+| pgvector | 32 requested (7 effective) | 64 |
+
+i.e. **1.27x per core** and 5.5-8.8x in wall clock purely from worker count.
+The phase split of the hnswsq build (from `hnswsq.build_stats`):
 
 ```
 search=372079ms (76%) backlink_select=97912ms (20%) flush=10810ms select=6990ms

@@ -279,6 +279,21 @@ next phases:
   pair lookup cost ~2.5us, i.e. under a cost model that no longer holds; it has
   to be re-measured with distances at SIMD cost before the default stays exact.
 
+### Query/build gap vs pgvector hnsw: see `.design/hnswsq_vs_pgvector_gap.md`
+
+A dedicated same-host study (both engines release, `perf` + per-query
+`EXPLAIN (ANALYZE, BUFFERS)`) split the remaining gap:
+
+* build: **1.27x per core** (562 s vs 442 s for 1M), i.e. the visible 5.5-8.8x is
+  pgvector's 4-7 parallel workers, not algorithm;
+* query: the gap grows with `ef_search` (1.56x at ef 10, 1.92x at ef 640), i.e.
+  it is per-candidate cost — 1.95x per candidate vs 1.49x fixed — and the
+  profile attributes it to per-hop memory allocation/copying (15.6% of query
+  time inside malloc/free, 19% in node materialisation), a second page load per
+  emitted candidate, a re-parsed page header per hop, and
+  `xs_recheckorderby = true` (pgvector returns exact distances and sets it
+  false).  Distance arithmetic is only 4.5% vs their 5.0%.
+
 ### Validation of this revision
 
 The full hnswsq suite (60 tests) is green on all four hosts with the decode-once
