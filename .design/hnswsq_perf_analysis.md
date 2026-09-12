@@ -175,6 +175,72 @@ hashing, to be replaced by a decoded candidate buffer + SIMD distances) and the
 write-once backlink distances (`backlink_pairs`, 3.3 M lookups with 99.4 %
 misses — to be computed decode-free without touching the cache).
 
+## Phase-C/D result: decode-once distance buffer replaces the pair cache
+
+The own-list selection and the backlink re-prune drove every pair distance
+through a build-scoped `HashMap<(u32, u32), f32>`.  At 100k rows that table had
+grown to ~100MB, so each probe was a random access into main memory: 3.3M
+`(target, new_node)` distances with a 99.4% miss rate cost 8.2s, and the own-list
+selection's 50.5M probes — 99.998% of them *hits* — cost 11.5s.  Both loops only
+ever need the vectors of a small set of ids (one candidate set, or one neighbour
+list plus the incoming node), so `DistBuf` decodes each of those vectors exactly
+once into a flat `f32` buffer and evaluates pairs straight through the SIMD
+`dist_fn`.  No hashing, no per-pair allocation, working set in L1/L2.
+
+`DistBuf::dist` returns `dist_fn` over the same two decoded vectors the map
+stored, so the change is bit-identical, and the counters prove it (same
+`pair_dists` as the old `pair_lookups` to the digit, same fast/full entry counts,
+same recall at every ef).
+
+### Dataset change (and a methodology fix)
+
+The scratch database holding the previous 100k/dim-16 dataset was dropped, so the
+old `35.8 s` figure is not comparable to these runs.  The dataset is now scripted
+and reproducible (`.design/neon/bench/local_dataset.sql`: 100k rows, dim 16, 200
+clusters x 500 rows, 200 queries + exact top-10), the harness pins
+`hnswsq.build_seed = 20240912` (an unpinned build re-seeds from entropy, which
+moved recall@10 by up to 0.30 between runs), and `.design/neon/bench/local_cycle.sh`
+records build time + stats + recall sweep in one CSV row.
+
+### 100k, dim 16, m16/efc64, pinned seed — release profile
+
+Release is the profile that matters (pgvector and Lance are C/Rust release
+builds; a debug build of this extension is ~12x slower, which is what every
+earlier local number in this file was):
+
+| phase | before | after | |
+|---|---|---|---|
+| `search` | 7 659.7 ms | 6 074.7 ms | 1.26x |
+| `select` (own lists) | 3 954.0 ms | **320.5 ms** | **12.3x** |
+| `backlink_select` | 23 101.4 ms | **4 956.3 ms** | **4.66x** |
+| `backlink_pairs` | 264.7 ms | 73.5 ms | 3.6x |
+| flush | 359.8 ms | 379.9 ms | |
+| **accounted total** | **35 339.5 ms** | **11 804.9 ms** | **2.99x** |
+| **wall (CREATE INDEX)** | **36.28 s** | **12.48 s** | **2.91x** |
+
+Recall@10 is identical before/after (ef 10/40/160/640 = 0.50 / 0.80 / 1.00 /
+1.00) and so is every counter: `pair_dists = 233 686 708` (was
+`pair_lookups`), `fast_entries = 60 853 299`, `full_entries = 43 205 713`,
+`search_hits = 6 824 040`.
+
+Same change, debug profile (kept for the record — it is what the test suite
+runs): 439.3 s -> 321.5 s wall, `select` 61.4 s -> 18.6 s, `backlink_select`
+242.4 s -> 170.7 s.
+
+### What is left at 100k (release)
+
+`search` 6.07 s (51%) and `backlink_select` 4.96 s (42%) now account for
+essentially the whole build; everything else is 0.8 s.  Two consequences for the
+next phases:
+
+* the expensive part of `backlink_select` is no longer distance *lookup* but the
+  43.2M entries that cannot take the O(1) fast path (mask bit clear: never
+  occlusion-evaluated, or re-added by the closest-pruned backfill) and are
+  re-checked against the accepted prefix — 198.8M pair distances in total;
+* the Phase-B verdict on Lance's ranked/cutoff admission was measured while a
+  pair lookup cost ~2.5us, i.e. under a cost model that no longer holds; it has
+  to be re-measured with distances at SIMD cost before the default stays exact.
+
 ## Phase-B result: Lance's ranked/cutoff admission is not a win here
 
 `lance-index` admits a backlink edge only if it beats the target's current worst

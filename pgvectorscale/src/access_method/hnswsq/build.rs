@@ -66,7 +66,7 @@ struct MemGraph {
     /// `[node][layer][i]` → distance from the list owner to neighbor `i`
     /// (same order as `neighbors`).  Build-only: lets the backlink re-prune
     /// reuse the distances it computed when the list was produced, instead of
-    /// re-fetching them from the pair cache for every revision.
+    /// re-deriving them for every revision.
     list_dists: Vec<Vec<Vec<f32>>>,
     /// `[node][layer]` → bitmask over the stored neighbors: bit `i` set means
     /// neighbor `i` was **accepted by the occlusion heuristic**; clear means it
@@ -161,13 +161,9 @@ struct BuildState {
     budget_bytes: u64,
     mem_used: u64,
     graph: MemGraph,
-    /// Build-scoped cache of pairwise (decoded-vector) distances, keyed by
-    /// the unordered id pair.  The backlink re-pruning recomputes each
-    /// neighbor-list pair distance on every revision; the cache turns that
-    /// repeated work into one computation per pair.  Bounded: cleared when
-    /// it grows past `PAIR_CACHE_MAX` (~250MB), so long builds stay within
-    /// the maintenance_work_mem budget.
-    pair_dist_cache: std::collections::HashMap<(u32, u32), f32>,
+    /// Reusable decode-once distance buffer for the pair-heavy build loops
+    /// (own-list selection and backlink admission) — see [`DistBuf`].
+    pair_buf: DistBuf,
     /// Per-phase timing counters (`hnswsq.build_stats`).
     stats: BuildStats,
     /// Reusable search state (epoch marks + heaps) for the memory beam search.
@@ -198,8 +194,10 @@ pub struct BuildStats {
     pub backlink_pairs_ns: u64,
     pub backlink_select_ns: u64,
     pub backlink_lists: u64,
-    pub pair_lookups: u64,
-    pub pair_misses: u64,
+    /// Pair distances evaluated (SIMD, from the decode-once buffer) and how
+    /// many vector decodes were needed to feed them.
+    pub pair_dists: u64,
+    pub vector_decodes: u64,
     pub flush_ns: u64,
     /// Backlink entries resolved by the O(1) "only the new node can occlude"
     /// path vs entries that needed a full re-check (previously backfilled or
@@ -207,14 +205,11 @@ pub struct BuildStats {
     pub fast_entries: u64,
     pub full_entries: u64,
     pub extras_seen: u64,
-    /// Pair-cache traffic split by caller, so a high miss rate can be
-    /// attributed (own-list selection vs backlink admission vs extras).
-    pub pair_lookups_select: u64,
-    pub pair_misses_select: u64,
-    pub pair_lookups_backlink: u64,
-    pub pair_misses_backlink: u64,
-    pub pair_lookups_extras: u64,
-    pub pair_misses_extras: u64,
+    /// Pair-distance traffic split by caller, so the cost can be attributed
+    /// (own-list selection vs backlink admission vs extras).
+    pub pair_dists_select: u64,
+    pub pair_dists_backlink: u64,
+    pub pair_dists_extras: u64,
     /// Beam-search calls and the neighbour hits they returned (proxy for the
     /// work the search path does per insert).
     pub search_calls: u64,
@@ -236,16 +231,6 @@ pub(crate) enum BacklinkMode {
     Exact,
 }
 
-/// Which hot loop is asking the pair cache for a distance.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PairCaller {
-    /// Neighbour selection for the inserted node's own lists.
-    Select,
-    /// Backlink admission/re-prune distances.
-    Backlink,
-    /// Checks against entries newly accepted in this pass ("extras").
-    Extras,
-}
 
 impl BuildStats {
     fn new() -> Self {
@@ -260,15 +245,15 @@ impl BuildStats {
         let ms = |ns: u64| ns as f64 / 1e6;
         let total = ms(self.search_ns + self.select_ns + self.backlink_pairs_ns + self.backlink_select_ns + self.flush_ns);
         format!(
-            "hnswsq build stats: nodes={} backlink_lists={} pair_lookups={} pair_misses={} \
+            "hnswsq build stats: nodes={} backlink_lists={} pair_dists={} vector_decodes={} \
              search={:.1}ms select={:.1}ms backlink_pairs={:.1}ms backlink_select={:.1}ms \
              flush={:.1}ms accounted_total={:.1}ms fast_entries={} full_entries={} extras_seen={} \
-             pair(select)={}/{} pair(backlink)={}/{} pair(extras)={}/{} search_calls={} search_hits={} \
+             pair(select)={} pair(backlink)={} pair(extras)={} search_calls={} search_hits={} \
              cutoff_skips={} ranked_admits={} ranked_prunes={}",
             self.nodes,
             self.backlink_lists,
-            self.pair_lookups,
-            self.pair_misses,
+            self.pair_dists,
+            self.vector_decodes,
             ms(self.search_ns),
             ms(self.select_ns),
             ms(self.backlink_pairs_ns),
@@ -278,12 +263,9 @@ impl BuildStats {
             self.fast_entries,
             self.full_entries,
             self.extras_seen,
-            self.pair_lookups_select,
-            self.pair_misses_select,
-            self.pair_lookups_backlink,
-            self.pair_misses_backlink,
-            self.pair_lookups_extras,
-            self.pair_misses_extras,
+            self.pair_dists_select,
+            self.pair_dists_backlink,
+            self.pair_dists_extras,
             self.search_calls,
             self.search_hits,
             self.cutoff_skips,
@@ -293,87 +275,160 @@ impl BuildStats {
     }
 }
 
-/// Pair-distance cache cap (~4M entries ≈ 250MB).
-const PAIR_CACHE_MAX: usize = 4 << 20;
-
-/// Distance between two memory-graph nodes, computed once and cached.
-#[inline]
-fn cached_pair_dist(
-    codec: &Codec,
-    dist_fn: DistanceFn,
-    g: &MemGraph,
-    cache: &mut std::collections::HashMap<(u32, u32), f32>,
-    stats: &mut BuildStats,
-    caller: PairCaller,
-    a: u32,
-    b: u32,
-) -> f32 {
-    if a == b {
-        return 0.0;
-    }
-    let key = if a < b { (a, b) } else { (b, a) };
-    if stats.enabled {
-        stats.pair_lookups += 1;
-        match caller {
-            PairCaller::Select => stats.pair_lookups_select += 1,
-            PairCaller::Backlink => stats.pair_lookups_backlink += 1,
-            PairCaller::Extras => stats.pair_lookups_extras += 1,
-        }
-    }
-    if let Some(&d) = cache.get(&key) {
-        return d;
-    }
-    if stats.enabled {
-        stats.pair_misses += 1;
-        match caller {
-            PairCaller::Select => stats.pair_misses_select += 1,
-            PairCaller::Backlink => stats.pair_misses_backlink += 1,
-            PairCaller::Extras => stats.pair_misses_extras += 1,
-        }
-    }
-    let va = codec.decode(&g.vectors[a as usize]);
-    let d = dist_fn(&va, &codec.decode(&g.vectors[b as usize]));
-    if cache.len() >= PAIR_CACHE_MAX {
-        cache.clear();
-    }
-    cache.insert(key, d);
-    d
+/// Which hot loop is asking for a pair distance (statistics attribution).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairCaller {
+    /// Neighbour selection for the inserted node's own lists.
+    Select,
+    /// Backlink admission/re-prune distances.
+    Backlink,
+    /// Checks against entries newly accepted in this pass ("extras").
+    Extras,
 }
 
-/// Memory-graph SELECT-NEIGHBORS-HEURISTIC with a cached pair distance
-/// oracle (see [`cached_pair_dist`]); same semantics as the disk-graph
-/// [`select_neighbors_heuristic`].
+/// Decode-once distance buffer for the build's pair-heavy loops.
+///
+/// Both hot loops — neighbour selection for the inserted node's own lists, and
+/// backlink admission/pruning — work on a *small* set of ids per call: the
+/// candidates of one selection, or one neighbour list plus the incoming node.
+/// Pushing each of those vectors into a flat `f32` buffer exactly once and
+/// evaluating pairs straight through the SIMD `dist_fn` replaces the
+/// build-scoped `HashMap<(u32, u32), f32>` oracle this used to be (and returns
+/// bit-identical distances: the map stored `dist_fn` over the same two decoded
+/// vectors).
+///
+/// Why the map had to go (100k-node build, dim 16, m=16, efc=64): its probes
+/// are random accesses into a table that grows to ~100MB, so a single lookup
+/// measured ~2.5us — more than decoding and comparing both vectors costs — and
+/// 99.4% of the backlink pairs were cold anyway.  The buffer version keeps a
+/// whole selection's vectors in L1/L2 and does no hashing at all.
+struct DistBuf {
+    dim: usize,
+    /// Ids of the decoded vectors, in slot order (slot `i` is `ids[i]`).
+    ids: Vec<u32>,
+    /// `ids.len() * dim` decoded values, one slot after another.
+    data: Vec<f32>,
+}
+
+impl DistBuf {
+    fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            ids: Vec::new(),
+            data: Vec::new(),
+        }
+    }
+
+    /// Drop all slots, keeping the allocation (one selection's worth of f32).
+    fn clear(&mut self) {
+        self.ids.clear();
+        self.data.clear();
+    }
+
+    /// Decode `id`'s stored vector into the next slot; returns the slot index.
+    fn push(&mut self, codec: &Codec, g: &MemGraph, id: u32, stats: &mut BuildStats) -> usize {
+        if stats.enabled {
+            stats.vector_decodes += 1;
+        }
+        let start = self.data.len();
+        self.data.resize(start + self.dim, 0.0);
+        codec.decode_into(&g.vectors[id as usize], &mut self.data[start..]);
+        self.ids.push(id);
+        self.ids.len() - 1
+    }
+
+    #[inline]
+    fn slice(&self, slot: usize) -> &[f32] {
+        &self.data[slot * self.dim..(slot + 1) * self.dim]
+    }
+
+    /// Distance between two slots.
+    #[inline]
+    fn dist(
+        &self,
+        dist_fn: DistanceFn,
+        stats: &mut BuildStats,
+        caller: PairCaller,
+        a: usize,
+        b: usize,
+    ) -> f32 {
+        debug_assert!(a != b, "pair distance between a slot and itself");
+        note_pair(stats, caller);
+        dist_fn(self.slice(a), self.slice(b))
+    }
+
+    /// Distance from an already-decoded query vector to `id`'s stored vector.
+    /// One decode of `id`, no cache: `g` is not consulted for the query side
+    /// because the caller (an insert) holds it decoded already.
+    fn dist_to_query(
+        &mut self,
+        codec: &Codec,
+        dist_fn: DistanceFn,
+        stats: &mut BuildStats,
+        caller: PairCaller,
+        query: &[f32],
+        g: &MemGraph,
+        id: u32,
+    ) -> f32 {
+        self.clear();
+        self.push(codec, g, id, stats);
+        note_pair(stats, caller);
+        dist_fn(query, self.slice(0))
+    }
+}
+
+/// Count one evaluated pair distance, attributed to its caller.
+#[inline]
+fn note_pair(stats: &mut BuildStats, caller: PairCaller) {
+    if stats.enabled {
+        stats.pair_dists += 1;
+        match caller {
+            PairCaller::Select => stats.pair_dists_select += 1,
+            PairCaller::Backlink => stats.pair_dists_backlink += 1,
+            PairCaller::Extras => stats.pair_dists_extras += 1,
+        }
+    }
+}
+
+/// Memory-graph SELECT-NEIGHBORS-HEURISTIC.
+///
+/// Same semantics as the disk-graph [`select_neighbors_heuristic`]; the
+/// pairwise distances come from a decode-once [`DistBuf`] over the candidate
+/// set, where slot `i` is the candidate at sorted position `i`, so every
+/// occlusion check is one SIMD kernel call on two slices of a small hot buffer.
 pub(crate) fn select_neighbors_heuristic_mem(
     codec: &Codec,
     dist_fn: DistanceFn,
     g: &MemGraph,
-    cache: &mut std::collections::HashMap<(u32, u32), f32>,
+    buf: &mut DistBuf,
     stats: &mut BuildStats,
     candidates: Vec<(f32, u32)>,
     cap: usize,
 ) -> (Vec<u32>, Vec<f32>, [u64; LIST_MASK_WORDS]) {
-    if candidates.len() <= cap {
+    let mut sorted = candidates;
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    buf.clear();
+    for &(_, id) in sorted.iter() {
+        buf.push(codec, g, id, stats);
+    }
+    if sorted.len() <= cap {
         // Room for everyone: the returned list is every candidate in ascending
         // order.  The mask still records, for each entry, whether the occlusion
         // rule would have accepted it — the incremental backlink re-prune
         // relies on that bit, and it must not claim "accepted" for an entry
         // that was never evaluated.
-        let mut sorted = candidates;
-        sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        sorted.truncate(cap);
-        let mut accepted: Vec<(f32, u32)> = Vec::with_capacity(sorted.len());
+        let mut accepted: Vec<usize> = Vec::with_capacity(sorted.len());
         let mut mask = [0u64; LIST_MASK_WORDS];
-        for (i, &(d, id)) in sorted.iter().enumerate() {
+        for (i, &(d, _)) in sorted.iter().enumerate() {
             let mut keep = true;
-            for sel in &accepted {
-                if cached_pair_dist(codec, dist_fn, g, cache, stats, PairCaller::Select, id, sel.1) < d
-                {
+            for &sel in &accepted {
+                if buf.dist(dist_fn, stats, PairCaller::Select, i, sel) < d {
                     keep = false;
                     break;
                 }
             }
             if keep {
-                accepted.push((d, id));
+                accepted.push(i);
                 if i < LIST_MASK_WORDS * 64 {
                     mask[i / 64] |= 1u64 << (i % 64);
                 }
@@ -383,52 +438,42 @@ pub(crate) fn select_neighbors_heuristic_mem(
         let dists: Vec<f32> = sorted.iter().map(|c| c.0).collect();
         return (ids, dists, mask);
     }
-    let mut sorted = candidates;
-    sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let mut selected: Vec<(f32, u32)> = Vec::with_capacity(cap);
+    // Selected entries carry their buffer slot so the occlusion checks index
+    // the decoded buffer directly; only the backfill below drops it (it is
+    // appended after every check is done).
+    let mut selected: Vec<(f32, u32, usize)> = Vec::with_capacity(cap);
     let mut pruned: Vec<(f32, u32)> = Vec::new();
-    for cand in sorted {
+    for (i, cand) in sorted.iter().enumerate() {
         if selected.len() >= cap {
-            pruned.push(cand);
+            pruned.push(*cand);
             continue;
         }
         let mut keep = true;
         for sel in &selected {
-            if cached_pair_dist(
-                codec,
-                dist_fn,
-                g,
-                cache,
-                stats,
-                PairCaller::Select,
-                cand.1,
-                sel.1,
-            ) < cand.0
-            {
+            if buf.dist(dist_fn, stats, PairCaller::Select, i, sel.2) < cand.0 {
                 keep = false;
                 break;
             }
         }
         if keep {
-            selected.push(cand);
+            selected.push((cand.0, cand.1, i));
         } else {
-            pruned.push(cand);
+            pruned.push(*cand);
         }
     }
     // Backfill with the closest pruned candidates (ascending order).
-    let main_loop_len = selected.len();
+    let mut entries: Vec<(f32, u32)> = selected.iter().map(|&(d, id, _)| (d, id)).collect();
+    let main_loop_len = entries.len();
     for p in pruned {
-        if selected.len() >= cap {
+        if entries.len() >= cap {
             break;
         }
-        selected.push(p);
+        entries.push(p);
     }
     let mut mask = [0u64; LIST_MASK_WORDS];
-    let mut ids = Vec::with_capacity(selected.len());
-    let mut dists = Vec::with_capacity(selected.len());
-    for (i, (d, id)) in selected.into_iter().enumerate() {
-        // Entries the main loop accepted keep their bit; entries re-added by
-        // the backfill stay clear (they were pruned by the occlusion rule).
+    let mut ids = Vec::with_capacity(entries.len());
+    let mut dists = Vec::with_capacity(entries.len());
+    for (i, (d, id)) in entries.into_iter().enumerate() {
         if i < main_loop_len && i < LIST_MASK_WORDS * 64 {
             mask[i / 64] |= 1u64 << (i % 64);
         }
@@ -626,7 +671,7 @@ fn backlink_add_ranked_mem(
     codec: &Codec,
     dist_fn: DistanceFn,
     g: &MemGraph,
-    cache: &mut std::collections::HashMap<(u32, u32), f32>,
+    buf: &mut DistBuf,
     stats: &mut BuildStats,
     existing_ids: &[u32],
     existing_dists: &[f32],
@@ -685,7 +730,7 @@ fn backlink_add_ranked_mem(
     }
     let cands: Vec<(f32, u32)> = dists.iter().copied().zip(ids.iter().copied()).collect();
     let (mut ids, mut dists, mut mask) =
-        select_neighbors_heuristic_mem(codec, dist_fn, g, cache, stats, cands, cap);
+        select_neighbors_heuristic_mem(codec, dist_fn, g, buf, stats, cands, cap);
     // The heuristic emits accepted entries followed by backfilled ones, which
     // is not globally ascending; the ranked-list invariant (`cutoff`, insertion
     // position) needs a true order, so re-sort.  The SET is unchanged, so
@@ -713,12 +758,17 @@ fn backlink_add_ranked_mem(
 /// [`select_neighbors_heuristic_mem`] over the merged candidate set; the
 /// `test_backlink_prune_matches_full_heuristic` test asserts that equality on
 /// randomized graphs.
+///
+/// Distances come from a decode-once [`DistBuf`] holding the existing list plus
+/// the incoming node (slots `0..len` in list order, then the new node), so the
+/// per-entry checks are SIMD calls on one small hot buffer rather than hash-map
+/// probes.
 #[allow(clippy::too_many_arguments)]
 fn backlink_prune_mem(
     codec: &Codec,
     dist_fn: DistanceFn,
     g: &MemGraph,
-    cache: &mut std::collections::HashMap<(u32, u32), f32>,
+    buf: &mut DistBuf,
     stats: &mut BuildStats,
     existing_ids: &[u32],
     existing_dists: &[f32],
@@ -729,16 +779,23 @@ fn backlink_prune_mem(
 ) -> (Vec<u32>, Vec<f32>, [u64; LIST_MASK_WORDS]) {
     debug_assert_eq!(existing_ids.len(), existing_dists.len());
 
+    buf.clear();
+    for &id in existing_ids.iter() {
+        buf.push(codec, g, id, stats);
+    }
+    let new_slot = buf.push(codec, g, new_id, stats);
+
     // The old list is ascending by distance (heuristic output order); the new
     // node slots in at the first position where (dist, id) wins.
-    let mut merged: Vec<(f32, u32, bool)> = Vec::with_capacity(existing_ids.len() + 1);
+    let mut merged: Vec<(f32, u32, bool, usize)> = Vec::with_capacity(existing_ids.len() + 1);
     for (i, (&id, &d)) in existing_ids.iter().zip(existing_dists.iter()).enumerate() {
         let was_selected = (existing_mask[i / 64] >> (i % 64)) & 1 == 1;
-        merged.push((d, id, was_selected));
+        merged.push((d, id, was_selected, i));
     }
     // Old entries may not be perfectly sorted if a list ever arrived from a
-    // different path; sorting keeps this exact rather than assumed.
-    merged.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    // different path; sorting keeps this exact rather than assumed.  `(dist, id)`
+    // is a total order over distinct ids, so an unstable sort is equivalent.
+    merged.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     // Insertion position under the heuristic's (dist, id) ordering.
     let p = merged
         .iter()
@@ -746,8 +803,7 @@ fn backlink_prune_mem(
             d_new.total_cmp(&c.0).then_with(|| new_id.cmp(&c.1)) == std::cmp::Ordering::Less
         })
         .unwrap_or(merged.len());
-    merged.insert(p, (d_new, new_id, false));
-
+    merged.insert(p, (d_new, new_id, false, new_slot));
 
     // Room for everyone: the list is every candidate in ascending order (the
     // heuristic's fast path).  The mask must still record which entries the
@@ -755,19 +811,18 @@ fn backlink_prune_mem(
     // fast path does — otherwise later incremental updates would trust an
     // acceptance that was never evaluated.
     if merged.len() <= cap {
-        let mut accepted: Vec<(f32, u32)> = Vec::with_capacity(merged.len());
+        let mut accepted: Vec<usize> = Vec::with_capacity(merged.len());
         let mut mask = [0u64; LIST_MASK_WORDS];
-        for (i, &(d, id, _)) in merged.iter().enumerate() {
+        for (i, &(d, _, _, slot)) in merged.iter().enumerate() {
             let mut keep = true;
-            for sel in &accepted {
-                if cached_pair_dist(codec, dist_fn, g, cache, stats, PairCaller::Select, id, sel.1) < d
-                {
+            for &sel in &accepted {
+                if buf.dist(dist_fn, stats, PairCaller::Select, slot, sel) < d {
                     keep = false;
                     break;
                 }
             }
             if keep {
-                accepted.push((d, id));
+                accepted.push(slot);
                 if i < LIST_MASK_WORDS * 64 {
                     mask[i / 64] |= 1u64 << (i % 64);
                 }
@@ -778,7 +833,8 @@ fn backlink_prune_mem(
         return (ids, dists, mask);
     }
 
-    let mut selected: Vec<(f32, u32)> = Vec::with_capacity(cap);
+    // Accepted entries carry their buffer slot (used as the occluder index).
+    let mut selected: Vec<(f32, u32, usize)> = Vec::with_capacity(cap);
     let mut pruned: Vec<(f32, u32)> = Vec::new();
     let mut new_selected = false;
     // Entries the occlusion rule had *not* accepted before but accepts now
@@ -786,8 +842,8 @@ fn backlink_prune_mem(
     // are the only occluders a previously-accepted entry has not already been
     // checked against, so mask-set entries only need to be tested against
     // these plus the new node — instead of rescanning `selected`.
-    let mut extras: Vec<u32> = Vec::new();
-    for (i, &(d, id, was_selected)) in merged.iter().enumerate() {
+    let mut extras: Vec<usize> = Vec::new();
+    for (i, &(d, id, was_selected, slot)) in merged.iter().enumerate() {
         if selected.len() >= cap {
             pruned.push((d, id));
             continue;
@@ -796,17 +852,7 @@ fn backlink_prune_mem(
             // The new node: full occlusion check against the accepted prefix.
             let mut keep = true;
             for sel in &selected {
-                if cached_pair_dist(
-                    codec,
-                    dist_fn,
-                    g,
-                    cache,
-                    stats,
-                    PairCaller::Backlink,
-                    id,
-                    sel.1,
-                ) < d
-                {
+                if buf.dist(dist_fn, stats, PairCaller::Backlink, slot, sel.2) < d {
                     keep = false;
                     break;
                 }
@@ -823,33 +869,13 @@ fn backlink_prune_mem(
             // `extras` accepted in this run that were not accepted before.
             let mut keep = true;
             if i > p && new_selected {
-                if cached_pair_dist(
-                    codec,
-                    dist_fn,
-                    g,
-                    cache,
-                    stats,
-                    PairCaller::Backlink,
-                    id,
-                    new_id,
-                ) < d
-                {
+                if buf.dist(dist_fn, stats, PairCaller::Backlink, slot, new_slot) < d {
                     keep = false;
                 }
             }
             if keep {
                 for &extra in &extras {
-                    if cached_pair_dist(
-                        codec,
-                        dist_fn,
-                        g,
-                        cache,
-                        stats,
-                        PairCaller::Extras,
-                        id,
-                        extra,
-                    ) < d
-                    {
+                    if buf.dist(dist_fn, stats, PairCaller::Extras, slot, extra) < d {
                         keep = false;
                         break;
                     }
@@ -865,17 +891,7 @@ fn backlink_prune_mem(
             // contains the new node when it was accepted.
             let mut keep = true;
             for sel in &selected {
-                if cached_pair_dist(
-                    codec,
-                    dist_fn,
-                    g,
-                    cache,
-                    stats,
-                    PairCaller::Backlink,
-                    id,
-                    sel.1,
-                ) < d
-                {
+                if buf.dist(dist_fn, stats, PairCaller::Backlink, slot, sel.2) < d {
                     keep = false;
                     break;
                 }
@@ -883,9 +899,9 @@ fn backlink_prune_mem(
             keep
         };
         if keep {
-            selected.push((d, id));
+            selected.push((d, id, slot));
             if !was_selected && i != p {
-                extras.push(id);
+                extras.push(slot);
                 if stats.enabled {
                     stats.extras_seen += 1;
                 }
@@ -897,18 +913,19 @@ fn backlink_prune_mem(
 
     // Backfill with the closest pruned candidates (ascending order); those keep
     // a clear mask bit, exactly like the full heuristic.
-    let main_loop_len = selected.len();
+    let mut entries: Vec<(f32, u32)> = selected.iter().map(|&(d, id, _)| (d, id)).collect();
+    let main_loop_len = entries.len();
     for p_item in pruned {
-        if selected.len() >= cap {
+        if entries.len() >= cap {
             break;
         }
-        selected.push(p_item);
+        entries.push(p_item);
     }
 
     let mut mask = [0u64; LIST_MASK_WORDS];
-    let mut ids = Vec::with_capacity(selected.len());
-    let mut dists = Vec::with_capacity(selected.len());
-    for (i, (d, id)) in selected.into_iter().enumerate() {
+    let mut ids = Vec::with_capacity(entries.len());
+    let mut dists = Vec::with_capacity(entries.len());
+    for (i, (d, id)) in entries.into_iter().enumerate() {
         if i < main_loop_len && i < LIST_MASK_WORDS * 64 {
             mask[i / 64] |= 1u64 << (i % 64);
         }
@@ -1055,7 +1072,7 @@ pub unsafe extern "C-unwind" fn ambuild(
         budget_bytes,
         mem_used: 0,
         graph: MemGraph::new(),
-        pair_dist_cache: std::collections::HashMap::new(),
+        pair_buf: DistBuf::new(num_dimensions),
         stats: BuildStats::new(),
         search_scratch: SearchScratch::new(),
         reference_backlinks: false,
@@ -1294,7 +1311,7 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
             &state.codec,
             state.dist_fn,
             &*g,
-            &mut state.pair_dist_cache,
+            &mut state.pair_buf,
             &mut state.stats,
             cands,
             cap_for(l),
@@ -1313,32 +1330,33 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
         }
 
         // Backlinks with heuristic re-pruning (RAM: no two-phase needed).
-        // Pair distances come from the build-scoped cache: each (n, mm)
-        // pair is decoded and evaluated once per build, not once per
-        // neighbor-list revision.
+        // Pair distances come from the decode-once `pair_buf`; each check is a
+        // SIMD kernel call on a small hot buffer (see [`DistBuf`]).
         let cap = cap_for(l);
         for (sel_idx, &n) in selected.iter().enumerate() {
             if timed {
                 state.stats.backlink_lists += 1;
             }
             let t_phase = timed.then(std::time::Instant::now);
-            let d_self = cached_pair_dist(
+            let d_self = state.pair_buf.dist_to_query(
                 &state.codec,
                 state.dist_fn,
-                &*g,
-                &mut state.pair_dist_cache,
                 &mut state.stats,
                 PairCaller::Backlink,
+                &subject,
+                &*g,
                 n,
-                id,
             );
             if let Some(t) = t_phase {
                 state.stats.backlink_pairs_ns += t.elapsed().as_nanos() as u64;
             }
             let t_phase = timed.then(std::time::Instant::now);
             let n_i = n as usize;
-            let existing_ids: Vec<u32> = g.neighbors[n_i][l].clone();
-            let existing_dists: Vec<f32> = g.list_dists[n_i][l].clone();
+            // Move the list out instead of cloning it: it is overwritten at the
+            // end of this iteration anyway, and `mem::take` keeps the same
+            // allocation alive for the (much more common) write-back path.
+            let existing_ids: Vec<u32> = std::mem::take(&mut g.neighbors[n_i][l]);
+            let existing_dists: Vec<f32> = std::mem::take(&mut g.list_dists[n_i][l]);
             let existing_mask = g.list_masks[n_i][l];
             let ranked = if state.reference_backlinks || state.backlink_mode == BacklinkMode::Exact {
                 None
@@ -1347,7 +1365,7 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
                     &state.codec,
                     state.dist_fn,
                     &*g,
-                    &mut state.pair_dist_cache,
+                    &mut state.pair_buf,
                     &mut state.stats,
                     &existing_ids,
                     &existing_dists,
@@ -1358,9 +1376,11 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
                 ))
             };
             if let Some(ranked) = ranked {
-                // Ranked mode: the edge may have been skipped by the cutoff test.
-                if let Some((ids, dists, mask)) = ranked {
-                    g.set_list(n, l, ids, dists, mask);
+                // Ranked mode: the edge may have been skipped by the cutoff test,
+                // in which case the list taken above goes straight back.
+                match ranked {
+                    Some((ids, dists, mask)) => g.set_list(n, l, ids, dists, mask),
+                    None => g.set_list(n, l, existing_ids, existing_dists, existing_mask),
                 }
                 if let Some(t) = t_phase {
                     state.stats.backlink_select_ns += t.elapsed().as_nanos() as u64;
@@ -1378,7 +1398,7 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
                     &state.codec,
                     state.dist_fn,
                     &*g,
-                    &mut state.pair_dist_cache,
+                    &mut state.pair_buf,
                     &mut state.stats,
                     cands,
                     cap,
@@ -1388,7 +1408,7 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
                     &state.codec,
                     state.dist_fn,
                     &*g,
-                    &mut state.pair_dist_cache,
+                    &mut state.pair_buf,
                     &mut state.stats,
                     &existing_ids,
                     &existing_dists,
@@ -1703,7 +1723,7 @@ mod mem_tests {
         let owner = 0u32;
 
         for case in 0..2000 {
-            let mut cache = std::collections::HashMap::new();
+            let mut buf = DistBuf::new(dim);
             let mut stats = BuildStats::default();
 
             // Random existing list, produced by the full heuristic so the mask
@@ -1720,7 +1740,7 @@ mod mem_tests {
                 cands.push((distance_l2(&vecs[owner as usize], &vecs[id as usize]), id));
             }
             let (existing_ids, existing_dists, existing_mask) = select_neighbors_heuristic_mem(
-                &codec, distance_l2, &g, &mut cache, &mut stats, cands, cap,
+                &codec, distance_l2, &g, &mut buf, &mut stats, cands, cap,
             );
 
             // A fresh node not in the list.
@@ -1739,14 +1759,14 @@ mod mem_tests {
                 .collect();
             merged.push((d_new, new_id));
             let (ref_ids, _, _) = select_neighbors_heuristic_mem(
-                &codec, distance_l2, &g, &mut cache, &mut stats, merged, cap,
+                &codec, distance_l2, &g, &mut buf, &mut stats, merged, cap,
             );
 
             let (inc_ids, _, _) = backlink_prune_mem(
                 &codec,
                 distance_l2,
                 &g,
-                &mut cache,
+                &mut buf,
                 &mut stats,
                 &existing_ids,
                 &existing_dists,
@@ -1795,7 +1815,7 @@ mod mem_tests {
                 budget_bytes: u64::MAX,
                 mem_used: 0,
                 graph: MemGraph::new(),
-                pair_dist_cache: std::collections::HashMap::new(),
+                pair_buf: DistBuf::new(dim),
                 stats: BuildStats::default(),
                 search_scratch: SearchScratch::new(),
                 reference_backlinks: reference,
@@ -1867,7 +1887,7 @@ mod mem_tests {
                 budget_bytes: u64::MAX,
                 mem_used: 0,
                 graph: MemGraph::new(),
-                pair_dist_cache: std::collections::HashMap::new(),
+                pair_buf: DistBuf::new(dim),
                 stats: BuildStats::default(),
                 search_scratch: SearchScratch::new(),
                 reference_backlinks: reference,
@@ -1949,7 +1969,7 @@ mod mem_tests {
             budget_bytes: u64::MAX,
             mem_used: 0,
             graph: MemGraph::new(),
-            pair_dist_cache: std::collections::HashMap::new(),
+            pair_buf: DistBuf::new(dim),
             stats: BuildStats {
                 enabled: true,
                 ..Default::default()
@@ -2023,7 +2043,7 @@ mod mem_tests {
             budget_bytes: u64::MAX,
             mem_used: 0,
             graph: MemGraph::new(),
-            pair_dist_cache: std::collections::HashMap::new(),
+            pair_buf: DistBuf::new(dim),
             stats: BuildStats::default(),
             search_scratch: SearchScratch::new(),
             reference_backlinks: false,
@@ -2130,7 +2150,7 @@ mod mem_tests {
                 budget_bytes: u64::MAX,
                 mem_used: 0,
                 graph: MemGraph::new(),
-                pair_dist_cache: std::collections::HashMap::new(),
+                pair_buf: DistBuf::new(dim),
                 stats: BuildStats::default(),
                 search_scratch: SearchScratch::new(),
                 reference_backlinks: reference,
@@ -2228,7 +2248,7 @@ mod mem_tests {
             budget_bytes: u64::MAX,
             mem_used: 0,
             graph: MemGraph::new(),
-            pair_dist_cache: std::collections::HashMap::new(),
+            pair_buf: DistBuf::new(dim),
             stats: BuildStats::default(),
             search_scratch: SearchScratch::new(),
             reference_backlinks: false,
