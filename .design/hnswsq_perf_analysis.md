@@ -227,6 +227,44 @@ Same change, debug profile (kept for the record — it is what the test suite
 runs): 439.3 s -> 321.5 s wall, `select` 61.4 s -> 18.6 s, `backlink_select`
 242.4 s -> 170.7 s.
 
+### Scaling: 100k -> 300k -> 1M (release, local 12-core Mac, pinned seed)
+
+Same clustered dataset generator at each size, `m=16`, `ef_construction=64`,
+`maintenance_work_mem=2GB`, single-threaded build:
+
+| rows | wall | `search` | `backlink_select` | `select` | flush | pair distances |
+|---|---|---|---|---|---|---|
+| 100k | 12.48 s | 6.07 s (51%) | 4.96 s (42%) | 0.32 s | 0.38 s | 234 M |
+| 300k | 45.44 s | 25.43 s (60%) | 15.22 s (36%) | 0.97 s | 0.77 s | 694 M |
+| **1M** | **182.59 s** | **110.02 s (65%)** | **51.20 s (30%)** | 3.32 s | 3.50 s | 2 291 M |
+
+Recall@10 at ef 160/640 is 1.000 at every size (ef 10/40 = 0.500/0.508 — this
+clustered dataset needs a large ef at `m=16`, which is a property of the data,
+not of the build).  For reference, the same 1M build in the *debug* profile
+(none of the pair-distance work done) was interrupted after 97 min, so the
+release profile alone is a ~30x methodology correction on top of the algorithmic
+work.
+
+### Ranked admission re-measured with cheap distances (Phase-B revisit)
+
+The Phase-B verdict (Lance's ranked/cutoff list loses) was measured while a pair
+lookup cost ~2.5us.  With distances at SIMD cost the cost model changed, so it
+was re-run on the same 100k/pinned-seed/release setup:
+
+| | exact (default) | ranked (cutoff) |
+|---|---|---|
+| wall | **12.48 s** | 13.56 s |
+| pair distances | 234 M | 664 M |
+| edges skipped by cutoff | 0 | 471 000 |
+| admits / prunes | - | 2 835 872 / 2 834 936 |
+| recall@10 (ef 10/40/160/640) | 0.500 / **0.800** / 1.000 / 1.000 | 0.500 / **0.508** / 1.000 / 1.000 |
+
+Still slower *and* worse recall, so the default stays `Exact`.  The reason is
+unchanged: the cutoff test is cheap, but every admitted edge then pays a full
+neighbor-selection heuristic over the merged list (664M pair distances for 2.8M
+admits), whereas the exact incremental re-prune resolves an admitted edge with
+an O(len) walk over state it already has.
+
 ### What is left at 100k (release)
 
 `search` 6.07 s (51%) and `backlink_select` 4.96 s (42%) now account for

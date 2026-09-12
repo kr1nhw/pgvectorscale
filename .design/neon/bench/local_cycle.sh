@@ -38,6 +38,9 @@ MAINT_MEM="${MAINT_MEM:-2GB}"
 # in graph quality and recall@10 moves by several points between runs.  Every
 # A/B in the perf notes pins the seed so build time *and* recall are comparable.
 BUILD_SEED="${HNSWSQ_BUILD_SEED_BENCH:-20240912}"
+# Backlink admission policy: 1 = exact incremental re-prune (default),
+# 0 = Lance-style ranked/cutoff list.
+BACKLINK_MODE="${HNSWSQ_BACKLINK_MODE_BENCH:-1}"
 EF_SWEEP="${HNSWSQ_EF_SWEEP:-10 40 160 640}"
 OUT_CSV="${OUT_CSV:-/tmp/hnswsq_local_cycle.csv}"
 LOG="${LOG:-/tmp/hnswsq_local_$(date +%Y%m%d_%H%M%S)_${LABEL}.log}"
@@ -72,10 +75,11 @@ fi
 
 # ---- 2. drop + rebuild, timed, with stats on -------------------------------
 q -c "DROP INDEX IF EXISTS $IDX;" >>"$LOG" 2>&1
-log "building $IDX (layout=$LAYOUT m=$M efc=$EFC maintenance_work_mem=$MAINT_MEM build_seed=$BUILD_SEED)"
+log "building $IDX (layout=$LAYOUT m=$M efc=$EFC maintenance_work_mem=$MAINT_MEM build_seed=$BUILD_SEED backlink_mode=$BACKLINK_MODE)"
 BUILD_START=$(date +%s.%N)
 q -c "SET maintenance_work_mem = '$MAINT_MEM'; SET hnswsq.build_stats = on;
       SET hnswsq.build_seed = $BUILD_SEED;
+      SET hnswsq.build_backlink_mode = $BACKLINK_MODE;
       CREATE INDEX $IDX ON $TABLE USING hnswsq (embedding vector_l2_ops)
       WITH (storage_layout = '$LAYOUT', m = $M, ef_construction = $EFC);" >>"$LOG" 2>&1
 BUILD_RC=$?
