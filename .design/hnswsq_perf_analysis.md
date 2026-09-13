@@ -325,6 +325,10 @@ p50 within 0.2%), and `local_cycle.sh` now refuses to run against a debug `.so`.
 | baseline | 30.14 | 21 227 | 0.681 | 2.678 | 13.293 |
 | P1 lossless-layout distance kernel | **21.88** | **13 448** | 0.627 | 2.448 | 12.479 |
 | P2 in-page probe + allocation-free expansion | 21.34 | 13 621 | **0.269** | **1.004** | **5.764** |
+| P3 exact `plain` emission, no second load, no executor recheck | 22.32 | 13 598 | 0.266 | **0.983** | **3.718** |
+
+Cumulative against the baseline: build 30.14 s -> 22.3 s (1.35x), scan p50
+2.673 -> 0.983 ms at ef 160 (2.7x) and 13.27 -> 3.72 ms at ef 640 (3.6x).
 
 Recall is identical across the three (0.000/0.200/0.200/0.500 at ef 10/40/160/640
 on this hard synthetic set), i.e. P2 is a pure cost change and P1 (which changes
@@ -340,6 +344,15 @@ What P2 does: `GraphAccess` gains `probe` (distance + heap TID + tombstone/clamp
 flags read while the page is pinned — no copy, no allocation) and `expand` (copy
 only the neighbour prefix into a caller-reused buffer).  `search_layer` drops its
 `HashMap<Id, VisitData>` cache entirely, so a search allocates nothing per hop.
+
+What P3 does: the lossless `plain` layout now emits the operator's own value
+(sqrt for L2, unchanged for cosine/IP) with `xs_recheckorderby = false`, exactly
+like pgvector's hnsw for `vector` columns, and takes the heap TID/clamp flag from
+the probe instead of loading every emitted candidate a second time.  Quantized
+layouts keep the provable-lower-bound + recheck contract.  Verified on the
+dim-16 dataset (recall 1.0 at ef 160): the index returns the **identical order**
+to the exact seq-scan answer for every query checked, and the quantized layouts
+are unchanged (full suite green).
 
 ## Next-round plan, driven by the measurements above
 

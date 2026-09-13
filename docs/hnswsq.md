@@ -93,7 +93,8 @@ sequential scan.
 
 ## 4. Choosing a storage layout
 
-- **`plain`** — exact stored distances, 4 bytes/dim.  The baseline.
+- **`plain`** — exact stored distances, 4 bytes/dim.  The baseline, and the
+  only layout whose scan needs no executor recheck (see §5).
 - **`ieeefp16`** — ~2× smaller; per-element relative error ≤ 2^-11, which is
   effectively lossless for ANN ranking.  The recommended default for
   incremental workloads.
@@ -114,11 +115,16 @@ total index size shrinks a bit less for small `dim`.
 ## 5. Concurrency & MVCC
 
 - **Visibility** is the executor's snapshot check: the index returns heap
-  TIDs (`xs_recheckorderby = true`), the executor fetches each heap tuple
-  (MVCC) and recomputes the exact distance with the operator, restoring exact
+  TIDs, the executor fetches each heap tuple (MVCC) and drops invisible rows.
+  Ordering depends on the storage layout: for the lossless `plain` layout the
+  index emits the operator's own distance and PostgreSQL trusts that order
+  (`xs_recheckorderby = false`, exactly as pgvector's hnsw does for `vector`
+  columns); for the reduced-precision layouts (`ieeefp16`, `ieeefp8`, `f8`) the
+  emitted value is a provable **lower bound**, `xs_recheckorderby = true`, and
+  the executor recomputes the exact operator value per tuple and restores exact
   ordering over the candidates the graph search produced.  Uncommitted /
-  aborted / dead rows are therefore invisible, and aborted inserts leave at
-  most an orphan index node that vacuum cleans up.
+  aborted / dead rows are therefore invisible either way, and aborted inserts
+  leave at most an orphan index node that vacuum cleans up.
 - **Inserts are concurrent** (pgvector-style): no global writer lock.  Node
   slots are appended under per-page exclusive locks; neighbor lists are
   updated with a two-phase optimistic protocol (snapshot under a share lock,

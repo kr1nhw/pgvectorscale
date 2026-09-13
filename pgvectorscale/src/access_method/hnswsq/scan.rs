@@ -3,10 +3,13 @@
 //! - `ambeginscan`: allocate the scan state (Rust `Box` hung off `opaque`).
 //! - `amrescan`: extract + preprocess the query vector, reset the state.
 //! - `amgettuple`: on the first call run the layered HNSW search and cache the
-//!   ranked results, then emit one heap TID per call with
-//!   `xs_recheckorderby = true` — the executor fetches the heap tuple (MVCC
-//!   visibility) and recomputes the exact operator value, so the final
-//!   ordering is exact over the candidates the graph produced.
+//!   ranked results, then emit one heap TID per call.  For the lossless `plain`
+//!   layout the emitted distance is the operator's own value and
+//!   `xs_recheckorderby` is false (the executor just fetches the heap tuple for
+//!   MVCC visibility); for the reduced-precision layouts the emitted value is a
+//!   provable lower bound and `xs_recheckorderby` is true, so the executor
+//!   recomputes the exact value and restores exact ordering.  For `plain`, the
+//!   order is exact over the candidates the graph produced.
 //! - `amendscan`: drop the state (releases the last-returned-page pin).
 //!
 //! Reads only ever take ONE share content lock at a time (snapshot-and-
@@ -45,6 +48,11 @@ pub struct HnswScanState {
     results: Vec<ScanResult>,
     /// Cursor into `results`.
     result_index: usize,
+    /// Whether the stored layout is lossless, so the emitted distances are the
+    /// operator's own values and the executor must NOT recheck/reorder them
+    /// (`xs_recheckorderby = false`, as pgvector does for `vector`).  Set by
+    /// [`compute_results`]; conservative `true` until then.
+    recheck_orderby: bool,
     /// Whether the search has run for the current query.
     results_computed: bool,
     /// Preallocated `xs_orderbyvals`/`xs_orderbynulls` slots (palloc'd once
@@ -71,6 +79,7 @@ impl HnswScanState {
                 query: Vec::new(),
                 results: Vec::new(),
                 result_index: 0,
+                recheck_orderby: true,
                 results_computed: false,
                 orderbyvals,
                 orderbynulls,
@@ -214,13 +223,37 @@ unsafe fn compute_results(index_rel: &PgRelation, state: &mut HnswScanState) {
         .sum::<f32>()
         .sqrt();
 
-    // Emit only live nodes; tombstones keep routing but never surface.  The
-    // node load also yields the heap TID and the decoded vector (for the
-    // per-node error bound).
+    // A lossless layout stores the vector the operator will see, so the stored
+    // distance IS the operator's value (L2 additionally applies the sqrt the
+    // operator applies) and the executor neither rechecks nor reorders — this is
+    // the same contract pgvector's hnsw uses for `vector` columns.  It also
+    // removes the second load of every emitted node (page read + copy + decode
+    // + norm), which the quantized layouts still need for their lower bounds.
+    state.recheck_orderby = precision != quantize::HnswPrecision::Plain;
+
+    // Emit only live nodes; tombstones keep routing but never surface.
     state.results = hits
         .into_iter()
         .filter(|h| !h.deleted)
         .filter_map(|h| {
+            // Heap TID and clamp flag were read when the node's distance was
+            // evaluated, so no hit is loaded a second time.
+            if !h.heap_tid.is_valid() {
+                return None;
+            }
+            if !state.recheck_orderby {
+                let dist = match distance_type {
+                    DistanceType::L2 => h.dist.max(0.0).sqrt(),
+                    // Cosine and inner product are emitted in the operator's
+                    // own units already (1 − dot clamped, and −dot).
+                    _ => h.dist,
+                };
+                return Some(ScanResult {
+                    dist,
+                    heap_tid: h.heap_tid,
+                    node_ptr: h.id,
+                });
+            }
             let view = load_node_view(index_rel, h.id)?;
             if view.deleted || !view.heap_tid.is_valid() {
                 return None;
@@ -303,12 +336,14 @@ pub unsafe extern "C-unwind" fn amgettuple(
             res.heap_tid.to_item_pointer_data(&mut tid_data);
             (*scan).xs_heaptid = tid_data;
             (*scan).xs_recheck = false;
-            // Distances come from the stored (possibly reduced-precision)
-            // vectors and are emitted as provable LOWER BOUNDS (see
-            // compute_results): the executor rechecks the exact operator
-            // value from the heap tuple for all layouts (also performs MVCC
-            // visibility) and restores exact ordering via its reorder queue.
-            (*scan).xs_recheckorderby = true;
+            // Lossless layout (`plain`): the emitted distances ARE the
+            // operator's values, so the executor trusts this order (no recheck
+            // pass, no reorder queue) — pgvector's hnsw does the same for
+            // `vector` columns.  Reduced-precision layouts emit provable LOWER
+            // BOUNDS instead: there the executor recomputes the exact operator
+            // value per tuple (which also performs the MVCC visibility check)
+            // and restores exact ordering via its reorder queue.
+            (*scan).xs_recheckorderby = state.recheck_orderby;
             // pgvector's distance operators return float8: the orderbyval
             // datum MUST be a double — the executor compares it against the
             // recomputed float8 with the operator's sort support, and raw
