@@ -1,16 +1,26 @@
 -- Recall/latency sweep for the local hnswsq gates.
 --
--- Creates `bench_sweep(efs int[], k int)`: for every ef in `efs` it runs the k-NN
--- query over all `bench_queries` rows through the *index* (seq scans disabled),
--- compares against `gt_<n>`, and returns recall@k plus p50/p99 latency.
+-- Creates `bench_sweep(tbl text, gtbl text, qtbl text, efs int[], k int)`:
+-- for every ef in `efs` it runs the k-NN query over all rows of `qtbl` through
+-- the *index* (seq scans disabled), compares against `gtbl`, and returns
+-- recall@k plus p50/p99 latency.  Table names are arguments, so one function
+-- serves every dataset tag/dimension in the database.
 --
 -- Usage:
 --   psql ... -d t100kdb -f local_sweep.sql
---   psql ... -d t100kdb -c "SELECT * FROM bench_sweep(ARRAY[10,40,160,640])"
+--   psql ... -d t100kdb -c "SELECT * FROM bench_sweep('t100k','gt_100k','bench_queries_16',ARRAY[10,40,160,640])"
 
 \set ON_ERROR_STOP on
 
-CREATE OR REPLACE FUNCTION bench_sweep(efs int[], k int DEFAULT 10)
+DROP FUNCTION IF EXISTS bench_sweep(int[], int);
+
+CREATE OR REPLACE FUNCTION bench_sweep(
+    tbl text,
+    gtbl text,
+    qtbl text,
+    efs int[],
+    k int DEFAULT 10
+)
 RETURNS TABLE(ef int, recall numeric, p50_ms numeric, p99_ms numeric)
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -23,21 +33,22 @@ DECLARE
     nq bigint;
 BEGIN
     PERFORM set_config('enable_seqscan', 'off', true);
-    SELECT count(*) INTO nq FROM bench_queries;
+    EXECUTE format('SELECT count(*) FROM %I', qtbl) INTO nq;
     FOREACH e IN ARRAY efs LOOP
         PERFORM set_config('hnswsq.ef_search', e::text, true);
         lat := ARRAY[]::numeric[];
         hits := 0;
-        FOR rec IN SELECT qid, q FROM bench_queries ORDER BY qid LOOP
+        FOR rec IN EXECUTE format('SELECT qid, q FROM %I ORDER BY qid', qtbl) LOOP
             DECLARE
                 t0 timestamptz := clock_timestamp();
             BEGIN
-                SELECT array_agg(id) INTO approx FROM (
-                    SELECT t.id FROM t100k t ORDER BY t.embedding <-> rec.q LIMIT k
-                ) s;
+                EXECUTE format(
+                    'SELECT array_agg(id) FROM (SELECT id FROM %I ORDER BY embedding <-> $1 LIMIT %s) s',
+                    tbl, k)
+                INTO approx USING rec.q;
                 lat := lat || (EXTRACT(EPOCH FROM clock_timestamp() - t0) * 1000)::numeric;
             END;
-            SELECT ids INTO exact FROM gt_100k WHERE qid = rec.qid;
+            EXECUTE format('SELECT ids FROM %I WHERE qid = $1', gtbl) INTO exact USING rec.qid;
             SELECT hits + count(*) INTO hits
             FROM (SELECT unnest(exact) INTERSECT SELECT unnest(approx)) x;
         END LOOP;

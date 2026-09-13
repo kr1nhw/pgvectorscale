@@ -47,7 +47,21 @@ log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 
 log "cycle start engine=$ENGINE db=$DB label=$LABEL n=$N layout=$LAYOUT"
 
-# ---- 0. dataset sanity -----------------------------------------------------
+# ---- 0. the installed extension must be a RELEASE build --------------------
+# `cargo pgrx test` installs a debug build over the release one; that made every
+# build ~25x slower and silently invalidated a whole analysis pass.
+SO=$(ls "$(dirname "$PSQL")/../lib/postgresql"*/vectorscale-*.so 2>/dev/null | head -1)
+if [ -n "$SO" ]; then
+  SO_KB=$(( $(stat -c %s "$SO" 2>/dev/null || stat -f %z "$SO") / 1024 ))
+  log "installed extension: $SO (${SO_KB}KB)"
+  if [ "$SO_KB" -gt 8000 ]; then
+    log "FATAL: that looks like a debug build; reinstall with:"
+    log "  cargo pgrx install --release --pg-config \$(dirname $PSQL)/pg_config --no-default-features --features pg17"
+    exit 1
+  fi
+fi
+
+# ---- 0b. dataset sanity ----------------------------------------------------
 ROWS=$(run_psql -At -c "SELECT count(*) FROM $TABLE;" 2>/dev/null)
 GT_ROWS=$(run_psql -At -c "SELECT count(*) FROM $GT;" 2>/dev/null)
 QROWS=$(run_psql -At -c "SELECT count(*) FROM bench_queries;" 2>/dev/null)

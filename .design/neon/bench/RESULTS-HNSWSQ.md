@@ -93,6 +93,8 @@ PSQL_BIN=/root/.pgrx-hnswsq/17.11/pgrx-install/bin/psql \
 PGPORT=54330 ... bash .design/neon/bench/cycle.sh hnsw postgres pgvector-1m 1m
 
 # local (single host, pinned seed, reproducible dataset)
-.design/neon/bench/local_dataset.sh 1000000
-.design/neon/bench/local_cycle.sh <label> plain t100kdb 1000000
+# dim 16 dataset (tag = rows), then a dim 128 one for kernel work
+.design/neon/bench/local_dataset.sh 1m t100kdb 100 200 16
+.design/neon/bench/local_dataset.sh 100kd128 t100kdb 200 200 128
+.design/neon/bench/local_cycle.sh <label> plain t100kdb 100kd128 16 64 128
 ```

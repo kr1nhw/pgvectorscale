@@ -239,7 +239,10 @@ release profile, single-threaded, pinned build seed, 200-cluster dim-16 data):
 | 1M | 183 s | 110 s | 51 s | 3.3 s | 3.5 s |
 
 For calibration: the same 100k build took 36.3 s before the decode-once buffer
-and 439 s in a debug build.  Builds are single-backend (the in-memory phase is
+and 439 s in a debug build.  **Always benchmark a release build**: `cargo pgrx
+test` installs a debug build of the extension over the release one, which makes
+every build roughly 25x slower (`local_cycle.sh`/`cycle.sh` now refuse to run
+against a debug `.so`).  Builds are single-backend (the in-memory phase is
 sequential, and `hnswsq.build_workers` is reserved but unused); the remaining
 cost is graph traversal (`search`) plus the entries that cannot take the O(1)
 backlink fast path, which is what a parallel build would attack next.

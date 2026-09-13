@@ -2,15 +2,21 @@
 # Local (single-host) hnswsq build + recall cycle on the development scratch
 # cluster, for the per-phase perf gates in .design/hnswsq_perf_analysis.md.
 #
-# Usage: local_cycle.sh <label> [layout] [db] [n] [m] [ef_construction]
+# Usage: local_cycle.sh <label> [layout] [db] [tag] [m] [ef_construction] [dim]
 #
 #   label            free-text tag recorded in the CSV row
 #   layout           storage_layout (default plain)
 #   db               database (default t100kdb, see local_dataset.sql)
-#   n                table tag: table is t<n>, ground truth gt_<n> (default 100k)
+#   tag              dataset tag: table t<tag>, ground truth gt_<tag>,
+#                    queries bench_queries_<dim> (default 100k; use e.g.
+#                    100kd128 for the dim 128 kernel datasets)
 #   m / efc          index parameters (default 16 / 64)
+#   dim              query-table dimension (default 16)
 #
 # What it guarantees (each of these bit us before):
+#   * the installed extension is a RELEASE build — `cargo pgrx test` overwrites
+#     the installed .so with a debug one, which silently makes every build ~25x
+#     slower (this invalidated a whole analysis pass once);
 #   * stale CREATE INDEX backends are killed by PID before the run, so a
 #     leftover build cannot silently double the wall clock;
 #   * the index is dropped and recreated, so page reuse cannot skew the build;
@@ -25,9 +31,10 @@ set -uo pipefail
 LABEL="${1:?label}"
 LAYOUT="${2:-plain}"
 DB="${3:-t100kdb}"
-N="${4:-100k}"
+TAG="${4:-100k}"
 M="${5:-16}"
 EFC="${6:-64}"
+DIM="${7:-16}"
 
 PORT="${PGPORT:-54331}"
 USER="${PGUSER:-$USER}"
@@ -45,8 +52,9 @@ EF_SWEEP="${HNSWSQ_EF_SWEEP:-10 40 160 640}"
 OUT_CSV="${OUT_CSV:-/tmp/hnswsq_local_cycle.csv}"
 LOG="${LOG:-/tmp/hnswsq_local_$(date +%Y%m%d_%H%M%S)_${LABEL}.log}"
 
-TABLE="t${N}"
-GT="gt_${N}"
+TABLE="t${TAG}"
+GT="gt_${TAG}"
+QT="bench_queries_${DIM}"
 IDX="${TABLE}_idx"
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -54,14 +62,28 @@ q() { "$PSQL" -h 127.0.0.1 -p "$PORT" -U "$USER" -d "$DB" -X -q -v ON_ERROR_STOP
 qn() { "$PSQL" -h 127.0.0.1 -p "$PORT" -U "$USER" -d "$DB" -X -q -At -v ON_ERROR_STOP=1 "$@"; }
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 
-log "local cycle start label=$LABEL db=$DB table=$TABLE layout=$LAYOUT m=$M efc=$EFC"
+log "local cycle start label=$LABEL db=$DB table=$TABLE dim=$DIM layout=$LAYOUT m=$M efc=$EFC"
+
+# ---- 0. the extension must be a release build ------------------------------
+SO=$(ls "$(dirname "$PSQL")/../lib/postgresql"*/vectorscale-*.so 2>/dev/null \
+     || ls "$(dirname "$PSQL")/../lib/postgresql"*/vectorscale-*.dylib 2>/dev/null \
+     || true)
+if [ -n "$SO" ]; then
+    SO_MB=$(( $(stat -f %z "$SO" 2>/dev/null || stat -c %s "$SO") / 1048576 ))
+    log "installed extension: $SO (${SO_MB}MB)"
+    if [ "$SO_MB" -gt 3 ]; then
+        log "FATAL: that looks like a debug build; reinstall with:"
+        log "  cargo pgrx install --release --pg-config $PGBIN/pg_config --no-default-features --features pg18"
+        exit 1
+    fi
+fi
 
 ROWS=$(qn -c "SELECT count(*) FROM $TABLE;" 2>/dev/null)
 GT_ROWS=$(qn -c "SELECT count(*) FROM $GT;" 2>/dev/null)
-QROWS=$(qn -c "SELECT count(*) FROM bench_queries;" 2>/dev/null)
+QROWS=$(qn -c "SELECT count(*) FROM $QT;" 2>/dev/null)
 log "dataset rows=$ROWS gt=$GT_ROWS queries=$QROWS"
 if [ -z "${ROWS:-}" ] || [ "$ROWS" = "0" ]; then
-    log "FATAL: table $TABLE is missing or empty (run local_dataset.sql)"
+    log "FATAL: table $TABLE is missing or empty (run local_dataset.sh $TAG $DB <queries> <clusters> $DIM)"
     exit 1
 fi
 
@@ -98,8 +120,8 @@ SIZE=$(qn -c "SELECT pg_relation_size('$IDX');")
 q -f "$BENCH_DIR/local_sweep.sql" >>"$LOG" 2>&1
 EF_ARRAY=$(echo "$EF_SWEEP" | tr ' ' ',')
 SWEEP=$(qn -c "SELECT string_agg(format('ef=%s recall=%s p50=%sms p99=%sms', ef, recall, p50_ms, p99_ms), ' | ')
-                FROM bench_sweep(ARRAY[$EF_ARRAY]);" 2>/dev/null)
+                FROM bench_sweep('$TABLE', '$GT', '$QT', ARRAY[$EF_ARRAY]);" 2>/dev/null)
 log "sweep: $SWEEP"
 
-echo "$LABEL,$LAYOUT,$N,$M,$EFC,$BUILD_S,$SIZE,${STATS:-},${SWEEP:-}" >>"$OUT_CSV"
+echo "$LABEL,$LAYOUT,$TAG,dim$DIM,$M,$EFC,$BUILD_S,$SIZE,${STATS:-},${SWEEP:-}" >>"$OUT_CSV"
 log "csv row appended to $OUT_CSV; log $LOG"
