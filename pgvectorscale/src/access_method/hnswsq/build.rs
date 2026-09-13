@@ -25,8 +25,8 @@ use rand::{Rng, SeedableRng};
 
 use crate::access_method::distance::{preprocess_cosine, DistanceFn, DistanceType};
 use crate::access_method::hnswsq::graph::{
-    distance_encoded, greedy_descent, random_level, search_layer, GraphAccess, HeapItem, SearchHit,
-    VisitData,
+    distance_encoded, greedy_descent, random_level, search_layer, ExpandResult, GraphAccess,
+    HeapItem, ProbeResult, SearchHit, VisitData,
 };
 use crate::access_method::hnswsq::insert::{codec_for, insert_vector, InsertCtx};
 use crate::access_method::hnswsq::meta_page::HnswMetaPage;
@@ -138,11 +138,43 @@ impl GraphAccess for MemGraph {
                 .and_then(|n| n.get(layer))
                 .cloned()
                 .unwrap_or_default(),
+            heap_tid: *self.tids.get(i)?,
+            clamped: *self.clamped.get(i)?,
         })
     }
 
     fn vector(&self, id: u32) -> Option<Vec<u8>> {
         self.vectors.get(id as usize).cloned()
+    }
+
+    /// Borrowed probe: no copy, no allocation (the graph lives in RAM).
+    fn probe(
+        &self,
+        id: u32,
+        query: &[f32],
+        codec: &Codec,
+        dist_type: DistanceType,
+    ) -> Option<ProbeResult> {
+        let i = id as usize;
+        Some(ProbeResult {
+            dist: distance_encoded(codec, dist_type, query, self.vectors.get(i)?),
+            deleted: false,
+            heap_tid: *self.tids.get(i)?,
+            clamped: *self.clamped.get(i)?,
+        })
+    }
+
+    /// Borrowed expansion into the caller's buffer.
+    fn expand(&self, id: u32, layer: usize, out: &mut Vec<u32>) -> Option<ExpandResult> {
+        let i = id as usize;
+        out.clear();
+        if let Some(list) = self.neighbors.get(i).and_then(|n| n.get(layer)) {
+            out.extend_from_slice(list);
+        }
+        Some(ExpandResult {
+            level: *self.levels.get(i)?,
+            deleted: false,
+        })
     }
 }
 
@@ -584,15 +616,22 @@ fn search_layer_mem(
             continue;
         }
         visited_epoch[i] = epoch;
+        // The build graph never emits heap TIDs (nothing to scan there), so the
+        // emission metadata is a placeholder: keeping it out of this loop's
+        // memory traffic matters more than filling it in.
         candidates.push(std::cmp::Reverse(HeapItem {
             dist: d,
             id,
             deleted: false,
+            heap_tid: ItemPointer::new_invalid(),
+            clamped: false,
         }));
         results.push(HeapItem {
             dist: d,
             id,
             deleted: false,
+            heap_tid: ItemPointer::new_invalid(),
+            clamped: false,
         });
     }
 
@@ -629,6 +668,8 @@ fn search_layer_mem(
                 dist: d,
                 id: nb,
                 deleted: false,
+                heap_tid: ItemPointer::new_invalid(),
+                clamped: false,
             };
             candidates.push(std::cmp::Reverse(item.clone()));
             if results.len() < ef {
@@ -649,6 +690,8 @@ fn search_layer_mem(
             dist: i.dist,
             id: i.id,
             deleted: false,
+            heap_tid: i.heap_tid,
+            clamped: i.clamped,
         })
         .collect()
 }

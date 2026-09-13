@@ -22,7 +22,7 @@ use pgrx::PgRelation;
 use rand::Rng;
 
 use crate::access_method::distance::DistanceType;
-use crate::access_method::hnswsq::node::load_node_view;
+use crate::access_method::hnswsq::node::{expand_node, load_node_view, probe_node};
 use crate::access_method::hnswsq::quantize::Codec;
 use crate::util::ItemPointer;
 
@@ -35,6 +35,11 @@ pub struct VisitData<Id> {
     /// Valid neighbor prefix at the requested layer (empty when the node has
     /// no such layer or is missing).
     pub neighbors: Vec<Id>,
+    /// Heap TID (Invalid for the in-memory build graph, which has no heap TIDs
+    /// of its own to emit).
+    pub heap_tid: ItemPointer,
+    /// Whether encoding this node's vector clamped a component.
+    pub clamped: bool,
 }
 
 /// Node store abstraction for the HNSW algorithms.
@@ -45,12 +50,75 @@ pub struct VisitData<Id> {
 pub trait GraphAccess {
     type Id: Copy + Eq + std::hash::Hash + Ord + std::fmt::Debug;
 
-    /// Load `id`'s vector + neighbor list at `layer`.
+    /// Load `id`'s vector + neighbor list at `layer` (copying: cold paths).
     fn visit(&self, id: Self::Id, layer: usize) -> Option<VisitData<Self::Id>>;
 
     /// Load just `id`'s encoded vector (used for pairwise distances in
     /// neighbor selection).
     fn vector(&self, id: Self::Id) -> Option<Vec<u8>>;
+
+    /// Distance from `query` to `id`'s stored vector, evaluated while the node
+    /// is loaded, plus the metadata needed to emit the node later (heap TID,
+    /// tombstone flag, quantization clamp flag).
+    ///
+    /// The default implementation goes through [`GraphAccess::visit`]; the
+    /// on-disk graph overrides it to compute straight out of the pinned page —
+    /// no per-hop `Vec` allocation, no vector copy — which is what the search's
+    /// inner loop needs (it probes every discovered neighbour).
+    fn probe(
+        &self,
+        id: Self::Id,
+        query: &[f32],
+        codec: &Codec,
+        dist_type: DistanceType,
+    ) -> Option<ProbeResult> {
+        let vd = self.visit(id, 0)?;
+        Some(ProbeResult {
+            dist: distance_encoded(codec, dist_type, query, &vd.encoded),
+            deleted: vd.deleted,
+            heap_tid: vd.heap_tid,
+            clamped: vd.clamped,
+        })
+    }
+
+    /// Copy `id`'s valid neighbor prefix at `layer` into `out` (a caller-owned
+    /// buffer reused across hops) and report its level.
+    ///
+    /// The default implementation goes through [`GraphAccess::visit`].
+    fn expand(
+        &self,
+        id: Self::Id,
+        layer: usize,
+        out: &mut Vec<Self::Id>,
+    ) -> Option<ExpandResult> {
+        let vd = self.visit(id, layer)?;
+        out.clear();
+        out.extend_from_slice(&vd.neighbors);
+        Some(ExpandResult {
+            level: vd.level,
+            deleted: vd.deleted,
+        })
+    }
+}
+
+/// Result of [`GraphAccess::probe`].
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeResult {
+    pub dist: f32,
+    /// Tombstone flag (tombstones route but never occupy a result slot).
+    pub deleted: bool,
+    /// Heap TID of the node, so a scan can emit it without loading it again.
+    pub heap_tid: ItemPointer,
+    /// Whether encoding this node's vector clamped a component (the scan then
+    /// cannot prove a finite lower bound).
+    pub clamped: bool,
+}
+
+/// Result of [`GraphAccess::expand`].
+#[derive(Clone, Copy, Debug)]
+pub struct ExpandResult {
+    pub level: u8,
+    pub deleted: bool,
 }
 
 /// On-disk accessor: ids are node `ItemPointer`s, loads go through
@@ -70,11 +138,44 @@ impl GraphAccess for DiskGraph<'_> {
             deleted: view.deleted,
             encoded: view.vector,
             neighbors: view.neighbors.get(layer).cloned().unwrap_or_default(),
+            heap_tid: view.heap_tid,
+            clamped: view.clamped,
         })
     }
 
     fn vector(&self, id: Self::Id) -> Option<Vec<u8>> {
         Some(load_node_view(self.index, id)?.vector)
+    }
+
+    /// Evaluate the distance out of the pinned page: the node's vector is fed to
+    /// the distance kernel in place, so a probed neighbour costs one page read
+    /// and nothing else (the previous path copied the vector and the whole
+    /// neighbour list out of the page for every visited node, then cloned the
+    /// list again on expansion).
+    fn probe(
+        &self,
+        id: Self::Id,
+        query: &[f32],
+        codec: &Codec,
+        dist_type: DistanceType,
+    ) -> Option<ProbeResult> {
+        let probed = probe_node(self.index, codec, dist_type, query, id)?;
+        Some(ProbeResult {
+            dist: probed.dist,
+            deleted: probed.deleted,
+            heap_tid: probed.heap_tid,
+            clamped: probed.clamped,
+        })
+    }
+
+    fn expand(
+        &self,
+        id: Self::Id,
+        layer: usize,
+        out: &mut Vec<Self::Id>,
+    ) -> Option<ExpandResult> {
+        let (level, deleted) = expand_node(self.index, id, layer, out)?;
+        Some(ExpandResult { level, deleted })
     }
 }
 
@@ -85,6 +186,10 @@ pub struct HeapItem<Id> {
     pub id: Id,
     /// Tombstone flag snapshot (does not participate in ordering).
     pub deleted: bool,
+    /// Heap TID + clamp flag snapshot, so a scan can emit a hit without
+    /// loading the node a second time (does not participate in ordering).
+    pub heap_tid: ItemPointer,
+    pub clamped: bool,
 }
 
 /// One search result: distance, node id, and whether the node is a tombstone.
@@ -95,6 +200,10 @@ pub struct SearchHit<Id> {
     pub dist: f32,
     pub id: Id,
     pub deleted: bool,
+    /// Heap TID of the node, carried from the load that produced the hit.
+    pub heap_tid: ItemPointer,
+    /// Whether encoding clamped a component (scan-side lower-bound input).
+    pub clamped: bool,
 }
 
 impl<Id: Ord> PartialEq for HeapItem<Id> {
@@ -156,35 +265,35 @@ pub fn search_layer<A: GraphAccess>(
 ) -> Vec<SearchHit<A::Id>> {
     let ef = ef.max(1);
     let mut visited: HashSet<A::Id> = HashSet::with_capacity(ef * 2);
-    // One load per visited node: the expansion of `cur` reuses the snapshot
-    // taken when `cur` was distance-evaluated.
-    let mut cache: HashMap<A::Id, VisitData<A::Id>> = HashMap::with_capacity(ef * 2);
     // min-heap of frontier candidates (includes tombstones)
     let mut candidates: BinaryHeap<std::cmp::Reverse<HeapItem<A::Id>>> = BinaryHeap::new();
     // max-heap of the ef best LIVE results
     let mut results: BinaryHeap<HeapItem<A::Id>> = BinaryHeap::new();
+    // Reused neighbour buffer: expansion copies the next node's list into it,
+    // so a whole search allocates nothing per hop (the old path kept a
+    // `HashMap<Id, VisitData>` of copied views and cloned the list again on
+    // every expansion — visible as 15.6% libc + 9.4% `Vec::from_iter` in the
+    // query profile).
+    let mut neighbors: Vec<A::Id> = Vec::with_capacity(64);
 
     for (d, id) in entries {
         if !visited.insert(id) {
             continue;
         }
-        // Snapshot the entry so its tombstone flag is known even when it is
-        // never expanded.
-        let deleted = match access.visit(id, layer) {
-            Some(vd) => {
-                let del = vd.deleted;
-                cache.insert(id, vd);
-                del
-            }
-            None => continue, // vanished entry
+        // Probe the entry so its tombstone flag is known even when it is never
+        // expanded, and so its heap TID can be emitted without a second load.
+        let Some(p) = access.probe(id, query, codec, dist_type) else {
+            continue; // vanished entry
         };
         let item = HeapItem {
             dist: d,
             id,
-            deleted,
+            deleted: p.deleted,
+            heap_tid: p.heap_tid,
+            clamped: p.clamped,
         };
         candidates.push(std::cmp::Reverse(item.clone()));
-        if !deleted {
+        if !p.deleted {
             results.push(item);
         }
     }
@@ -200,46 +309,27 @@ pub fn search_layer<A: GraphAccess>(
             }
         }
 
-        // Load (or reuse) the snapshot for `cur`.
-        if !cache.contains_key(&cur.id) {
-            match access.visit(cur.id, layer) {
-                Some(vd) => {
-                    cache.insert(cur.id, vd);
-                }
-                None => continue, // vanished id
-            }
+        // Copy this node's neighbour list at `layer` into the reused buffer.
+        if access.expand(cur.id, layer, &mut neighbors).is_none() {
+            continue; // vanished id
         }
-        let neighbors: Vec<A::Id> = match cache.get(&cur.id) {
-            Some(vd) => vd.neighbors.clone(),
-            None => continue,
-        };
 
-        for nb in neighbors {
+        for &nb in neighbors.iter() {
             if !visited.insert(nb) {
                 continue;
             }
-            if !cache.contains_key(&nb) {
-                match access.visit(nb, layer) {
-                    Some(vd) => {
-                        cache.insert(nb, vd);
-                    }
-                    None => continue,
-                }
-            }
-            let (d, deleted) = match cache.get(&nb) {
-                Some(vd) => (
-                    distance_encoded(codec, dist_type, query, &vd.encoded),
-                    vd.deleted,
-                ),
-                None => continue,
+            let Some(p) = access.probe(nb, query, codec, dist_type) else {
+                continue;
             };
             let item = HeapItem {
-                dist: d,
+                dist: p.dist,
                 id: nb,
-                deleted,
+                deleted: p.deleted,
+                heap_tid: p.heap_tid,
+                clamped: p.clamped,
             };
             candidates.push(std::cmp::Reverse(item.clone()));
-            if deleted {
+            if p.deleted {
                 // Tombstones route the search but never occupy a result slot.
                 continue;
             }
@@ -260,6 +350,8 @@ pub fn search_layer<A: GraphAccess>(
             dist: i.dist,
             id: i.id,
             deleted: i.deleted,
+            heap_tid: i.heap_tid,
+            clamped: i.clamped,
         })
         .collect()
 }
@@ -276,19 +368,19 @@ pub fn greedy_descent<A: GraphAccess>(
     to_layer: usize,
 ) -> (f32, A::Id) {
     let mut cur = entry;
+    let mut neighbors: Vec<A::Id> = Vec::with_capacity(64);
     for layer in (to_layer..=from_layer).rev() {
         loop {
-            let Some(vd) = access.visit(cur.1, layer) else {
+            if access.expand(cur.1, layer, &mut neighbors).is_none() {
                 break;
-            };
+            }
             let mut improved = false;
-            for nb in vd.neighbors {
-                let Some(enc) = access.vector(nb) else {
+            for &nb in neighbors.iter() {
+                let Some(p) = access.probe(nb, query, codec, dist_type) else {
                     continue;
                 };
-                let d = distance_encoded(codec, dist_type, query, &enc);
-                if d < cur.0 {
-                    cur = (d, nb);
+                if p.dist < cur.0 {
+                    cur = (p.dist, nb);
                     improved = true;
                 }
             }
@@ -407,6 +499,8 @@ mod tests {
                     .and_then(|n| n.get(layer))
                     .cloned()
                     .unwrap_or_default(),
+                heap_tid: ItemPointer::new_invalid(),
+                clamped: false,
             })
         }
         fn vector(&self, id: u32) -> Option<Vec<u8>> {

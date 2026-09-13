@@ -312,6 +312,35 @@ above:
 | 121.37.117.106 | x86_64 / 17.11 | 60 passed | 277 s |
 | 116.204.102.142 | aarch64 / 17.11 | 60 passed | 964 s |
 
+## Query-optimization round (P1/P2), local dim-128 gates
+
+Iteration dataset: `.design/neon/bench/local_dataset.sh 100kd128u t100kdb 200 0 128`
+(100k rows, **dim 128**, uniform in [0,1]^dim — the shape that keeps recall
+monotone; tight synthetic clusters collapse recall at any ef).  Baseline is
+reproducible to 1.4% (two runs: 30.14 s / 30.57 s build, identical counters,
+p50 within 0.2%), and `local_cycle.sh` now refuses to run against a debug `.so`.
+
+| step | build (s) | `search` (ms) | scan p50 ef 40 (ms) | ef 160 | ef 640 |
+|---|---|---|---|---|---|
+| baseline | 30.14 | 21 227 | 0.681 | 2.678 | 13.293 |
+| P1 lossless-layout distance kernel | **21.88** | **13 448** | 0.627 | 2.448 | 12.479 |
+| P2 in-page probe + allocation-free expansion | 21.34 | 13 621 | **0.269** | **1.004** | **5.764** |
+
+Recall is identical across the three (0.000/0.200/0.200/0.500 at ef 10/40/160/640
+on this hard synthetic set), i.e. P2 is a pure cost change and P1 (which changes
+summation order and therefore the graph in the last ulp) did not move it here.
+
+What P1 does: every branch of `Codec::distance_encoded_direct` is a counted
+`for i in 0..dim` loop, and for `plain` the stored bytes go to the SIMD kernels
+directly when the slice is 4-byte aligned (`Vec<u8>` copies fall back to
+unaligned counted loads).  The old `chunks_exact(..).map(..)` adapters were ~66%
+of a dim-128 build profile against 3.6% in the kernel they fed.
+
+What P2 does: `GraphAccess` gains `probe` (distance + heap TID + tombstone/clamp
+flags read while the page is pinned — no copy, no allocation) and `expand` (copy
+only the neighbour prefix into a caller-reused buffer).  `search_layer` drops its
+`HashMap<Id, VisitData>` cache entirely, so a search allocates nothing per hop.
+
 ## Next-round plan, driven by the measurements above
 
 Three measured facts set the order:

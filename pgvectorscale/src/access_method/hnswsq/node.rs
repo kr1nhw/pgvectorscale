@@ -24,6 +24,8 @@ use pgvectorscale_derive::{Readable, Writeable};
 use rkyv::vec::ArchivedVec;
 use rkyv::{Archive, Deserialize, Serialize};
 
+use crate::access_method::distance::DistanceType;
+use crate::access_method::hnswsq::quantize::Codec;
 use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::util::page::{PageType, ReadablePage, WritablePage, tsv_fresh_page_capacity};
 use crate::util::ports::{PageGetItem, PageGetItemId, PageGetMaxOffsetNumber};
@@ -251,6 +253,93 @@ pub fn load_node_view(index: &PgRelation, ptr: ItemPointer) -> Option<NodeView> 
             vector: node.vector.as_slice().to_vec(),
             neighbors,
         })
+    }
+}
+
+/// Result of [`probe_node`]: the distance to `query` plus the metadata a scan
+/// needs to emit the node later, all read while the page is pinned.
+pub struct ProbedNode {
+    pub dist: f32,
+    pub deleted: bool,
+    pub heap_tid: ItemPointer,
+    pub clamped: bool,
+}
+
+/// Distance from `query` to the node at `ptr`, computed **in place** from the
+/// pinned page: the stored vector bytes go straight to the distance kernel, so
+/// nothing is copied and nothing is allocated.
+///
+/// This is the search's inner loop (once per discovered neighbour).  It takes
+/// the page share lock for the duration of the call only — the single-lock rule
+/// holds — and returns `None` when the location no longer holds an `HnswNode`
+/// (recycled page), which callers treat as "node vanished".
+pub fn probe_node(
+    index: &PgRelation,
+    codec: &Codec,
+    dist_type: DistanceType,
+    query: &[f32],
+    ptr: ItemPointer,
+) -> Option<ProbedNode> {
+    if !ptr.is_valid() {
+        return None;
+    }
+    unsafe {
+        let page = ReadablePage::read(index, ptr.block_number);
+        if page.get_type() != PageType::HnswNode {
+            return None;
+        }
+        if ptr.offset == 0 || (ptr.offset as usize) > PageGetMaxOffsetNumber(*page) {
+            return None;
+        }
+        let item_id = PageGetItemId(*page, ptr.offset);
+        if (*item_id).lp_flags() != LP_NORMAL_FLAG || (*item_id).lp_len() == 0 {
+            return None;
+        }
+        let rb = page.get_item_unchecked(ptr.offset);
+        let node = rkyv::archived_root::<HnswNode>(rb.get_data_slice());
+        // Read everything we need out of the page in one go.
+        let dist = codec.distance_encoded_direct(dist_type, query, node.vector.as_slice());
+        Some(ProbedNode {
+            dist,
+            deleted: node.is_deleted(),
+            heap_tid: node.heap_tid.deserialize_item_pointer(),
+            clamped: node.clamped != 0,
+        })
+    }
+}
+
+/// Copy the node's valid neighbour prefix at `layer` into `out` (cleared
+/// first, capacity reused) and return `(level, deleted)`.
+///
+/// Expansion is much rarer than probing (once per popped candidate, not once per
+/// discovered neighbour), so this is where the neighbour list is materialised;
+/// the vector is not copied at all.
+pub fn expand_node(
+    index: &PgRelation,
+    ptr: ItemPointer,
+    layer: usize,
+    out: &mut Vec<ItemPointer>,
+) -> Option<(u8, bool)> {
+    out.clear();
+    if !ptr.is_valid() {
+        return None;
+    }
+    unsafe {
+        let page = ReadablePage::read(index, ptr.block_number);
+        if page.get_type() != PageType::HnswNode {
+            return None;
+        }
+        if ptr.offset == 0 || (ptr.offset as usize) > PageGetMaxOffsetNumber(*page) {
+            return None;
+        }
+        let item_id = PageGetItemId(*page, ptr.offset);
+        if (*item_id).lp_flags() != LP_NORMAL_FLAG || (*item_id).lp_len() == 0 {
+            return None;
+        }
+        let rb = page.get_item_unchecked(ptr.offset);
+        let node = rkyv::archived_root::<HnswNode>(rb.get_data_slice());
+        out.extend(node.iter_valid_neighbors(layer));
+        Some((node.level, node.is_deleted()))
     }
 }
 

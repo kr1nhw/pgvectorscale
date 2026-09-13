@@ -7,7 +7,10 @@
 #             (e.g. `100k` for dim 16 work, `100kd128` for dim 128 work)
 #   db        database name (default t100kdb)
 #   queries   number of query vectors (default 200 for n<=300k, else 100)
-#   clusters  number of clusters (default 200)
+#   clusters  number of clusters (default 200; **0 = uniform random** in [0,1],
+#             which is the shape that matches BIGANN and keeps recall meaningful
+#             at dim 128 — tight synthetic clusters make the true 10-NN
+#             neighbourhood so small that recall collapses at any ef)
 #   dim       vector dimension (default 16; 128 matches the BIGANN remote runs)
 #
 # Rows are spread evenly over `clusters` Gaussian-ish clusters; the shared
@@ -38,7 +41,11 @@ GT="gt_$TAG"
 QT="bench_queries_${DIM}"
 N="${TAG%%d*}"                      # rows, when the tag is `<rows>d<dim>`
 case "$N" in (*[!0-9]*|'') N=100000;; esac
-PER=$(( (N + CLUSTERS - 1) / CLUSTERS ))
+if [ "$CLUSTERS" -gt 0 ]; then
+    PER=$(( (N + CLUSTERS - 1) / CLUSTERS ))
+else
+    PER=0
+fi
 
 q() { "$PSQL" -h 127.0.0.1 -p "$PORT" -U "$USER" -d "$1" -X -q -v ON_ERROR_STOP=1 "${@:2}"; }
 
@@ -52,7 +59,19 @@ echo "loading $TABLE ($N rows, dim $DIM, $CLUSTERS clusters x $PER)"
 q "$DB" -c "DROP TABLE IF EXISTS $TABLE; DROP TABLE IF EXISTS $GT;"
 q "$DB" -c "CREATE TABLE $TABLE (id int PRIMARY KEY, embedding vector($DIM));"
 q "$DB" -c "SELECT setseed(0.42);"
-q "$DB" -c "
+if [ "$CLUSTERS" -eq 0 ]; then
+    # Uniform random in [0,1]^dim (BIGANN-like): no cluster structure.
+    # `random()` must be evaluated per (row, dimension): an uncorrelated scalar
+    # subquery would be treated as an InitPlan and give every row the same
+    # vector, so aggregate over an explicit dimension series instead.
+    q "$DB" -c "
+INSERT INTO $TABLE (id, embedding)
+SELECT i - 1, array_agg(random()::float4 ORDER BY j)::float4[]::vector($DIM)
+FROM generate_series(1, $N) i
+CROSS JOIN generate_series(1, $DIM) j
+GROUP BY i;"
+else
+    q "$DB" -c "
 WITH centers AS (
     SELECT g AS cid,
            (SELECT array_agg(random() * 2 - 1) FROM generate_series(1, $DIM)) AS c
@@ -63,6 +82,7 @@ SELECT (row_number() OVER ())::int - 1,
        (SELECT array_agg((c.c[j] + (random() - 0.5) * 0.05)::float4)
         FROM generate_series(1, $DIM) j)::float4[]::vector($DIM)
 FROM centers c, generate_series(1, $PER);"
+fi
 
 if ! "$PSQL" -h 127.0.0.1 -p "$PORT" -U "$USER" -d "$DB" -X -Atc \
         "SELECT count(*) FROM $TABLE" | grep -qx "$N"; then
@@ -74,7 +94,16 @@ if ! "$PSQL" -h 127.0.0.1 -p "$PORT" -U "$USER" -d "$DB" -X -Atc \
         "SELECT to_regclass('$QT')" | grep -q "$QT"; then
     q "$DB" -c "CREATE TABLE $QT (qid int PRIMARY KEY, q vector($DIM));"
 fi
-q "$DB" -c "
+if [ "$CLUSTERS" -eq 0 ]; then
+    q "$DB" -c "
+INSERT INTO $QT (qid, q)
+SELECT i - 1, array_agg(random()::float4 ORDER BY j)::float4[]::vector($DIM)
+FROM generate_series(1, $QUERIES) i
+CROSS JOIN generate_series(1, $DIM) j
+GROUP BY i
+ON CONFLICT (qid) DO NOTHING;"
+else
+    q "$DB" -c "
 WITH centers AS (
     SELECT g AS cid,
            (SELECT array_agg(random() * 2 - 1) FROM generate_series(1, $DIM)) AS c
@@ -86,6 +115,7 @@ SELECT (row_number() OVER ())::int - 1,
         FROM generate_series(1, $DIM) j)::float4[]::vector($DIM)
 FROM centers c
 ON CONFLICT (qid) DO NOTHING;"
+fi
 
 if ! "$PSQL" -h 127.0.0.1 -p "$PORT" -U "$USER" -d "$DB" -X -Atc \
         "SELECT to_regclass('$GT')" | grep -q "$GT"; then
