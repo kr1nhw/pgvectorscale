@@ -196,11 +196,16 @@ same recall at every ef).
 
 The scratch database holding the previous 100k/dim-16 dataset was dropped, so the
 old `35.8 s` figure is not comparable to these runs.  The dataset is now scripted
-and reproducible (`.design/neon/bench/local_dataset.sql`: 100k rows, dim 16, 200
-clusters x 500 rows, 200 queries + exact top-10), the harness pins
+and reproducible (`.design/neon/bench/local_dataset.sh` builds `t<tag>` /
+`gt_<tag>` / `bench_queries_<dim>` at any size *and dimension*: 100k rows, dim 16,
+200 clusters x 500 rows, 200 queries + exact top-10), the harness pins
 `hnswsq.build_seed = 20240912` (an unpinned build re-seeds from entropy, which
 moved recall@10 by up to 0.30 between runs), and `.design/neon/bench/local_cycle.sh`
-records build time + stats + recall sweep in one CSV row.
+records build time + stats + recall sweep in one CSV row.  Dimension matters:
+dim 16 hides the per-element decode cost that dominates a dim 128 build, so
+kernel work is measured on a `100kd128` tag.  Both cycle scripts now refuse to
+run against a debug `.so` (`cargo pgrx test` installs one over the release
+build, which silently made an earlier analysis pass ~25x slow).
 
 ### 100k, dim 16, m16/efc64, pinned seed — release profile
 
