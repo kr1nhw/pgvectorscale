@@ -358,9 +358,18 @@ impl Codec {
     /// Compute `distance(query, bytes)` directly over the encoded byte
     /// representation, without the decode-into-scratch copy.  Matches the
     /// semantics of the [`crate::access_method::distance`] kernels exactly:
-    /// L2 is the sum of squared differences (no sqrt — ordering only), inner
-    /// product is `Σ q·v`, cosine is `1 − Σ q·v` clamped at zero (inputs are
-    /// normalized).  This is the hottest routine of index builds and scans.
+    /// L2 is the sum of squared differences (no sqrt — ordering only), cosine is
+    /// `1 − Σ q·v` clamped at zero (inputs are normalized) and inner product is
+    /// the NEGATED dot (`<#>` ordering).  This is the hottest routine of index
+    /// builds and scans.
+    ///
+    /// Every branch is a counted `for i in 0..dim` loop: the previous
+    /// `chunks_exact(..).map(..)`/`enumerate()` iterator chains blocked
+    /// vectorization, and profiling a dim-128 build put ~66% of samples in those
+    /// adapters against 3.6% in the SIMD kernel they fed.  For the lossless
+    /// `plain` layout the stored bytes ARE little-endian IEEE f32, so when the
+    /// slice is 4-byte aligned (page items always are; `Vec<u8>` copies are not
+    /// guaranteed to be) the SIMD kernels consume them with no decode at all.
     #[inline]
     pub fn distance_encoded_direct(
         &self,
@@ -368,50 +377,108 @@ impl Codec {
         query: &[f32],
         bytes: &[u8],
     ) -> f32 {
+        use crate::access_method::distance as kernels;
         use crate::access_method::distance::DistanceType;
         debug_assert_eq!(query.len(), self.dim);
         debug_assert_eq!(bytes.len(), self.vector_bytes());
 
-        // Decode one element at a time via `get` (per-layout closure).
-        macro_rules! elem_loop {
-            ($get:expr) => {{
-                let mut acc = 0.0f32;
+        /// Apply the operator conventions shared by every layout: cosine is
+        /// `1 − dot` clamped at zero, inner product is the negated dot.
+        #[inline(always)]
+        fn finish(acc: f32, dist_type: DistanceType) -> f32 {
+            match dist_type {
+                DistanceType::Cosine => (1.0 - acc).max(0.0),
+                DistanceType::InnerProduct => -acc,
+                _ => acc,
+            }
+        }
+
+        let dim = self.dim;
+
+        if self.precision == HnswPrecision::Plain
+            && (bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>())
+        {
+            // SAFETY: the slice is `dim * 4` bytes (debug-asserted) and 4-byte
+            // aligned; every bit pattern is a valid `f32`.
+            let v: &[f32] =
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), dim) };
+            return match dist_type {
+                DistanceType::L2 => kernels::distance_l2(query, v),
+                DistanceType::Cosine => kernels::distance_cosine(query, v),
+                DistanceType::InnerProduct => kernels::distance_inner_product(query, v),
+                _ => kernels::distance_l2(query, v),
+            };
+        }
+
+        let mut acc = 0.0f32;
+        match self.precision {
+            HnswPrecision::Plain => {
+                // Unaligned copy (e.g. a `Vec<u8>` node buffer): unaligned loads
+                // in a counted loop, which vectorizes the same way.
+                let ptr = bytes.as_ptr().cast::<f32>();
                 match dist_type {
                     DistanceType::L2 => {
-                        for (i, v) in ($get).enumerate() {
-                            let d = query[i] - v;
+                        for i in 0..dim {
+                            // SAFETY: `i < dim` and the slice is `dim * 4` long.
+                            let x = unsafe { std::ptr::read_unaligned(ptr.add(i)) };
+                            let d = query[i] - x;
                             acc += d * d;
                         }
                     }
-                    DistanceType::InnerProduct | DistanceType::Cosine => {
-                        for (i, v) in ($get).enumerate() {
-                            acc += query[i] * v;
+                    _ => {
+                        for i in 0..dim {
+                            // SAFETY: as above.
+                            let x = unsafe { std::ptr::read_unaligned(ptr.add(i)) };
+                            acc += query[i] * x;
                         }
                     }
                 }
-                match dist_type {
-                    // `<#>` orders by the NEGATIVE inner product, matching
-                    // distance_inner_product.
-                    DistanceType::Cosine => (1.0 - acc).max(0.0),
-                    DistanceType::InnerProduct => -acc,
-                    _ => acc,
+            }
+            HnswPrecision::IeeeFp16 => match dist_type {
+                DistanceType::L2 => {
+                    for i in 0..dim {
+                        let x = f16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]).to_f32();
+                        let d = query[i] - x;
+                        acc += d * d;
+                    }
                 }
-            }};
+                _ => {
+                    for i in 0..dim {
+                        let x = f16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]).to_f32();
+                        acc += query[i] * x;
+                    }
+                }
+            },
+            HnswPrecision::IeeeFp8 => match dist_type {
+                DistanceType::L2 => {
+                    for i in 0..dim {
+                        let d = query[i] - e4m3_to_f32(bytes[i]);
+                        acc += d * d;
+                    }
+                }
+                _ => {
+                    for i in 0..dim {
+                        acc += query[i] * e4m3_to_f32(bytes[i]);
+                    }
+                }
+            },
+            HnswPrecision::Sq8 => match dist_type {
+                DistanceType::L2 => {
+                    for i in 0..dim {
+                        let x = self.sq8_mins[i] + bytes[i] as f32 * self.sq8_scales[i];
+                        let d = query[i] - x;
+                        acc += d * d;
+                    }
+                }
+                _ => {
+                    for i in 0..dim {
+                        let x = self.sq8_mins[i] + bytes[i] as f32 * self.sq8_scales[i];
+                        acc += query[i] * x;
+                    }
+                }
+            },
         }
-
-        match self.precision {
-            HnswPrecision::Plain => elem_loop!(bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))),
-            HnswPrecision::IeeeFp16 => elem_loop!(bytes
-                .chunks_exact(2)
-                .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())),
-            HnswPrecision::IeeeFp8 => elem_loop!(bytes.iter().map(|&b| e4m3_to_f32(b))),
-            HnswPrecision::Sq8 => elem_loop!(bytes
-                .iter()
-                .enumerate()
-                .map(|(d, &q)| self.sq8_mins[d] + q as f32 * self.sq8_scales[d])),
-        }
+        finish(acc, dist_type)
     }
 
     /// SQ8 only: `sqrt(Σ scale_d²)` — the L2 norm of the per-dimension
@@ -524,6 +591,112 @@ mod tests {
         (0..dim)
             .map(|d| ((seed * 31 + d * 17) % 2000) as f32 / 1000.0 - 1.0)
             .collect()
+    }
+
+    /// The decode-free distance path must agree with a plain scalar reference
+    /// for every layout and distance type, and the `plain` fast path (SIMD
+    /// kernels over the stored bytes) must agree with the unaligned fallback
+    /// (counted loop) — they differ only in summation order.
+    #[test]
+    fn test_distance_encoded_direct_matches_reference() {
+        use crate::access_method::distance::DistanceType;
+        let dim = 40usize;
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(7);
+        let q: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let v: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+
+        let reference = |dt: DistanceType| -> f32 {
+            match dt {
+                DistanceType::L2 => v
+                    .iter()
+                    .zip(q.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f32>(),
+                DistanceType::Cosine => {
+                    (1.0 - v.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f32>()).max(0.0)
+                }
+                DistanceType::InnerProduct => {
+                    -v.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f32>()
+                }
+            }
+        };
+
+        for precision in [
+            HnswPrecision::Plain,
+            HnswPrecision::IeeeFp16,
+            HnswPrecision::IeeeFp8,
+            HnswPrecision::Sq8,
+        ] {
+            let codec = match precision {
+                HnswPrecision::Sq8 => {
+                    let sample: Vec<Vec<f32>> = (0..64)
+                        .map(|_| (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect())
+                        .collect();
+                    Codec::new_sq8(&Sq8Calibration::train(&sample, dim))
+                }
+                _ => Codec::new(precision, dim),
+            };
+            let enc = codec.encode(&v);
+            let decoded: Vec<f32> = codec.decode(&enc);
+            for dt in [
+                DistanceType::L2,
+                DistanceType::Cosine,
+                DistanceType::InnerProduct,
+            ] {
+                let got = codec.distance_encoded_direct(dt, &q, &enc);
+                // Reference over the *decoded* vector: the codec may have
+                // changed it (quantization), and the distance is defined on the
+                // stored representation.
+                let want = match dt {
+                    DistanceType::L2 => decoded
+                        .iter()
+                        .zip(q.iter())
+                        .map(|(a, b)| (a - b) * (a - b))
+                        .sum::<f32>(),
+                    DistanceType::Cosine => (1.0
+                        - decoded.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f32>())
+                    .max(0.0),
+                    DistanceType::InnerProduct => {
+                        -decoded.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f32>()
+                    }
+                };
+                let tol = 1e-5 * (1.0 + want.abs());
+                assert!(
+                    (got - want).abs() <= tol,
+                    "{:?} {:?}: got {} want {} (decoded {:?})",
+                    precision,
+                    dt,
+                    got,
+                    want,
+                    &decoded[..3]
+                );
+            }
+        }
+
+        // plain: the aligned SIMD path and the unaligned counted loop agree.
+        let codec = Codec::new(HnswPrecision::Plain, dim);
+        let mut enc = codec.encode(&v);
+        for dt in [
+            DistanceType::L2,
+            DistanceType::Cosine,
+            DistanceType::InnerProduct,
+        ] {
+            let aligned = codec.distance_encoded_direct(dt, &q, &enc);
+            // Force the fallback: shift the slice so it cannot be 4-byte aligned.
+            let mut shifted = vec![0u8; enc.len() + 1];
+            shifted[1..].copy_from_slice(&enc);
+            assert_ne!(shifted[1..].as_ptr() as usize % 4, 0);
+            let unaligned = codec.distance_encoded_direct(dt, &q, &shifted[1..]);
+            assert!(
+                (aligned - unaligned).abs() <= 1e-5 * (1.0 + aligned.abs()),
+                "{:?}: aligned {} vs unaligned {}",
+                dt,
+                aligned,
+                unaligned
+            );
+        }
+        enc.clear();
+        let _ = reference; // the closure documents the reference formula
     }
 
     #[test]
