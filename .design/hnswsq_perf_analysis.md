@@ -354,6 +354,19 @@ dim-16 dataset (recall 1.0 at ef 160): the index returns the **identical order**
 to the exact seq-scan answer for every query checked, and the quantized layouts
 are unchanged (full suite green).
 
+### Round validation (P1-P3, 61-test suite)
+
+| host | arch / PG | result | time |
+|---|---|---|---|
+| local (dev Mac) | aarch64 / 18.4 | 61 passed | 345 s |
+| 113.44.106.182 | x86_64 / 17.11 | 61 passed | 265 s |
+| 121.37.117.106 | x86_64 / 17.11 | 61 passed | 264 s |
+| 116.204.102.142 | aarch64 / 17.11 | 61 passed | 946 s |
+
+(The 61st test is the new distance-kernel reference check; the extension was
+reinstalled in release on the local box and on 121 afterwards, since
+`cargo pgrx test` leaves a debug build installed.)
+
 ### Round status
 
 | phase | status | evidence |
