@@ -354,6 +354,32 @@ dim-16 dataset (recall 1.0 at ef 160): the index returns the **identical order**
 to the exact seq-scan answer for every query checked, and the quantized layouts
 are unchanged (full suite green).
 
+### Round status
+
+| phase | status | evidence |
+|---|---|---|
+| P0 harness (dim-128 dataset, release guard) | done | reproducibility 1.4% over two runs |
+| P1 distance kernel | done | remote build 538 s -> 352 s; local search 21.2 s -> 13.4 s |
+| P2 in-page probe / allocation-free expansion | done | local scan p50 ef 160 2.448 -> 1.004 ms |
+| P3 exact `plain` emission | done | remote p50 ef 640 14.046 -> 7.936 ms; local 5.76 -> 3.72 ms |
+| P4 page-header verify | **reverted** (no measurable gain) | see below |
+| P5 parallel build | **not attempted in this round** | see below |
+
+**P5 (parallel build) status.** The measured case for it is unchanged and now
+sharper: single-core build is 352 s against pgvector's 442 s on the same box (we
+are *faster* per core after P1), while pgvector's 4-worker build is 103 s — so the
+entire remaining build gap is worker count, worth ~3-4x.  It was not attempted in
+this round because it is a structural change (per-node `RwLock<MemNode>` over
+immutable-during-phase arenas, batched row buffering on the main thread,
+one-write-lock-at-a-time backlinks, `hnswsq.build_workers` default off) with its
+own recall/connectivity validation, and the earlier batched plan/apply attempt
+shows the failure mode it must avoid: a design in which a searching node cannot
+see in-flight inserts loses 20-40 points of recall.  The next session should
+start it from that constraint (Lance's per-node-lock model) and gate it on: 1M
+build at 4 workers <= 160 s with recall within 0.005, connectivity invariants
+(no node without an incoming layer-0 edge), and workers=1 remaining the default
+until that passes.
+
 ### P4 (page-header verify) — tried, no measurable gain, reverted
 
 The pre-P2 query profile attributed 9.5% of samples to
