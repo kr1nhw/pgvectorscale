@@ -354,6 +354,21 @@ dim-16 dataset (recall 1.0 at ef 160): the index returns the **identical order**
 to the exact seq-scan answer for every query checked, and the quantized layouts
 are unchanged (full suite green).
 
+### P4 (page-header verify) — tried, no measurable gain, reverted
+
+The pre-P2 query profile attributed 9.5% of samples to
+`TsvPageOpaqueData::read_from_page` (called once per page load).  Rewriting its
+`verify()` as two integer compares and marking the accessor `inline(always)`
+changed nothing measurable: build 22.32 s -> 22.64 s (noise), and the scan deltas
+were inside the local noise band (the dev machine carries a load average of ~3
+from the agent's own UI processes, which is ±20% at ef 640).  The function was
+already being inlined; what the profile saw is the *cache miss* on the page's
+special area, which inlining cannot remove.  Reverted rather than kept.
+
+Lesson for this harness: use the 20-30 s **build** as the sensitive metric for
+micro-changes and treat single-digit-percent scan deltas locally as noise —
+query-number acceptance belongs on the quiet remote box.
+
 ## Next-round plan, driven by the measurements above
 
 Three measured facts set the order:
