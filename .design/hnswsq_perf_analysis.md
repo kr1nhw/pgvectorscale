@@ -378,7 +378,9 @@ reinstalled in release on the local box and on 121 afterwards, since
 | P4 page-header verify | **reverted** (no measurable gain) | see below |
 | P5 parallel build | **not attempted in this round** | see below |
 
-**P5 (parallel build) status.** The measured case for it is unchanged and now
+**P5 (parallel build) status — see `.design/hnswsq_parallel_build_todos.md`** for
+the full TODO analysis (two candidate designs, the worker-by-worker work items,
+gates, open decisions and risk register). The measured case for it is unchanged and now
 sharper: single-core build is 352 s against pgvector's 442 s on the same box (we
 are *faster* per core after P1), while pgvector's 4-worker build is 103 s — so the
 entire remaining build gap is worker count, worth ~3-4x.  It was not attempted in
