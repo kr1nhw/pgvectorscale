@@ -248,6 +248,17 @@ study flagged as build CPU).
   performance-wise identical (assert an unchanged graph for a pinned seed, and no
   build-time regression at 100k/1M).
 
+## 4b. Deferred to future testing
+
+The refinement "decide every eviction by measuring distances, with no cached
+`list_dists`/`list_masks` anywhere" is recorded as an **unscheduled** idea in
+`.design/future/hnswsq_backlink_measure_on_demand.md` (with its gains, costs, the
+three-configuration micro-benchmark that would settle it and its acceptance
+criteria).  It is not part of this plan: T6's decided policy is ids-only
+append/shrink, which already removes the metadata from the arena, and the
+measure-on-demand question is whether the *single-backend* path should follow
+later.
+
 ## 5. Open decisions
 
 1. **Design A vs B** — recommend A (§2).
