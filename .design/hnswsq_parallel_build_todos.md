@@ -125,11 +125,62 @@ cheaper but drops edges.  *Gate:* the connectivity invariant (no node without an
 incoming layer-0 edge) and recall within 0.005 of sequential at workers 1/2/4/8 in
 the in-memory harness.
 
-**T6 — Backlink policy under concurrency (M).**  The exact incremental re-prune
-needs `list_dists` + `list_masks` in the arena (~8-12 bytes per list entry at
-1M ≈ tens of MB); pgvector instead appends and repairs only on overflow.  Measure
-both in the arena: recall delta and build time.  *Gate:* documented decision with
-numbers; the single-backend path keeps the exact policy regardless.
+**T6 — Backlink policy under concurrency — DECIDED: pgvector's append/shrink
+policy, in the arena/parallel path only (M).**
+
+Exact algorithm (read from `hnswutils.c:HnswUpdateConnection`, which the insert
+path calls per selected neighbour from `hnswinsert.c:441`; note this is *not* the
+"replace the farthest" shortcut one might expect):
+
+```
+arena_backlink(target, x, layer, cap, d_self):
+    lock target for write (the only lock held; d_self computed before locking)
+    if target.list.len < cap:
+        append (x, d_self)                      # O(1), the common case
+    else:
+        candidates = target.list ∪ {(x, d_self)}
+        pruned     = SelectNeighbors(candidates, cap)   # the SAME diversification
+                                                        # heuristic we run, with a
+                                                        # reusable closer-set bitset
+        replace the entry equal to `pruned` with x      # in place, list stays full
+    unlock
+```
+No version/retry is needed in the arena: with a per-node write lock the
+read-modify-write is atomic, and the only input that needs the lock is the list
+itself (`d_self` is precomputed from the two vectors).  Dedup check (never link a
+node to itself, never append a duplicate) is an assertion.
+
+Consequences (what changes in T1/T5):
+* the arena slabs hold **ids only** — no `list_dists`, no `list_masks`, so ≈150 MB
+  of the 1M arena disappears and the slab layout is just `[u32; cap] + len`;
+* `arena_apply` becomes: publish own list, then one target lock at a time, append
+  or shrink-and-replace — no extras bookkeeping, no merged-list sort, no masks to
+  maintain across revisions;
+* the policy needs the target's *current* distances only when it is full, which is
+  where the precomputed `d_self` plus per-neighbour distances come from the same
+  probe path the search already uses.
+
+Measured cost of the decision (sequential, single-backend, so it is the policy
+alone): 99.3% vs 98.9% recall@10 at ef 160 on 1M BIGANN, and the low-ef effect is
+sharper (0.508 vs 0.800 at ef 40 in the dim-16 ranked-mode A/B).  Cause: while a
+list is *unsaturated* pgvector's list is "the first M arrivals", not the
+heuristic's diversified set; the heuristic only runs on overflow.  Acceptance
+therefore splits in two:
+
+1. **Policy cost** (recorded, not a pass/fail): parallel-path policy vs today's
+   exact policy at 1 worker, recall sweep at 100k and 1M — expect a few tenths of
+   a point at low/mid ef.
+2. **Concurrency cost** (the gate): workers 1/2/4/8 with the *same* policy must
+   agree within 0.005 recall, with zero nodes lacking an incoming layer-0 edge.
+
+The single-backend path keeps the exact incremental re-prune (it is today's
+shipped behaviour, it is better, and the acceptance in §1 requires `workers = 0`
+to be untouched).  That leaves three recorded policies — exact (default
+single-backend), pgvector append/shrink (arena/parallel), Lance ranked/cutoff
+(`hnswsq.build_backlink_mode = 0`, measured slower and lower recall twice) — so
+T10 must document which applies when.  Unifying the single-backend path onto the
+arena + append/shrink later is a separate decision to take on measurement, not a
+prerequisite.
 
 **T7 — Writeout, spill and failure paths (M).**  Leader does
 `WaitForParallelWorkersToFinish`, then the *existing* `flush_mem_graph` +
