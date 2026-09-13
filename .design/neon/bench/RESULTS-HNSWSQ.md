@@ -42,6 +42,30 @@ measured at ~170 nodes/s (interrupted at 48 min ≈ 97 min projected for 1M, and
 that was the *debug* profile); the current release build is 11x faster, and the
 remaining 76% is the graph search, which is what a parallel build would attack.
 
+## Query path after the P1-P3 optimizations (same table, same box, same session)
+
+The gap study located the query gap in per-hop memory work (not distance
+arithmetic), so the query path was reworked (`.design/hnswsq_perf_analysis.md`,
+"Query-optimization round"): in-page distance probes with allocation-free
+expansion, a counted-loop/SIMD distance kernel for the lossless layout, and — for
+`plain` only — exact distances with `xs_recheckorderby = false` plus no second
+load per emitted candidate.
+
+| ef | recall@10 (before = after) | hnswsq p50 before | hnswsq p50 after | pgvector p50 |
+|---|---|---|---|---|
+| 10 | 78.50 | 1.033 ms | **0.742 ms** | 0.655 ms |
+| 20 | 87.30 | 1.374 ms | **0.920 ms** | 0.824 ms |
+| 40 | 94.30 | 1.969 ms | **1.242 ms** | 1.056 ms |
+| 80 | 97.70 | 2.929 ms | **1.800 ms** | 1.577 ms |
+| 160 | 99.40 | 4.795 ms | **2.864 ms** | 2.520 ms |
+| 320 | 100.00 | 8.084 ms | **4.604 ms** | 4.146 ms |
+| 640 | 100.00 | 14.046 ms | **7.936 ms** | 7.013 ms |
+
+Recall is bit-identical before/after at every ef (same build seed), and the
+latency ratio to pgvector went from 1.56-1.92x to **1.11-1.18x**.  The build also
+dropped from 538 s to **352 s** (1.53x; the search phase alone 389.9 s -> 228.3 s)
+with the same index size.
+
 ## Recall@10 and latency sweep (ef_search 10..640)
 
 | ef | pgvector recall | pgvector p50 ms | hnswsq recall | hnswsq p50 ms | hnswsq p99 ms |

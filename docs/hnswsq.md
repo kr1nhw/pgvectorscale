@@ -236,13 +236,18 @@ revision before it (details, counters and A/B tables in
   backlink admission).
 
 Measured builds (`m=16`, `ef_construction=64`, `maintenance_work_mem=2GB`,
-release profile, single-threaded, pinned build seed, 200-cluster dim-16 data):
+release profile, single-threaded, pinned build seed, 200-cluster dim-16 data;
+dim 128 dominates the decode cost, see the 1M row):
 
 | rows | wall | search | backlink admission | selection | flush |
 |---|---|---|---|---|---|
 | 100k | 12.5 s | 6.07 s | 4.96 s | 0.32 s | 0.38 s |
 | 300k | 45.4 s | 25.4 s | 15.2 s | 0.97 s | 0.77 s |
 | 1M | 183 s | 110 s | 51 s | 3.3 s | 3.5 s |
+
+and on 1M BIGANN (dim 128, 32-vCPU cloud box, release) the same build went from
+538 s to **352 s** once the distance path stopped decoding element-by-element
+(`search` 389.9 s -> 228.3 s).
 
 For calibration: the same 100k build took 36.3 s before the decode-once buffer
 and 439 s in a debug build.  **Always benchmark a release build**: `cargo pgrx
