@@ -1,4 +1,4 @@
-//! hnswsq2 core types — the Rust translation of pgvector's `hnsw.h`.
+//! hnswsq core types — the Rust translation of pgvector's `hnsw.h`.
 //!
 //! `repr(C)` for everything that crosses shared memory or disk (graph state,
 //! elements, neighbor arrays, metapage, page opaque, element/neighbor tuples);
@@ -24,7 +24,7 @@ use pgrx::pg_sys;
 
 use crate::access_method::distance::DistanceType;
 use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision};
-use crate::access_method::hnswsq2::ptr::HnswPtr;
+use crate::access_method::hnswsq::ptr::HnswPtr;
 
 // ---------------------------------------------------------------------------
 // Constants (pgvector hnsw.h, renamed for the port)
@@ -32,11 +32,11 @@ use crate::access_method::hnswsq2::ptr::HnswPtr;
 
 /// Metapage magic: "HNS2" — distinguishes the port's format from the retired
 /// rkyv engine ("HNSQ") so old indexes fail with a clear error.
-pub const HNSW2_MAGIC: u32 = 0x484E_5332;
+pub const HNSW_MAGIC: u32 = 0x484E_5332;
 /// On-disk format version.
-pub const HNSW2_VERSION: u32 = 1;
+pub const HNSW_VERSION: u32 = 1;
 /// Page special-area id, same value pgvector uses.
-pub const HNSW2_PAGE_ID: u16 = 0xFF90;
+pub const HNSW_PAGE_ID: u16 = 0xFF90;
 
 pub const METAPAGE_BLKNO: pg_sys::BlockNumber = 0;
 pub const HEAD_BLKNO: pg_sys::BlockNumber = 1;
@@ -98,7 +98,7 @@ pub struct MetaPageData {
     pub calibration_offno: pg_sys::OffsetNumber,
 }
 
-/// pgvector's `HnswPageOpaqueData`: every non-metapage hnswsq2 page carries
+/// pgvector's `HnswPageOpaqueData`: every non-metapage hnswsq page carries
 /// this in its special area.
 #[repr(C)]
 pub struct PageOpaqueData {

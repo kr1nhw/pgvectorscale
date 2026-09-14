@@ -1,38 +1,22 @@
-//! hnswsq — HNSW access method with reduced-precision node storage.
+//! hnswsq — the pgvector-core port (see the module docs of each file).
 //!
-//! A multi-layer HNSW graph index over pgvector `vector` columns with four
-//! node-vector storage layouts: `plain` (f32), `ieeefp16` (IEEE binary16),
-//! `ieeefp8` (OCP FP8 E4M3) and `f8` (Lance-style trained SQ8).  The IEEE
-//! layouts are training-free, which makes them the incremental-build friendly
-//! choice; SQ8 calibrates per-dimension min/max at CREATE INDEX.
-//!
-//! Operational model (established by the IVF-RaBitQ work in this repo):
-//! - append-only node storage: nodes are written once and never moved;
-//!   bounded in-place mutations (neighbor slots, tombstone flags) are atomic
-//!   per page under exclusive content locks with GenericXLog WAL;
-//! - transactional: visibility is the executor's MVCC snapshot check on the
-//!   returned heap TIDs, ordering is rechecked exactly
-//!   (`xs_recheckorderby = true`);
-//! - autovacuum-ready: `ambulkdelete` tombstones + repairs + recycles pages,
-//!   `amvacuumcleanup` refreshs estimates;
-//! - pgvector-style concurrent inserts: no global writer lock, one content
-//!   lock at a time, two-phase optimistic neighbor updates.
+//! This module builds the new engine under its own access method name
+//! (`hnswsq`) so both engines coexist in one cluster for the A/B parity
+//! gates.  At retirement (gate 5) the module is renamed `hnswsq` in place,
+//! the AM/opclass SQL below is renamed accordingly, and the old engine is
+//! deleted.
 
-pub mod arena;
 pub mod build;
-pub mod driver;
-pub mod flat_engine;
-pub mod flat_graph;
-pub mod graph;
 pub mod insert;
-pub mod levels;
-pub mod meta_page;
-pub mod node;
 pub mod options;
+pub mod ptr;
 pub mod quantize;
 pub mod scan;
-mod tests;
+pub mod types;
+pub mod utils;
 pub mod vacuum;
+#[cfg(any(test, feature = "pg_test"))]
+mod tests;
 
 use pgrx::*;
 
@@ -40,61 +24,9 @@ use crate::access_method::distance::{
     distance_type_cosine, distance_type_inner_product, distance_type_l2,
 };
 
-/// Advisory-lock key serializing the hnswsq integration tests ACROSS
-/// backends.  pg_test bodies execute inside the pgrx framework's transaction
-/// in a server backend, so a process-local mutex cannot serialize them; an
-/// advisory lock can.  pg_tests take the key in transaction scope (released
-/// by the framework's rollback), the raw-client vacuum scaffolds hold it in
-/// session scope on a dedicated connection.  The mock pg_test must NOT take
-/// the lock (scaffolds invoke it while holding it).
-#[cfg(any(test, feature = "pg_test"))]
-pub(crate) const HNSW_SUITE_ADVISORY_KEY: i64 = 5_205_217_837_881_163_777;
-
-#[cfg(any(test, feature = "pg_test"))]
-pub(crate) fn lock_suite_for_test() {
-    // Raw SPI_execute (NOT pgrx's Spi::run/SpiClient): pgrx's SpiClient
-    // references PostgreSQL DATA symbols (SPI_processed/SPI_tuptable) that
-    // `-undefined dynamic_lookup` cannot defer on macOS, which crashes the
-    // unit-test binary at load time.  Function calls stay lazy.
-    use pgrx::pg_sys::AsPgCStr;
-    unsafe {
-        let query = "SELECT pg_advisory_xact_lock(5205217837881163777)";
-        if pg_sys::SPI_execute(query.as_pg_cstr(), false, 0) >= 0 {
-            pg_sys::SPI_finish();
-        }
-    }
-}
-
-/// Build RNG: entropy in production, or the pinned `hnswsq.build_seed` value
-/// (tests set it so builds — and recall assertions — are deterministic).
-/// The seed a build's *levels* are derived from, for the paths that key a level on the row
-/// rather than on draw order (`levels::level_for_tid`).
-///
-/// Entropy mode (`build_seed < 0`) has no seed to report, so one is drawn: the level RNG is
-/// still the entropy-seeded one, and the parallel path always pins a seed through
-/// `BuildParams`, so this is only a value for the field to hold.
-pub(crate) fn build_seed_value() -> u64 {
-    let seed = options::HNSWSQ_BUILD_SEED.get();
-    if seed < 0 {
-        rand::random::<u64>()
-    } else {
-        seed as u64
-    }
-}
-
-pub(crate) fn build_rng() -> rand::rngs::SmallRng {
-    use rand::SeedableRng;
-    let seed = options::HNSWSQ_BUILD_SEED.get();
-    if seed < 0 {
-        rand::rngs::SmallRng::from_entropy()
-    } else {
-        rand::rngs::SmallRng::seed_from_u64(seed as u64)
-    }
-}
-
 /// hnswsq access method support function numbers:
-///   1 = distance type function (matches the diskann/ivf convention)
-pub const HNSWSQ_DISTANCE_TYPE_PROC: u16 = 1;
+///   1 = distance type function (matches the diskann/ivf/hnswsq convention)
+pub const HNSW_DISTANCE_TYPE_PROC: u16 = 1;
 
 /// The main access method handler.
 #[pg_extern(sql = "
@@ -237,86 +169,287 @@ pub extern "C-unwind" fn hnswsq_validate(opclassoid: pg_sys::Oid) -> bool {
     true
 }
 
-/// Test-build-only index health diagnostic: walk the node pages and report
-/// live/tombstone counts plus directed layer-0 reachability from the entry
-/// point.  Exposed as SQL so raw-client tests can inspect vacuum outcomes.
+/// Test-build-only index health diagnostic: walk the graph pages and report
+/// element/neighbor tuple counts plus directed layer-0 reachability from the
+/// entry point.  Exposed as SQL so raw-client tests can inspect vacuum
+/// outcomes.
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_extern]
 fn hnswsq_diag(index: PgRelation) -> String {
-    use crate::access_method::hnswsq::meta_page::HnswMetaPage;
-    use crate::access_method::hnswsq::node::{load_node_view, HnswNode};
-    use crate::util::page::{PageType, ReadablePage};
+    use crate::access_method::hnswsq::types::*;
+    use crate::access_method::hnswsq::utils::*;
     use crate::util::ports::{PageGetItem, PageGetItemId, PageGetMaxOffsetNumber};
-    use crate::util::ItemPointer;
     use std::collections::{HashSet, VecDeque};
 
-    let index_rel = index;
-    let nblocks = unsafe {
-        pg_sys::RelationGetNumberOfBlocksInFork(
-            index_rel.as_ptr(),
-            pg_sys::ForkNumber::MAIN_FORKNUM,
-        )
-    };
+    let index_rel = index.as_ptr();
     let mut total = 0u64;
     let mut live = 0u64;
-    for block in 1..nblocks {
-        let page = unsafe { ReadablePage::read(&index_rel, block) };
-        if page.get_type() != PageType::HnswNode {
-            continue;
+    let mut deleted = 0u64;
+    let mut invalid_refs = 0u64;
+    let mut head = pg_sys::InvalidBlockNumber;
+    let mut entry = None;
+    unsafe {
+        let buf = pg_sys::ReadBuffer(index_rel, METAPAGE_BLKNO);
+        pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+        let page = pg_sys::BufferGetPage(buf);
+        let metap = page_get_meta(page);
+        head = (*metap).graph_head;
+        if (*metap).entry_blkno != pg_sys::InvalidBlockNumber {
+            entry = Some(crate::util::ItemPointer::new(
+                (*metap).entry_blkno,
+                (*metap).entry_offno,
+            ));
         }
-        let max_off = unsafe { PageGetMaxOffsetNumber(*page) };
-        for off in 1..=max_off {
-            let item_id = unsafe { PageGetItemId(*page, off as pg_sys::OffsetNumber) };
-            if unsafe { (*item_id).lp_flags() } != 1 || unsafe { (*item_id).lp_len() } == 0 {
-                continue;
+        pg_sys::UnlockReleaseBuffer(buf);
+    }
+
+    let mut blkno = head;
+    unsafe {
+        while blkno != pg_sys::InvalidBlockNumber {
+            let buf = pg_sys::ReadBuffer(index_rel, blkno);
+            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+            let page = pg_sys::BufferGetPage(buf);
+            let maxoff = PageGetMaxOffsetNumber(page);
+            for off in 1..=maxoff as pg_sys::OffsetNumber {
+                let item_id = PageGetItemId(page, off);
+                if (*item_id).lp_len() == 0 {
+                    continue;
+                }
+                let item = PageGetItem(page, item_id);
+                let tup = item.cast::<ElementTupleData>();
+                if (*tup).type_ == ELEMENT_TUPLE_TYPE {
+                    total += 1;
+                    if (*tup).deleted != 0 {
+                        deleted += 1;
+                    } else if pgrx::itemptr::item_pointer_get_block_number_no_check(
+                        (*tup).heaptid,
+                    ) != pg_sys::InvalidBlockNumber
+                    {
+                        live += 1;
+                    } else {
+                        invalid_refs += 1;
+                    }
+                }
             }
-            let item = unsafe { PageGetItem(*page, item_id) } as *const u8;
-            let len = unsafe { (*item_id).lp_len() } as usize;
-            let node =
-                unsafe { rkyv::archived_root::<HnswNode>(std::slice::from_raw_parts(item, len)) };
-            total += 1;
-            if !node.is_deleted() {
-                live += 1;
-            }
+            blkno = (*page_opaque(page)).nextblkno;
+            pg_sys::UnlockReleaseBuffer(buf);
         }
     }
-    let meta = HnswMetaPage::fetch(&index_rel);
-    let mut reach_total = 0u64;
-    let mut reach_live = 0u64;
-    if let Some(ep) = meta.get_entry_point() {
-        let mut seen: HashSet<ItemPointer> = HashSet::new();
-        let mut queue: VecDeque<ItemPointer> = VecDeque::new();
+
+    // Layer-0 reachability from the entry point (BFS over neighbor tuples).
+    let mut reach = 0u64;
+    let mut bad_tids = 0u64;
+    let mut nlists = 0u64;
+    let mut max_list = 0u64;
+    if let Some(ep) = entry {
+        let mut seen: HashSet<crate::util::ItemPointer> = HashSet::new();
+        let mut queue: VecDeque<crate::util::ItemPointer> = VecDeque::new();
         seen.insert(ep);
         queue.push_back(ep);
-        while let Some(p) = queue.pop_front() {
-            if let Some(v) = load_node_view(&index_rel, p) {
-                reach_total += 1;
-                if !v.deleted {
-                    reach_live += 1;
+        unsafe {
+            while let Some(p) = queue.pop_front() {
+                let mut elem = init_element_from_block(p.block_number, p.offset);
+                let support = init_support(index_rel);
+                let mut dist = 0.0f32;
+                let ok = load_element_impl(
+                    p.block_number,
+                    p.offset,
+                    Some(&mut dist),
+                    None,
+                    index_rel,
+                    &support,
+                    true,
+                    None,
+                    Some(&mut *elem),
+                    None,
+                );
+                if ok.is_none() {
+                    bad_tids += 1;
+                    continue;
                 }
-                for n in v.neighbors.first().cloned().unwrap_or_default() {
-                    if seen.insert(n) {
-                        queue.push_back(n);
+                reach += 1;
+                let mut tids = vec![pg_sys::ItemPointerData::default(); get_layer_m(
+                    get_m(index_rel),
+                    0,
+                )];
+                let m = get_m(index_rel);
+                if load_neighbor_tids(
+                    &mut *elem,
+                    &mut tids,
+                    index_rel,
+                    m,
+                    get_layer_m(m, 0),
+                    0,
+                ) {
+                    nlists += 1;
+                    let mut len = 0u64;
+                    for t in &tids {
+                        if pgrx::itemptr::item_pointer_get_block_number_no_check(*t)
+                            == pg_sys::InvalidBlockNumber
+                        {
+                            break;
+                        }
+                        len += 1;
+                        let np =
+                            crate::util::ItemPointer::new(ip_block(t), ip_offset(t));
+                        if seen.insert(np) {
+                            queue.push_back(np);
+                        }
                     }
+                    max_list = max_list.max(len);
                 }
             }
         }
     }
     format!(
-        "total={} live={} tomb={} reach_total={} reach_live={} entry_level={}",
+        "total={} live={} deleted={} invalid={} head={} entry={:?} reach={} bad_tids={} nlists={} max_list={}",
         total,
         live,
-        total - live,
-        reach_total,
-        reach_live,
-        meta.get_entry_level()
+        deleted,
+        invalid_refs,
+        head,
+        entry,
+        reach,
+        bad_tids,
+        nlists,
+        max_list
     )
 }
 
-/// Cost estimate: hnswsq only answers `ORDER BY <distance>` searches — without
-/// orderby keys it would return at most `ef_search` approximate candidates and
-/// could expose stale TIDs to index-only fetches, so refuse the estimate (the
-/// same guard the IVF AM uses).
+/// Test-build-only raw page dump: every element tuple's offset/heaptid/level
+/// and the first few neighbor TIDs of its layer-0 list.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_extern]
+fn hnswsq_dump(index: PgRelation) -> String {
+    use crate::access_method::hnswsq::types::*;
+    use crate::access_method::hnswsq::utils::*;
+    use crate::util::ports::{PageGetItem, PageGetItemId, PageGetMaxOffsetNumber};
+
+    let index_rel = index.as_ptr();
+    let mut out = String::new();
+    unsafe {
+        let mut head = pg_sys::InvalidBlockNumber;
+        {
+            let buf = pg_sys::ReadBuffer(index_rel, METAPAGE_BLKNO);
+            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+            let page = pg_sys::BufferGetPage(buf);
+            let metap = page_get_meta(page);
+            head = (*metap).graph_head;
+            out.push_str(&format!(
+                "meta: precision={} m={} ef={} dims={}\n",
+                (*metap).precision,
+                (*metap).m,
+                (*metap).ef_construction,
+                (*metap).dimensions
+            ));
+            pg_sys::UnlockReleaseBuffer(buf);
+        }
+        let mut blkno = head;
+        let support = init_support(index_rel);
+        let m = get_m(index_rel);
+        while blkno != pg_sys::InvalidBlockNumber {
+            let buf = pg_sys::ReadBuffer(index_rel, blkno);
+            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+            let page = pg_sys::BufferGetPage(buf);
+            let maxoff = PageGetMaxOffsetNumber(page);
+            for off in 1..=maxoff as pg_sys::OffsetNumber {
+                let item_id = PageGetItemId(page, off);
+                if (*item_id).lp_len() == 0 {
+                    continue;
+                }
+                let item = PageGetItem(page, item_id);
+                let tup = item.cast::<ElementTupleData>();
+                if (*tup).type_ == ELEMENT_TUPLE_TYPE {
+                    let hb = ip_block(&(*tup).heaptid);
+                    let ho = ip_offset(&(*tup).heaptid);
+                    // Version/count check status (the scan's guard).
+                    {
+                        let mut vt = init_element_from_block(blkno, off);
+                        load_element_from_tuple(
+                            &mut *vt,
+                            tup,
+                            false,
+                            false,
+                            support.codec.vector_bytes(),
+                        );
+                        let nbuf = pg_sys::ReadBuffer(index_rel, (*vt).neighbor_page);
+                        pg_sys::LockBuffer(nbuf, pg_sys::BUFFER_LOCK_SHARE as i32);
+                        let npage = pg_sys::BufferGetPage(nbuf);
+                        let nitem = PageGetItem(
+                            npage,
+                            PageGetItemId(npage, (*vt).neighbor_offno),
+                        )
+                        .cast::<NeighborTupleData>();
+                        if (*nitem).version != (*vt).version
+                            || (*nitem).count as usize
+                                != ((*vt).level as usize + 2) * m
+                        {
+                            out.push_str(&format!(
+                                "  VERSION/COUNT MISMATCH: elem_v={} ntup_v={} ntup_count={} expect={}\n",
+                                (*vt).version,
+                                (*nitem).version,
+                                (*nitem).count,
+                                ((*vt).level as usize + 2) * m
+                            ));
+                        }
+                        pg_sys::UnlockReleaseBuffer(nbuf);
+                    }
+                    // Read the neighbor tuple's layer-0 section.
+                    let mut elem = init_element_from_block(blkno, off);
+                    load_element_from_tuple(&mut *elem, tup, true, true, support.codec.vector_bytes());
+                    let mut tids = vec![pg_sys::ItemPointerData::default(); get_layer_m(m, 0)];
+                    let mut nids = String::from("-");
+                    if load_neighbor_tids(
+                        &mut *elem,
+                        &mut tids,
+                        index_rel,
+                        m,
+                        get_layer_m(m, 0),
+                        0,
+                    ) {
+                        let parts: Vec<String> = tids
+                            .iter()
+                            .take_while(|t| ip_block(t) != pg_sys::InvalidBlockNumber)
+                            .map(|t| format!("{}/{}", ip_block(t), ip_offset(t)))
+                            .collect();
+                        nids = parts.join(",");
+                    }
+                    out.push_str(&format!(
+                        "blk={} off={} heap={}/{} lvl={} np={}/{} n0=[{}]\n",
+                        blkno,
+                        off,
+                        hb,
+                        ho,
+                        (*tup).level,
+                        (*elem).neighbor_page,
+                        (*elem).neighbor_offno,
+                        nids
+                    ));
+                    // Raw first bytes of the element tuple's neighbor tuple
+                    // (debugging aid): header + first few tids as hex.
+                    if (*tup).level == 0 {
+                        let mut nt = init_element_from_block(blkno, off);
+                        load_element_from_tuple(&mut *nt, tup, false, false, support.codec.vector_bytes());
+                        let nbuf = pg_sys::ReadBuffer(index_rel, (*nt).neighbor_page);
+                        pg_sys::LockBuffer(nbuf, pg_sys::BUFFER_LOCK_SHARE as i32);
+                        let npage = pg_sys::BufferGetPage(nbuf);
+                        let nitem = PageGetItem(npage, PageGetItemId(npage, (*nt).neighbor_offno));
+                        let raw = std::slice::from_raw_parts(nitem, 4 + 6 * 8);
+                        out.push_str(&format!("  raw={:02x?}\n", &raw[..40]));
+                        pg_sys::UnlockReleaseBuffer(nbuf);
+                    }
+                }
+            }
+            blkno = (*page_opaque(page)).nextblkno;
+            pg_sys::UnlockReleaseBuffer(buf);
+        }
+    }
+    out
+}
+
+/// Cost estimate: hnswsq only answers `ORDER BY <distance>` searches —
+/// without orderby keys it would return at most `ef_search` approximate
+/// candidates, so refuse the estimate (the same guard the old AM uses).
 #[pg_guard(immutable, parallel_safe)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C-unwind" fn hnswsq_amcostestimate(
@@ -340,8 +473,6 @@ pub unsafe extern "C-unwind" fn hnswsq_amcostestimate(
         *index_pages = 1.0;
         #[cfg(feature = "pg18")]
         {
-            // Following pgvector's PG18+ cost-estimate change: mark the path
-            // disabled so the planner never picks it without ORDER BY.
             if !path.is_null() {
                 (*path).path.disabled_nodes = 2;
             }
@@ -351,7 +482,7 @@ pub unsafe extern "C-unwind" fn hnswsq_amcostestimate(
 
     // Rough model: a search visits ~ef_search nodes (random-ish page reads)
     // and the executor rechecks each candidate against the heap.
-    let ef = crate::access_method::hnswsq::options::HNSWSQ_EF_SEARCH.get() as f64;
+    let ef = options::HNSW_EF_SEARCH.get() as f64;
     let mut generic_costs = pg_sys::GenericCosts {
         numIndexTuples: ef,
         ..Default::default()

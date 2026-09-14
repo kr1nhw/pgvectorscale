@@ -1,4 +1,4 @@
-//! hnswsq2 algorithm core — the Rust translation of pgvector's `hnswutils.c`.
+//! hnswsq algorithm core — the Rust translation of pgvector's `hnswutils.c`.
 //!
 //! Function-for-function correspondence with the vendored reference
 //! (`.design/reference/pgvector/hnswutils.c`): search layer (Algorithm 2),
@@ -25,9 +25,9 @@ use pgrx::*;
 
 use crate::access_method::distance::{self as kernels, DistanceType};
 use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision, Sq8Calibration};
-use crate::access_method::hnswsq2::options::Hnsw2Options;
-use crate::access_method::hnswsq2::ptr::HnswPtr;
-use crate::access_method::hnswsq2::types::*;
+use crate::access_method::hnswsq::options::Hnsw2Options;
+use crate::access_method::hnswsq::ptr::HnswPtr;
+use crate::access_method::hnswsq::types::*;
 use crate::util::ports::{PageGetContents, PageGetItem, PageGetItemId, PageGetMaxOffsetNumber};
 
 // ---------------------------------------------------------------------------
@@ -92,7 +92,7 @@ pub unsafe fn get_sample_size(index: pg_sys::Relation) -> usize {
 pub unsafe fn resolve_distance_type(index: pg_sys::Relation) -> DistanceType {
     let fmgr_info = pg_sys::index_getprocinfo(index, 1, 1);
     if fmgr_info.is_null() {
-        error!("hnswsq2: no distance type function found for index");
+        error!("hnswsq: no distance type function found for index");
     }
     let result = pg_sys::FunctionCall0Coll(fmgr_info, pg_sys::InvalidOid).value() as u16;
     DistanceType::from_u16(result)
@@ -144,7 +144,7 @@ pub unsafe fn init_page(buf: pg_sys::Buffer, page: pg_sys::Page) {
     );
     let opaque = page_opaque(page);
     (*opaque).nextblkno = pg_sys::InvalidBlockNumber;
-    (*opaque).page_id = HNSW2_PAGE_ID;
+    (*opaque).page_id = HNSW_PAGE_ID;
 }
 
 /// `HnswPageGetOpaque`.
@@ -196,11 +196,11 @@ impl Allocator {
             Allocator::Shared { base, graph } => {
                 let aligned = pg_sys::MAXALIGN(size);
                 if aligned > 1024 * 1024 {
-                    error!("hnswsq2 allocation too large");
+                    error!("hnswsq allocation too large");
                 }
                 let new_used = (**graph).memory_used + aligned;
                 if new_used > (**graph).memory_total {
-                    error!("hnswsq2 allocator out of memory");
+                    error!("hnswsq allocator out of memory");
                 }
                 let chunk = (*base).add((**graph).memory_used);
                 (**graph).memory_used = new_used;
@@ -225,10 +225,10 @@ pub unsafe fn init_neighbors(base: *mut u8, element: *mut Element, m: usize, all
     let neighbor_list = allocator
         .alloc((level + 1) * std::mem::size_of::<HnswPtr>())
         .cast::<HnswPtr>();
-    crate::access_method::hnswsq2::ptr::store(base, &mut (*element).neighbors, neighbor_list);
+    crate::access_method::hnswsq::ptr::store(base, &mut (*element).neighbors, neighbor_list);
     for lc in 0..=level {
         let na = init_neighbor_array(get_layer_m(m, lc), allocator);
-        crate::access_method::hnswsq2::ptr::store(base, &mut *neighbor_list.add(lc), na);
+        crate::access_method::hnswsq::ptr::store(base, &mut *neighbor_list.add(lc), na);
     }
 }
 
@@ -240,8 +240,8 @@ pub unsafe fn init_neighbors(base: *mut u8, element: *mut Element, m: usize, all
 pub unsafe fn get_neighbors(base: *mut u8, element: *mut Element, lc: usize) -> *mut NeighborArray {
     debug_assert!((*element).level as usize >= lc);
     let neighbor_list =
-        crate::access_method::hnswsq2::ptr::access::<HnswPtr>(base, (*element).neighbors);
-    crate::access_method::hnswsq2::ptr::access::<NeighborArray>(base, *neighbor_list.add(lc))
+        crate::access_method::hnswsq::ptr::access::<HnswPtr>(base, (*element).neighbors);
+    crate::access_method::hnswsq::ptr::access::<NeighborArray>(base, *neighbor_list.add(lc))
 }
 
 /// `HnswGetValue`: the element's encoded vector bytes.
@@ -251,7 +251,7 @@ pub unsafe fn get_neighbors(base: *mut u8, element: *mut Element, lc: usize) -> 
 /// slice).
 #[inline]
 pub unsafe fn get_value(base: *mut u8, element: *mut Element, vec_bytes: usize) -> &'static [u8] {
-    let p = crate::access_method::hnswsq2::ptr::access::<u8>(base, (*element).value);
+    let p = crate::access_method::hnswsq::ptr::access::<u8>(base, (*element).value);
     if p.is_null() {
         &[]
     } else {
@@ -274,7 +274,7 @@ pub unsafe fn init_element(
 ) -> *mut Element {
     let element = allocator.alloc(std::mem::size_of::<Element>()).cast::<Element>();
     let element = &mut *element;
-    crate::access_method::hnswsq2::ptr::store(base, &mut element.next, std::ptr::null_mut::<u8>());
+    crate::access_method::hnswsq::ptr::store(base, &mut element.next, std::ptr::null_mut::<u8>());
     element.heaptid_set = 0;
     add_heap_tid(element, heaptid);
     element.level = level as u8;
@@ -284,7 +284,7 @@ pub unsafe fn init_element(
     element.version = 1;
     element.hash = 0;
     init_neighbors(base, element, m, allocator);
-    crate::access_method::hnswsq2::ptr::store(base, &mut element.value, std::ptr::null_mut::<u8>());
+    crate::access_method::hnswsq::ptr::store(base, &mut element.value, std::ptr::null_mut::<u8>());
     element
 }
 
@@ -334,9 +334,9 @@ pub unsafe fn get_meta_page_info(
     let page = pg_sys::BufferGetPage(buf);
     let metap = page_get_meta(page);
 
-    if metap.is_null() || (*metap).magic_number != HNSW2_MAGIC {
+    if metap.is_null() || (*metap).magic_number != HNSW_MAGIC {
         pg_sys::UnlockReleaseBuffer(buf);
-        error!("hnswsq2 index is not valid (bad magic)");
+        error!("hnswsq index is not valid (bad magic)");
     }
 
     if let Some(m) = m {
@@ -385,9 +385,9 @@ pub unsafe fn meta_page_layout(
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
     let page = pg_sys::BufferGetPage(buf);
     let metap = page_get_meta(page);
-    if (*metap).magic_number != HNSW2_MAGIC {
+    if (*metap).magic_number != HNSW_MAGIC {
         pg_sys::UnlockReleaseBuffer(buf);
-        error!("hnswsq2 index is not valid (bad magic)");
+        error!("hnswsq index is not valid (bad magic)");
     }
     let precision = HnswPrecision::from_u8((*metap).precision);
     let dimensions = (*metap).dimensions as usize;
@@ -471,8 +471,8 @@ pub unsafe fn create_meta_page(
     init_page(buf, page);
 
     let metap = page_get_meta(page);
-    (*metap).magic_number = HNSW2_MAGIC;
-    (*metap).version = HNSW2_VERSION;
+    (*metap).magic_number = HNSW_MAGIC;
+    (*metap).version = HNSW_VERSION;
     (*metap).dimensions = dimensions as u32;
     (*metap).m = m as u16;
     (*metap).ef_construction = ef_construction as u16;
@@ -572,7 +572,7 @@ pub unsafe fn set_neighbor_tuple(
             idx += 1;
             if i < (*neighbors).length as usize {
                 let hc = &*neighbor_items(neighbors).add(i);
-                let hce = crate::access_method::hnswsq2::ptr::access::<Element>(base, hc.element);
+                let hce = crate::access_method::hnswsq::ptr::access::<Element>(base, hc.element);
                 pgrx::itemptr::item_pointer_set_all(indextid, (*hce).blkno, (*hce).offno);
             } else {
                 pgrx::itemptr::item_pointer_set_all(
@@ -637,7 +637,7 @@ pub unsafe fn load_element_from_tuple(
             p,
             vec_bytes,
         );
-        crate::access_method::hnswsq2::ptr::store(std::ptr::null_mut(), &mut (*element).value, p);
+        crate::access_method::hnswsq::ptr::store(std::ptr::null_mut(), &mut (*element).value, p);
     }
 }
 
@@ -762,12 +762,12 @@ pub unsafe fn load_element(
 #[inline]
 pub unsafe fn candidate_key(base: *mut u8, index: Option<pg_sys::Relation>, hp: HnswPtr) -> u64 {
     if index.is_some() {
-        let e = crate::access_method::hnswsq2::ptr::access::<Element>(base, hp);
+        let e = crate::access_method::hnswsq::ptr::access::<Element>(base, hp);
         pack_tid(tid_of(&*e))
     } else if !base.is_null() {
-        crate::access_method::hnswsq2::ptr::offset(hp) as u64
+        crate::access_method::hnswsq::ptr::offset(hp) as u64
     } else {
-        crate::access_method::hnswsq2::ptr::pointer(hp) as u64
+        crate::access_method::hnswsq::ptr::pointer(hp) as u64
     }
 }
 
@@ -789,7 +789,7 @@ pub unsafe fn init_search_candidate(
     distance: f32,
 ) -> SearchCandidate {
     let mut hp = HnswPtr { ptr: std::ptr::null_mut() };
-    crate::access_method::hnswsq2::ptr::store(base, &mut hp, element);
+    crate::access_method::hnswsq::ptr::store(base, &mut hp, element);
     SearchCandidate {
         element: hp,
         distance,
@@ -873,16 +873,16 @@ pub unsafe fn add_to_visited(
     hp: HnswPtr,
 ) -> bool {
     if index.is_some() {
-        let e = crate::access_method::hnswsq2::ptr::access::<Element>(base, hp);
+        let e = crate::access_method::hnswsq::ptr::access::<Element>(base, hp);
         let key = pack_tid(tid_of(&*e));
         v.insert(key)
     } else if !base.is_null() {
-        let key = crate::access_method::hnswsq2::ptr::offset(hp) as u64;
-        let e = crate::access_method::hnswsq2::ptr::access::<Element>(base, hp);
+        let key = crate::access_method::hnswsq::ptr::offset(hp) as u64;
+        let e = crate::access_method::hnswsq::ptr::access::<Element>(base, hp);
         v.insert_key_hash(key, (*e).hash)
     } else {
-        let key = crate::access_method::hnswsq2::ptr::pointer(hp) as u64;
-        let e = crate::access_method::hnswsq2::ptr::access::<Element>(base, hp);
+        let key = crate::access_method::hnswsq::ptr::pointer(hp) as u64;
+        let e = crate::access_method::hnswsq::ptr::access::<Element>(base, hp);
         v.insert_key_hash(key, (*e).hash)
     }
 }
@@ -1079,7 +1079,7 @@ pub unsafe fn search_layer(
         furthest.push(FurthestItem(*sc));
 
         // Do not count elements being deleted towards ef when vacuuming
-        let e = crate::access_method::hnswsq2::ptr::access::<Element>(base, sc.element);
+        let e = crate::access_method::hnswsq::ptr::access::<Element>(base, sc.element);
         if count_element(skip_element, e) {
             wlen += 1;
         }
@@ -1098,7 +1098,7 @@ pub unsafe fn search_layer(
             break;
         }
 
-        let c_element = crate::access_method::hnswsq2::ptr::access::<Element>(base, c_sc.element);
+        let c_element = crate::access_method::hnswsq::ptr::access::<Element>(base, c_sc.element);
 
         match index {
             None => {
@@ -1138,7 +1138,7 @@ pub unsafe fn search_layer(
             let e_element: *mut Element;
             match (u, index) {
                 (Unvisited::Element(hp), None) => {
-                    e_element = crate::access_method::hnswsq2::ptr::access::<Element>(base, hp);
+                    e_element = crate::access_method::hnswsq::ptr::access::<Element>(base, hp);
                     e_distance = get_element_distance(base, e_element, q.unwrap_or(&[]), support);
                 }
                 (Unvisited::Tid(tid), Some(index)) => {
@@ -1228,11 +1228,11 @@ pub unsafe fn search_layer(
 fn compare_candidate_distances(base: *mut u8, a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     b.distance.total_cmp(&a.distance).then_with(|| {
         if base.is_null() {
-            crate::access_method::hnswsq2::ptr::pointer(a.element)
-                .cmp(&crate::access_method::hnswsq2::ptr::pointer(b.element))
+            crate::access_method::hnswsq::ptr::pointer(a.element)
+                .cmp(&crate::access_method::hnswsq::ptr::pointer(b.element))
         } else {
-            crate::access_method::hnswsq2::ptr::offset(a.element)
-                .cmp(&crate::access_method::hnswsq2::ptr::offset(b.element))
+            crate::access_method::hnswsq::ptr::offset(a.element)
+                .cmp(&crate::access_method::hnswsq::ptr::offset(b.element))
         }
     })
 }
@@ -1282,11 +1282,11 @@ unsafe fn check_element_closer(
     support: &Support,
     scratch: &mut Vec<f32>,
 ) -> bool {
-    let e_element = crate::access_method::hnswsq2::ptr::access::<Element>(base, (*e).element);
+    let e_element = crate::access_method::hnswsq::ptr::access::<Element>(base, (*e).element);
 
     for &ri in r {
         let ri_element =
-            crate::access_method::hnswsq2::ptr::access::<Element>(base, (*ri).element);
+            crate::access_method::hnswsq::ptr::access::<Element>(base, (*ri).element);
         let distance = pair_distance(base, support, e_element, ri_element, scratch);
         if distance <= (*e).distance {
             return false;
@@ -1423,7 +1423,7 @@ pub unsafe fn update_connection(
     scratch: &mut Vec<f32>,
 ) {
     let mut new_hp = HnswPtr { ptr: std::ptr::null_mut() };
-    crate::access_method::hnswsq2::ptr::store(base, &mut new_hp, new_element);
+    crate::access_method::hnswsq::ptr::store(base, &mut new_hp, new_element);
     let mut new_hc = Candidate {
         element: new_hp,
         distance,
@@ -1466,7 +1466,7 @@ pub unsafe fn update_connection(
 
         // Find and replace the pruned element
         for i in 0..(*neighbors).length as usize {
-            if crate::access_method::hnswsq2::ptr::equal(
+            if crate::access_method::hnswsq::ptr::equal(
                 base,
                 (*neighbor_items(neighbors).add(i)).element,
                 (*pruned).element,
@@ -1494,7 +1494,7 @@ pub unsafe fn remove_elements(
 
     w.into_iter()
         .filter(|hc| {
-            let hce = crate::access_method::hnswsq2::ptr::access::<Element>(base, hc.element);
+            let hce = crate::access_method::hnswsq::ptr::access::<Element>(base, hc.element);
             if let Some(skip) = skip_element {
                 if (*hce).blkno == (*skip).blkno && (*hce).offno == (*skip).offno {
                     return false;
@@ -1682,7 +1682,7 @@ pub fn entropy_level(ml: f64, max_level: usize) -> usize {
     random_level(ml, max_level, u)
 }
 
-/// A build row's level.  With a pinned `hnswsq2.build_seed` the level is a
+/// A build row's level.  With a pinned `hnswsq.build_seed` the level is a
 /// pure function of `(seed, tid)` so a parallel build assigns the same level
 /// no matter which worker processes the row (the old engine's determinism
 /// machinery; pgvector draws from the process PRNG instead).  `seed < 0`
@@ -1719,7 +1719,7 @@ pub fn build_level(seed: i32, ml: f64, max_level: usize, tid: pg_sys::ItemPointe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access_method::hnswsq2::ptr::HnswPtr;
+    use crate::access_method::hnswsq::ptr::HnswPtr;
 
     /// An allocator for plain Rust tests: Box-allocated, absolute pointers,
     /// no backend needed (no LWLocks are touched by the tested functions).
@@ -1764,7 +1764,7 @@ mod tests {
         let neighbor_list = alloc
             .alloc_bytes((level + 1) * std::mem::size_of::<HnswPtr>())
             .cast::<HnswPtr>();
-        crate::access_method::hnswsq2::ptr::store(
+        crate::access_method::hnswsq::ptr::store(
             std::ptr::null_mut(),
             &mut (*element).neighbors,
             neighbor_list,
@@ -1776,7 +1776,7 @@ mod tests {
                 .cast::<NeighborArray>();
             (*na).length = 0;
             (*na).closer_set = false;
-            crate::access_method::hnswsq2::ptr::store(
+            crate::access_method::hnswsq::ptr::store(
                 std::ptr::null_mut(),
                 &mut *neighbor_list.add(lc),
                 na,
@@ -1785,7 +1785,7 @@ mod tests {
         let bytes = codec.encode(&value);
         let vp = alloc.alloc_bytes(bytes.len());
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), vp, bytes.len());
-        crate::access_method::hnswsq2::ptr::store(std::ptr::null_mut(), &mut (*element).value, vp);
+        crate::access_method::hnswsq::ptr::store(std::ptr::null_mut(), &mut (*element).value, vp);
         (element, codec)
     }
 
@@ -1836,7 +1836,7 @@ mod tests {
             let mk = |v: f32| -> (*mut Element, Candidate) {
                 let (e, _codec) = test_element(&alloc, 4, 0, vec![v]);
                 let mut hp = HnswPtr { ptr: std::ptr::null_mut() };
-                crate::access_method::hnswsq2::ptr::store(std::ptr::null_mut(), &mut hp, e);
+                crate::access_method::hnswsq::ptr::store(std::ptr::null_mut(), &mut hp, e);
                 (
                     e,
                     Candidate {
@@ -1945,7 +1945,7 @@ mod tests {
                 .map(|i| {
                     let hp = (*neighbor_items(na).add(i)).element;
                     let e =
-                        crate::access_method::hnswsq2::ptr::access::<Element>(
+                        crate::access_method::hnswsq::ptr::access::<Element>(
                             std::ptr::null_mut(),
                             hp,
                         );
@@ -2012,9 +2012,9 @@ mod tests {
             (*n2).offno = 2;
             let na = get_neighbors(std::ptr::null_mut(), element, 0);
             let mut hp1 = HnswPtr { ptr: std::ptr::null_mut() };
-            crate::access_method::hnswsq2::ptr::store(std::ptr::null_mut(), &mut hp1, n1);
+            crate::access_method::hnswsq::ptr::store(std::ptr::null_mut(), &mut hp1, n1);
             let mut hp2 = HnswPtr { ptr: std::ptr::null_mut() };
-            crate::access_method::hnswsq2::ptr::store(std::ptr::null_mut(), &mut hp2, n2);
+            crate::access_method::hnswsq::ptr::store(std::ptr::null_mut(), &mut hp2, n2);
             *neighbor_items(na) = Candidate {
                 element: hp1,
                 distance: 0.1,

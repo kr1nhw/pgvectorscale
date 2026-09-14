@@ -1,4 +1,4 @@
-//! Relptr for the hnswsq2 port — pgvector's `HnswPtr` reimplemented.
+//! Relptr for the hnswsq port — pgvector's `HnswPtr` reimplemented.
 //!
 //! pgvector's `HnswPtr` is a union of an absolute pointer and a PostgreSQL
 //! `relptr` (an offset from a base address).  `relptr_store`/`relptr_access`

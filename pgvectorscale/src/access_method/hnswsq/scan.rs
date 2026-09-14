@@ -1,123 +1,311 @@
-//! hnswsq index scan implementation.
+//! hnswsq index scan — the Rust translation of pgvector's `hnswscan.c`
+//! (Algorithm 5 + the iterative scan), with the old engine's order-by
+//! contract:
 //!
-//! - `ambeginscan`: allocate the scan state (Rust `Box` hung off `opaque`).
-//! - `amrescan`: extract + preprocess the query vector, reset the state.
-//! - `amgettuple`: on the first call run the layered HNSW search and cache the
-//!   ranked results, then emit one heap TID per call.  For the lossless `plain`
-//!   layout the emitted distance is the operator's own value and
-//!   `xs_recheckorderby` is false (the executor just fetches the heap tuple for
-//!   MVCC visibility); for the reduced-precision layouts the emitted value is a
-//!   provable lower bound and `xs_recheckorderby` is true, so the executor
-//!   recomputes the exact value and restores exact ordering.  For `plain`, the
-//!   order is exact over the candidates the graph produced.
-//! - `amendscan`: drop the state (releases the last-returned-page pin).
+//! * `plain` (lossless): the emitted distances ARE the operator's values and
+//!   `xs_recheckorderby` is false — exactly pgvector's contract for `vector`
+//!   columns; the executor trusts the index order.
+//! * quantized layouts: the emitted value is a provable lower bound of the
+//!   exact operator value and `xs_recheckorderby` is true, so the executor
+//!   recomputes the exact value per tuple and restores exact ordering.
 //!
-//! Reads only ever take ONE share content lock at a time (snapshot-and-
-//! release inside `load_node_view`), so scans never contend with the insert
-//! protocol beyond per-page atomicity, and stale node pointers into
-//! vacuum-freed-and-reused pages resolve safely (see `node::load_node_view`).
+//! Divergences from the reference, and only these: the scan keeps a pin-less
+//! heap-TID emission (pgvector returns heap TIDs with no index-page pin), the
+//! quantized layouts materialize the encoded vectors of admitted candidates
+//! (the reference never materializes values in a scan), and the query vector
+//! is a decoded/normalized `Vec<f32>`.
 
+use pgrx::pg_sys;
 use pgrx::*;
 
 use crate::access_method::distance::{preprocess_cosine, DistanceType};
-use crate::access_method::hnswsq::graph::{
-    distance_encoded, greedy_descent, search_layer, DiskGraph,
+use crate::access_method::hnswsq::quantize::{self, HnswPrecision};
+use crate::access_method::hnswsq::options::HNSW_EF_SEARCH;
+use crate::access_method::hnswsq::options::{
+    HNSW_ITERATIVE_SCAN, HNSW_MAX_SCAN_TUPLES, HNSW_SCAN_MEM_MULTIPLIER,
+    ITERATIVE_SCAN_OFF, ITERATIVE_SCAN_STRICT,
 };
-use crate::access_method::hnswsq::insert::codec_for;
-use crate::access_method::hnswsq::meta_page::HnswMetaPage;
-use crate::access_method::hnswsq::node::load_node_view;
-use crate::access_method::hnswsq::options::HNSWSQ_EF_SEARCH;
-use crate::access_method::hnswsq::quantize;
+use crate::access_method::hnswsq::types::*;
+use crate::access_method::hnswsq::utils::*;
 use crate::access_method::pg_vector::PgVectorInternal;
-use crate::util::buffer::PinnedBufferShare;
-use crate::util::ItemPointer;
 
-/// One cached scan result: approximate (stored-precision) distance, the heap
-/// TID to emit, and the node location to pin on emit.
-struct ScanResult {
-    dist: f32,
-    heap_tid: ItemPointer,
-    node_ptr: ItemPointer,
+/// The scan state (pgvector `HnswScanOpaqueData` + the emission contract).
+pub struct ScanState {
+    pub support: Support,
+    pub first: bool,
+    /// The result candidates, furthest-first (pgvector drains `llast`).
+    pub w: Vec<SearchCandidate>,
+    pub visited: Visited,
+    pub discarded: Option<CandidateHeap>,
+    /// Decoded + normalized query; empty = null query (no results).
+    pub q: Vec<f32>,
+    pub m: usize,
+    pub tuples: i64,
+    pub previous_distance: f64,
+    pub max_memory: usize,
+    pub scratch: SearchScratch,
+    pub tmp_ctx: PgMemoryContexts,
+    // Emission
+    pub orderbyvals: *mut pg_sys::Datum,
+    pub orderbynulls: *mut bool,
+    /// False for the lossless `plain` layout (exact order, no recheck).
+    pub recheck_orderby: bool,
+    pub norm_q: f32,
 }
 
-/// Scan state for hnswsq index scans.
-pub struct HnswScanState {
-    /// Query vector (cosine-normalized when the index is cosine).
-    query: Vec<f32>,
-    /// Ranked results (ascending approximate distance), computed lazily.
-    results: Vec<ScanResult>,
-    /// Cursor into `results`.
-    result_index: usize,
-    /// Whether the stored layout is lossless, so the emitted distances are the
-    /// operator's own values and the executor must NOT recheck/reorder them
-    /// (`xs_recheckorderby = false`, as pgvector does for `vector`).  Set by
-    /// [`compute_results`]; conservative `true` until then.
-    recheck_orderby: bool,
-    /// Whether the search has run for the current query.
-    results_computed: bool,
-    /// Preallocated `xs_orderbyvals`/`xs_orderbynulls` slots (palloc'd once
-    /// per scan in the executor's per-query context).
-    orderbyvals: *mut pg_sys::Datum,
-    orderbynulls: *mut bool,
-    /// Pin on the page of the node backing the last-returned tuple (the
-    /// amgettuple pinning contract).
-    last_buffer: Option<PinnedBufferShare>,
+/// Whether the scan materializes the encoded vectors of admitted candidates
+/// (the quantized layouts need them for their lower bounds; `plain` never
+/// does — the pgvector reference never materializes in a scan at all).
+fn scan_load_vec(precision: HnswPrecision) -> bool {
+    precision != HnswPrecision::Plain
 }
 
-impl HnswScanState {
-    fn new(norderbys: i32) -> Self {
-        let n = (norderbys.max(1)) as usize;
-        unsafe {
-            let orderbyvals = pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>() * n)
-                as *mut pg_sys::Datum;
-            let orderbynulls =
-                pg_sys::palloc(std::mem::size_of::<bool>() * n) as *mut bool;
-            for i in 0..n {
-                *orderbynulls.add(i) = true;
-            }
-            Self {
-                query: Vec::new(),
-                results: Vec::new(),
-                result_index: 0,
-                recheck_orderby: true,
-                results_computed: false,
-                orderbyvals,
-                orderbynulls,
-                last_buffer: None,
-            }
+/// `GetScanItems` (hnswscan.c): layered descent (ef = 1) then the layer-0
+/// search with `ef_search`.
+unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<SearchCandidate> {
+    let load_vec = scan_load_vec(state.support.precision);
+
+    // Get m and entry point
+    let mut m = 0usize;
+    let mut entry = None;
+    get_meta_page_info(index, Some(&mut m), Some(&mut entry));
+    state.m = m;
+
+    let Some(entry) = entry else {
+        return Vec::new();
+    };
+
+    // The entry element must outlive the search results (the candidates in
+    // `w` reference it until amgettuple drains them), so it lives in the
+    // scan's element store like every other materialized element.
+    state.scratch.elements.push(entry);
+    let entry_ptr = state.scratch.elements.last_mut().unwrap().as_mut() as *mut Element;
+
+    let q = if state.q.is_empty() {
+        None
+    } else {
+        Some(state.q.as_slice())
+    };
+
+    let mut ep = vec![entry_candidate(
+        std::ptr::null_mut(),
+        entry_ptr,
+        q,
+        Some(index),
+        &state.support,
+        load_vec,
+    )];
+    let entry_level = (*entry_ptr).level as usize;
+
+    // Descent: the scratch elements persist (admitted candidates at upper
+    // layers become entry points below), like pgvector's tmpCtx.
+    for lc in (1..=entry_level).rev() {
+        let w = search_layer(
+            std::ptr::null_mut(),
+            Some(index),
+            &state.support,
+            m,
+            q,
+            &ep,
+            1,
+            lc,
+            load_vec,
+            None,
+            &mut state.visited,
+            None,
+            true,
+            None,
+            &mut state.scratch,
+        );
+        ep = w;
+    }
+
+    let ef = (HNSW_EF_SEARCH.get() as usize).max(1);
+    let mut discarded: CandidateHeap = CandidateHeap::new();
+    let w = search_layer(
+        std::ptr::null_mut(),
+        Some(index),
+        &state.support,
+        m,
+        q,
+        &ep,
+        ef,
+        0,
+        load_vec,
+        None,
+        &mut state.visited,
+        if state.discarded.is_some() {
+            Some(&mut discarded)
+        } else {
+            None
+        },
+        true,
+        Some(&mut state.tuples),
+        &mut state.scratch,
+    );
+    if state.discarded.is_some() {
+        state.discarded = Some(discarded);
+    }
+
+    w
+}
+
+/// `ResumeScanItems` (hnswscan.c): continue the layer-0 search from the
+/// discarded candidates.
+unsafe fn resume_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<SearchCandidate> {
+    let load_vec = scan_load_vec(state.support.precision);
+    let batch_size = (HNSW_EF_SEARCH.get() as usize).max(1);
+
+    let mut ep: Vec<SearchCandidate> = Vec::new();
+    for _ in 0..batch_size {
+        let Some(sc) = state.discarded.as_mut().and_then(|d| d.pop()) else {
+            break;
+        };
+        ep.push(sc.0);
+    }
+    if ep.is_empty() {
+        return Vec::new();
+    }
+
+    let q = if state.q.is_empty() {
+        None
+    } else {
+        Some(state.q.as_slice())
+    };
+    let discarded = state.discarded.as_mut().expect("iterative scan owns its heap");
+    search_layer(
+        std::ptr::null_mut(),
+        Some(index),
+        &state.support,
+        state.m,
+        q,
+        &ep,
+        batch_size,
+        0,
+        load_vec,
+        None,
+        &mut state.visited,
+        Some(discarded),
+        false,
+        Some(&mut state.tuples),
+        &mut state.scratch,
+    )
+}
+
+/// The approximate memory an iterative scan's state occupies (pgvector reads
+/// `MemoryContextMemAllocated`; ours lives in Rust scratch buffers).
+fn scan_memory(state: &ScanState) -> usize {
+    let vec_bytes = state.support.codec.vector_bytes();
+    state.scratch.elements.len() * (std::mem::size_of::<Element>() + vec_bytes)
+        + state.scratch.tids.capacity() * std::mem::size_of::<pg_sys::ItemPointerData>()
+        + state.visited.capacity_bytes()
+}
+
+/// The emitted order-by value: the exact operator value for `plain`, a
+/// provable lower bound for the quantized layouts (see the module docs and
+/// the old engine's scan for the error-bound derivation).
+unsafe fn emit_distance(state: &ScanState, sc: &SearchCandidate) -> f64 {
+    let base = std::ptr::null_mut();
+    let element = crate::access_method::hnswsq::ptr::access::<Element>(base, sc.element);
+    let vec_bytes = state.support.codec.vector_bytes();
+
+    if !state.recheck_orderby {
+        // Lossless layout: the stored distance IS the operator's value (L2
+        // additionally applies the sqrt the operator applies).
+        return match state.support.dist_type {
+            DistanceType::L2 => (sc.distance.max(0.0)).sqrt() as f64,
+            _ => sc.distance as f64,
+        };
+    }
+
+    // Quantized: per-element error bound, in the operator's units.
+    let value = get_value(base, element, vec_bytes);
+    let mut decoded = vec![0.0f32; state.support.codec.dim()];
+    state
+        .support
+        .codec
+        .decode_into(value, decoded.as_mut_slice());
+    let norm_v = decoded.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    let rel_err = quantize::relative_element_error(state.support.precision);
+    let rel_margin = match state.support.precision {
+        quantize::HnswPrecision::IeeeFp8 => 1.15,
+        quantize::HnswPrecision::IeeeFp16 => 1.01,
+        _ => 1.0,
+    };
+    let sq8_half_norm = state.support.codec.sq8_scale_norm() / 2.0;
+    let e = rel_err * rel_margin * norm_v + sq8_half_norm;
+    let slack = 1e-4 * (1.0 + state.norm_q * norm_v);
+    let d = sc.distance;
+
+    if (*element).clamped != 0 {
+        // Encoding saturated components: no finite lower bound is provable.
+        // An ultra-conservative value keeps the executor's cmp check valid;
+        // its reorder queue restores the exact ordering.
+        return f64::NEG_INFINITY;
+    }
+
+    match state.support.dist_type {
+        DistanceType::L2 => {
+            let sqrt_d = d.max(0.0).sqrt();
+            let lb = d - 2.0 * sqrt_d * e - e * e - slack * (1.0 + sqrt_d);
+            (lb.max(0.0).sqrt()) as f64
         }
+        DistanceType::Cosine => {
+            let lb = d - state.norm_q.max(1.0) * e - slack;
+            (lb.max(0.0)) as f64
+        }
+        DistanceType::InnerProduct => (d - state.norm_q * e - slack) as f64,
     }
 }
 
-/// Extract the query vector from an ORDER BY datum, normalizing for cosine.
-unsafe fn extract_query_vector(datum: pg_sys::Datum, distance_type: DistanceType) -> Vec<f32> {
-    let detoasted = pg_sys::pg_detoast_datum_copy(datum.cast_mut_ptr());
-    let pg_vec = detoasted.cast::<PgVectorInternal>();
-    let mut vec = (*pg_vec).to_slice().to_vec();
-    pg_sys::pfree(detoasted.cast());
-
-    if distance_type == DistanceType::Cosine {
-        preprocess_cosine(&mut vec);
-    }
-    vec
-}
-
-/// Begin a scan of the hnswsq index.
+/// `hnswbeginscan` (hnswscan.c).
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambeginscan(
     index: pg_sys::Relation,
     nkeys: std::os::raw::c_int,
     norderbys: std::os::raw::c_int,
 ) -> pg_sys::IndexScanDesc {
-    let scan = unsafe { pg_sys::RelationGetIndexScan(index, nkeys, norderbys) };
-    let state = Box::new(HnswScanState::new(norderbys));
-    unsafe {
-        (*scan).opaque = Box::into_raw(state) as *mut std::os::raw::c_void;
+    let scan = pg_sys::RelationGetIndexScan(index, nkeys, norderbys);
+    let support = init_support(index);
+    let m = get_m(index);
+    let tmp_ctx = PgMemoryContexts::new("hnswsq scan temporary context");
+
+    let n = norderbys.max(1) as usize;
+    let orderbyvals =
+        pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>() * n) as *mut pg_sys::Datum;
+    let orderbynulls = pg_sys::palloc(std::mem::size_of::<bool>() * n) as *mut bool;
+    for i in 0..n {
+        *orderbynulls.add(i) = true;
     }
+
+    // max memory: work_mem * multiplier, +256 bytes to fill the last block
+    let max_memory = ((pg_sys::work_mem as f64) * HNSW_SCAN_MEM_MULTIPLIER * 1024.0 + 256.0)
+        as usize;
+
+    let state = Box::new(ScanState {
+        recheck_orderby: support.precision != HnswPrecision::Plain,
+        support,
+        first: true,
+        w: Vec::new(),
+        visited: Visited::new(256),
+        discarded: None,
+        q: Vec::new(),
+        m,
+        tuples: 0,
+        previous_distance: f64::NEG_INFINITY,
+        max_memory,
+        scratch: SearchScratch::new(m),
+        tmp_ctx,
+        orderbyvals,
+        orderbynulls,
+        norm_q: 0.0,
+    });
+    (*scan).opaque = Box::into_raw(state) as *mut std::os::raw::c_void;
     scan
 }
 
-/// Rescan with a new query vector.
+/// `hnswrescan` (hnswscan.c): reset and re-extract the query.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn amrescan(
     scan: pg_sys::IndexScanDesc,
@@ -126,255 +314,162 @@ pub unsafe extern "C-unwind" fn amrescan(
     orderbys: pg_sys::ScanKey,
     norderbys: std::os::raw::c_int,
 ) {
-    let state = unsafe { &mut *((*scan).opaque as *mut HnswScanState) };
-    state.results.clear();
-    state.result_index = 0;
-    state.results_computed = false;
-    state.last_buffer = None;
+    let state = &mut *((*scan).opaque as *mut ScanState);
 
-    let index_rel = unsafe { PgRelation::from_pg((*scan).indexRelation) };
-    let meta = HnswMetaPage::fetch(&index_rel);
-    let distance_type = meta.get_distance_type();
+    state.first = true;
+    state.w.clear();
+    state.visited.clear();
+    state.discarded = None;
+    state.tuples = 0;
+    state.previous_distance = f64::NEG_INFINITY;
+    state.scratch.elements.clear();
+    pg_sys::MemoryContextReset(state.tmp_ctx.value());
 
+    // Extract the query vector (NULL/absent → empty → no results).
+    state.q.clear();
     if norderbys > 0 && !orderbys.is_null() {
-        let orderby = unsafe { &*orderbys };
+        let orderby = &*orderbys;
         if !orderby.sk_argument.is_null() {
-            state.query = extract_query_vector(orderby.sk_argument, distance_type);
+            let detoasted = pg_sys::pg_detoast_datum_copy(orderby.sk_argument.cast_mut_ptr());
+            let pg_vec = detoasted.cast::<PgVectorInternal>();
+            state.q.extend_from_slice((*pg_vec).to_slice());
+            pg_sys::pfree(detoasted.cast());
+            if state.support.dist_type == DistanceType::Cosine {
+                preprocess_cosine(&mut state.q);
+            }
         }
     }
+    state.norm_q = state.q.iter().map(|x| x * x).sum::<f32>().sqrt();
 }
 
-/// Run the layered search and cache the ranked live results.
-///
-/// Emitted distances are PROVABLE LOWER BOUNDS of the exact operator value in
-/// the operator's own units — the contract `nodeIndexscan.c` enforces when
-/// `xs_recheckorderby = true` (it recomputes the exact value per tuple and
-/// errors with "index returned tuples in wrong order" when the index value
-/// exceeds it; the reorder queue then restores the exact ordering).
-///
-/// With per-element quantization error `δ = v̂ − v`:
-/// - L2 (`<->` = sqrt squared-L2): `‖q−v‖ ≥ ‖q−v̂‖ − ‖δ‖` → emit
-///   `sqrt(max(0, d − 2√d·e − e²))` with `e ≥ ‖δ‖`;
-/// - cosine (`<=>` = 1 − dot on normalized vectors) and IP (`<#>` = −dot):
-///   `|dot(q,v̂) − dot(q,v)| ≤ ‖q‖·‖δ‖` → emit `d − ‖q‖·e`;
-/// where `e = rel_err·‖v̂‖·margin` for the IEEE layouts and
-/// `e = ‖scales‖/2` for SQ8 (plus a small absolute slack covering SIMD
-/// accumulation differences against the executor's recomputation).  For
-/// `plain`, `e = 0` and the emitted value is the exact distance minus slack.
-unsafe fn compute_results(index_rel: &PgRelation, state: &mut HnswScanState) {
-    state.results_computed = true;
-    if state.query.is_empty() {
-        return;
-    }
-
-    let meta = HnswMetaPage::fetch(index_rel);
-    let distance_type = meta.get_distance_type();
-    let codec = codec_for(index_rel, &meta);
-    if codec.dim() != state.query.len() {
-        // Query dimension mismatch (shouldn't happen through the executor):
-        // return nothing rather than mis-decoding.
-        return;
-    }
-    let Some(ep) = meta.get_entry_point() else {
-        return; // empty index
-    };
-    let entry_level = meta.get_entry_level().max(0) as usize;
-
-    let access = DiskGraph { index: index_rel };
-
-    let Some(ep_view) = load_node_view(index_rel, ep) else {
-        return; // entry vanished (crash orphan freed by vacuum)
-    };
-    let mut cur = (
-        distance_encoded(&codec, distance_type, &state.query, &ep_view.vector),
-        ep,
-    );
-    if entry_level > 0 {
-        cur = greedy_descent(
-            &codec,
-            distance_type,
-            &state.query,
-            &access,
-            cur,
-            entry_level,
-            1,
-        );
-    }
-
-    let ef = (HNSWSQ_EF_SEARCH.get() as usize).max(1);
-    let hits = search_layer(&codec, distance_type, &state.query, &access, vec![cur], ef, 0);
-    let hits_len = hits.len();
-
-    // Error-bound ingredients (see the function docs).
-    let precision = meta.get_precision();
-    let rel_err = quantize::relative_element_error(precision);
-    // Margin covers ‖v‖ vs ‖v̂‖ (a factor (1+eps)/(1−eps)) and fp8 clamp
-    // edge effects; generous but negligible against the base error.
-    let rel_margin = match precision {
-        quantize::HnswPrecision::IeeeFp8 => 1.15,
-        quantize::HnswPrecision::IeeeFp16 => 1.01,
-        _ => 1.0,
-    };
-    let sq8_half_norm = codec.sq8_scale_norm() / 2.0;
-    let norm_q = state
-        .query
-        .iter()
-        .map(|x| x * x)
-        .sum::<f32>()
-        .sqrt();
-
-    // A lossless layout stores the vector the operator will see, so the stored
-    // distance IS the operator's value (L2 additionally applies the sqrt the
-    // operator applies) and the executor neither rechecks nor reorders — this is
-    // the same contract pgvector's hnsw uses for `vector` columns.  It also
-    // removes the second load of every emitted node (page read + copy + decode
-    // + norm), which the quantized layouts still need for their lower bounds.
-    state.recheck_orderby = precision != quantize::HnswPrecision::Plain;
-
-    // Emit only live nodes; tombstones keep routing but never surface.
-    state.results = hits
-        .into_iter()
-        .filter(|h| !h.deleted)
-        .filter_map(|h| {
-            // Heap TID and clamp flag were read when the node's distance was
-            // evaluated, so no hit is loaded a second time.
-            if !h.heap_tid.is_valid() {
-                return None;
-            }
-            if !state.recheck_orderby {
-                let dist = match distance_type {
-                    DistanceType::L2 => h.dist.max(0.0).sqrt(),
-                    // Cosine and inner product are emitted in the operator's
-                    // own units already (1 − dot clamped, and −dot).
-                    _ => h.dist,
-                };
-                return Some(ScanResult {
-                    dist,
-                    heap_tid: h.heap_tid,
-                    node_ptr: h.id,
-                });
-            }
-            let view = load_node_view(index_rel, h.id)?;
-            if view.deleted || !view.heap_tid.is_valid() {
-                return None;
-            }
-            let decoded = codec.decode(&view.vector);
-            let norm_v = decoded.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let e = rel_err * rel_margin * norm_v + sq8_half_norm;
-            let slack = 1e-4 * (1.0 + norm_q * norm_v);
-            let d = h.dist;
-            let dist = if view.clamped {
-                // Encoding saturated components: no finite lower bound can be
-                // proven from the index alone.  An ultra-conservative value
-                // keeps the executor's cmp check valid; its reorder queue
-                // restores the exact ordering.
-                f32::NEG_INFINITY
-            } else {
-                match distance_type {
-                    DistanceType::L2 => {
-                        let sqrt_d = d.max(0.0).sqrt();
-                        let lb = d - 2.0 * sqrt_d * e - e * e - slack * (1.0 + sqrt_d);
-                        lb.max(0.0).sqrt()
-                    }
-                    DistanceType::Cosine => {
-                        let lb = d - norm_q.max(1.0) * e - slack;
-                        lb.max(0.0)
-                    }
-                    DistanceType::InnerProduct => d - norm_q * e - slack,
-                }
-            };
-            Some(ScanResult {
-                dist,
-                heap_tid: view.heap_tid,
-                node_ptr: h.id,
-            })
-        })
-        .collect();
-    // Per-node error bounds can make the lower bounds non-monotonic in the
-    // approximate distance; re-sort so the executor's reorder queue drains
-    // with as few extra pulls as possible (legality does not depend on this
-    // — recheckorderby reorders — but latency does).
-    state.results.sort_by(|a, b| {
-        a.dist
-            .total_cmp(&b.dist)
-            .then_with(|| a.node_ptr.cmp(&b.node_ptr))
-    });
-
-    // Test-build diagnostics: verify the emitted set against the candidate
-    // set (useful when debugging recall/membership issues).
-    #[cfg(any(test, feature = "pg_test"))]
-    {
-        pgrx::log!(
-            "hnswsq scan diag: ef={} candidates={} emitted={} entry_level={}",
-            ef,
-            hits_len,
-            state.results.len(),
-            entry_level
-        );
-    }
-}
-
-/// Get the next tuple from the hnswsq index scan.
+/// `hnswgettuple` (hnswscan.c): run the search lazily, then emit one heap
+/// TID per call.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn amgettuple(
     scan: pg_sys::IndexScanDesc,
-    _direction: pg_sys::ScanDirection::Type,
+    dir: pg_sys::ScanDirection::Type,
 ) -> bool {
-    let state = unsafe { &mut *((*scan).opaque as *mut HnswScanState) };
+    debug_assert_eq!(dir, pg_sys::ScanDirection::ForwardScanDirection);
+    let state = &mut *((*scan).opaque as *mut ScanState);
+    let index = (*scan).indexRelation;
 
-    if !state.results_computed {
-        let index_rel = unsafe { PgRelation::from_pg((*scan).indexRelation) };
-        compute_results(&index_rel, state);
-    }
-
-    if state.result_index < state.results.len() {
-        let res = &state.results[state.result_index];
-        state.result_index += 1;
-
-        unsafe {
-            let mut tid_data = pg_sys::ItemPointerData::default();
-            res.heap_tid.to_item_pointer_data(&mut tid_data);
-            (*scan).xs_heaptid = tid_data;
-            (*scan).xs_recheck = false;
-            // Lossless layout (`plain`): the emitted distances ARE the
-            // operator's values, so the executor trusts this order (no recheck
-            // pass, no reorder queue) — pgvector's hnsw does the same for
-            // `vector` columns.  Reduced-precision layouts emit provable LOWER
-            // BOUNDS instead: there the executor recomputes the exact operator
-            // value per tuple (which also performs the MVCC visibility check)
-            // and restores exact ordering via its reorder queue.
-            (*scan).xs_recheckorderby = state.recheck_orderby;
-            // pgvector's distance operators return float8: the orderbyval
-            // datum MUST be a double — the executor compares it against the
-            // recomputed float8 with the operator's sort support, and raw
-            // f32 bits would be reinterpreted as a garbage f64.
-            *state.orderbyvals =
-                pg_sys::Datum::from((res.dist as f64).to_bits() as usize);
-            *state.orderbynulls = false;
-            (*scan).xs_orderbyvals = state.orderbyvals;
-            (*scan).xs_orderbynulls = state.orderbynulls;
-
-            // An index scan must keep a pin on the page holding the item it
-            // last returned (postgres index-locking contract).
-            let index_rel = PgRelation::from_pg((*scan).indexRelation);
-            state.last_buffer =
-                Some(PinnedBufferShare::read(&index_rel, res.node_ptr.block_number));
+    if state.first {
+        // Safety check
+        if (*scan).orderByData.is_null() {
+            error!("cannot scan hnswsq index without order");
         }
-        true
-    } else {
-        false
+        // Requires MVCC-compliant snapshot (not able to maintain a pin)
+        // IsMVCCSnapshot: snapshot_type == SNAPSHOT_MVCC.
+        if (*(*scan).xs_snapshot).snapshot_type != pg_sys::SnapshotType::SNAPSHOT_MVCC {
+            error!("non-MVCC snapshots are not supported with hnswsq");
+        }
+
+        // A shared lock lets vacuum ensure no in-flight scans before marking
+        // tuples deleted.
+        pg_sys::LockPage(index, SCAN_LOCK_PAGE, pg_sys::ShareLock as pg_sys::LOCKMODE);
+        state.w = get_scan_items(state, index);
+        pg_sys::UnlockPage(index, SCAN_LOCK_PAGE, pg_sys::ShareLock as pg_sys::LOCKMODE);
+
+        // The iterative scan owns its discarded heap from the start.
+        if HNSW_ITERATIVE_SCAN.get().as_i32() != ITERATIVE_SCAN_OFF {
+            if state.discarded.is_none() {
+                state.discarded = Some(CandidateHeap::new());
+            }
+        }
+
+        state.first = false;
     }
+
+    let iterative = HNSW_ITERATIVE_SCAN.get().as_i32();
+
+    loop {
+        let base = std::ptr::null_mut();
+        let element: *mut Element;
+        let sc: SearchCandidate;
+
+        if state.w.is_empty() {
+            if iterative == ITERATIVE_SCAN_OFF {
+                break;
+            }
+            // Empty index
+            if state.discarded.is_none() {
+                break;
+            }
+
+            // Reached max number of tuples or memory limit
+            let mem = scan_memory(state);
+            if state.tuples >= HNSW_MAX_SCAN_TUPLES.get() as i64
+                && HNSW_MAX_SCAN_TUPLES.get() >= 0
+                || mem > state.max_memory
+            {
+                let empty = state
+                    .discarded
+                    .as_ref()
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true);
+                if empty {
+                    break;
+                }
+                // Return remaining tuples
+                let sc = state.discarded.as_mut().unwrap().pop().unwrap().0;
+                state.w.push(sc);
+            } else {
+                // Locking ensures when neighbors are read, the elements they
+                // reference will not be deleted (and replaced) during the
+                // iteration.
+                pg_sys::LockPage(index, SCAN_LOCK_PAGE, pg_sys::ShareLock as pg_sys::LOCKMODE);
+                state.w = resume_scan_items(state, index);
+                pg_sys::UnlockPage(index, SCAN_LOCK_PAGE, pg_sys::ShareLock as pg_sys::LOCKMODE);
+            }
+
+            if state.w.is_empty() {
+                break;
+            }
+        }
+
+        let sc_ref = state.w.last().expect("w not empty");
+        sc = *sc_ref;
+        element = crate::access_method::hnswsq::ptr::access::<Element>(base, sc.element);
+
+        // Move to next element if no valid heap TIDs
+        if (*element).heaptid_set == 0 {
+            state.w.pop();
+            continue;
+        }
+
+        let heaptid = (*element).heaptid;
+        (*element).heaptid_set = 0;
+
+        if iterative == ITERATIVE_SCAN_STRICT {
+            if (sc.distance as f64) < state.previous_distance {
+                continue;
+            }
+            state.previous_distance = sc.distance as f64;
+        }
+
+        let emitted = emit_distance(state, &sc);
+
+        (*scan).xs_heaptid = heaptid;
+        (*scan).xs_recheck = false;
+        (*scan).xs_recheckorderby = state.recheck_orderby;
+        // pgvector's distance operators return float8: the orderbyval datum
+        // MUST be a double (raw f32 bits would be a garbage f64).
+        *state.orderbyvals = pg_sys::Datum::from(emitted.to_bits() as usize);
+        *state.orderbynulls = false;
+        (*scan).xs_orderbyvals = state.orderbyvals;
+        (*scan).xs_orderbynulls = state.orderbynulls;
+        return true;
+    }
+
+    false
 }
 
-/// End the scan: dropping the state releases the pinned buffer and the result
-/// allocations.
+/// `hnswendscan` (hnswscan.c).
 #[pg_guard]
 pub unsafe extern "C-unwind" fn amendscan(scan: pg_sys::IndexScanDesc) {
-    unsafe {
-        let ptr = (*scan).opaque as *mut HnswScanState;
-        if !ptr.is_null() {
-            drop(Box::from_raw(ptr));
-            (*scan).opaque = std::ptr::null_mut();
-        }
+    let ptr = (*scan).opaque as *mut ScanState;
+    if !ptr.is_null() {
+        drop(Box::from_raw(ptr));
+        (*scan).opaque = std::ptr::null_mut();
     }
 }

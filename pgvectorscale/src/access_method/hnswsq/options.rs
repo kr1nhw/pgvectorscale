@@ -1,8 +1,18 @@
 //! hnswsq index options parsing and GUC definitions.
+//!
+//! Same reloption surface as the retired engine (`storage_layout`, `m`,
+//! `ef_construction`, `sample_size`) so the SQL-facing configuration of an
+//! index is unchanged.  The engine-specific GUCs of the old framework
+//! (`build_engine`, `backfill`, `parallel_stage`, `build_backlink_mode`,
+//! `build_stats`) are retired with it; the GUCs below are the pgvector set
+//! (`ef_search`, `iterative_scan`, `max_scan_tuples`, `scan_mem_multiplier`)
+//! plus `build_seed`, which the determinism gates pin.
 
 use memoffset::*;
-use pgrx::{pg_sys::AsPgCStr, prelude::*, set_varsize_4b, void_ptr, PgRelation};
-use std::{ffi::CStr, fmt::Debug};
+use pgrx::pg_sys::AsPgCStr;
+use pgrx::{pg_sys, prelude::*, set_varsize_4b, void_ptr, PgRelation};
+use std::ffi::CStr;
+use std::fmt::Debug;
 
 use crate::access_method::hnswsq::quantize::HnswPrecision;
 
@@ -22,11 +32,54 @@ const HNSW_DEFAULT_STORAGE_TYPE_STR: &str = "plain";
 /// Build-time default for the SQ8 calibration reservoir sample.
 pub const DEFAULT_SAMPLE_SIZE: usize = 30000;
 
+/// Default search width at query time (pgvector `hnsw_ef_search`).
+pub static HNSW_EF_SEARCH: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(40);
+
+/// Iterative scan mode (pgvector `hnsw_iterative_scan`).
+#[derive(
+    pgrx::PostgresGucEnum, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default,
+)]
+pub enum IterativeScanMode {
+    Off,
+    #[default]
+    Relaxed,
+    Strict,
+}
+
+impl IterativeScanMode {
+    pub fn as_i32(self) -> i32 {
+        match self {
+            IterativeScanMode::Off => 0,
+            IterativeScanMode::Relaxed => 1,
+            IterativeScanMode::Strict => 2,
+        }
+    }
+}
+
+pub static HNSW_ITERATIVE_SCAN: pgrx::GucSetting<IterativeScanMode> =
+    pgrx::GucSetting::<IterativeScanMode>::new(IterativeScanMode::Relaxed);
+pub const ITERATIVE_SCAN_OFF: i32 = 0;
+pub const ITERATIVE_SCAN_RELAXED: i32 = 1;
+pub const ITERATIVE_SCAN_STRICT: i32 = 2;
+
+/// Max tuples before an iterative scan stops (pgvector `hnsw_max_scan_tuples`,
+/// -1 = unlimited).
+pub static HNSW_MAX_SCAN_TUPLES: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(-1);
+
+/// work_mem multiplier for the scan (pgvector `hnsw_scan_mem_multiplier`,
+/// fixed at the pgvector default of 1.0 — pgrx has no f32 GucSetting
+/// constructor, and the multiplier is a rarely-tuned knob).
+pub const HNSW_SCAN_MEM_MULTIPLIER: f64 = 1.0;
+
+/// Build RNG: entropy in production, or the pinned `hnswsq.build_seed` value
+/// (tests set it so builds — and recall assertions — are deterministic).
+pub static HNSW_BUILD_SEED: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(-1);
+
 // DO NOT derive Clone for this struct. The storage layout string comes at the
 // end and wouldn't be copied properly.
 #[derive(Debug, PartialEq)]
 #[repr(C)]
-pub struct TSVHnswOptions {
+pub struct Hnsw2Options {
     /* varlena header (do not touch directly!) */
     #[allow(dead_code)]
     vl_len_: i32,
@@ -37,27 +90,24 @@ pub struct TSVHnswOptions {
     pub sample_size: i32,
 }
 
-impl TSVHnswOptions {
+impl Hnsw2Options {
     /// Extract options from a relation, using defaults if none are set.
-    pub fn from_relation(relation: &PgRelation) -> PgBox<TSVHnswOptions> {
+    pub fn from_relation(relation: &PgRelation) -> PgBox<Hnsw2Options> {
         if relation.rd_index.is_null() {
             panic!("'{}' is not an hnswsq index", relation.name())
         } else if relation.rd_options.is_null() {
             // use defaults
-            let mut ops = unsafe { PgBox::<TSVHnswOptions>::alloc0() };
+            let mut ops = unsafe { PgBox::<Hnsw2Options>::alloc0() };
             ops.storage_layout_offset = 0;
             ops.m = DEFAULT_M;
             ops.ef_construction = DEFAULT_EF_CONSTRUCTION;
             ops.sample_size = DEFAULT_SAMPLE_SIZE_OPTION;
             unsafe {
-                set_varsize_4b(
-                    ops.as_ptr().cast(),
-                    std::mem::size_of::<TSVHnswOptions>() as i32,
-                );
+                set_varsize_4b(ops.as_ptr().cast(), std::mem::size_of::<Hnsw2Options>() as i32);
             }
             ops.into_pg_boxed()
         } else {
-            unsafe { PgBox::from_pg(relation.rd_options as *mut TSVHnswOptions) }
+            unsafe { PgBox::from_pg(relation.rd_options as *mut Hnsw2Options) }
         }
     }
 
@@ -85,247 +135,65 @@ impl TSVHnswOptions {
         self.ef_construction as u32
     }
 
-    /// SQ8 calibration sample size; `None` = auto (build default).
-    pub fn get_sample_size(&self) -> Option<usize> {
-        if self.sample_size < 0 {
-            panic!("sample_size must be >= 0 (0 = auto)");
+    /// SQ8 calibration sample size (0 = auto).
+    pub fn get_sample_size(&self) -> usize {
+        if self.sample_size < 0 || self.sample_size > 1_000_000 {
+            panic!("sample_size must be between 0 and 1000000");
         }
         if self.sample_size == 0 {
-            None
+            DEFAULT_SAMPLE_SIZE
         } else {
-            Some(self.sample_size as usize)
+            self.sample_size as usize
         }
     }
 
-    /// Helper to extract a string option from the options struct.
-    fn get_str<F: FnOnce() -> String>(&self, offset: i32, default: F) -> String {
+    fn get_str<F: FnOnce() -> String>(
+        &self,
+        offset: i32,
+        _default: F,
+    ) -> String {
+        // storage layout string is written directly into the options by
+        // PostgreSQL (the offset points into rd_options bytes)
+        let p = (self as *const Hnsw2Options as *const u8).wrapping_add(offset as usize);
         if offset == 0 {
-            default()
-        } else {
-            let opts = self as *const _ as void_ptr as usize;
-            let value =
-                unsafe { CStr::from_ptr((opts + offset as usize) as *const std::os::raw::c_char) };
-
-            value.to_str().unwrap().to_owned()
+            return _default();
+        }
+        unsafe {
+            let c = CStr::from_ptr(p.cast());
+            c.to_str().expect("invalid storage_layout").to_owned()
         }
     }
 }
 
-/// `hnswsq.ef_search`: layer-0 search width at query time (the main
-/// recall/latency dial).  Must be >= the query LIMIT for full recall.
-pub static HNSWSQ_EF_SEARCH: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(40);
-
-/// `hnswsq.build_stats`: emit per-phase build timing counters (search,
-/// neighbor selection, backlink pair distances, backlink selection) as a
-/// WARNING when a build finishes.  Off by default; used by the benchmark
-/// harness to see where build time goes.
-pub static HNSWSQ_BUILD_STATS: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(false);
-
-/// `hnswsq.build_seed`: RNG seed for the build (level assignment and the SQ8
-/// calibration sample).  -1 keeps the production behaviour (entropy); tests pin
-/// it so index builds — and therefore recall assertions — are deterministic.
-pub static HNSWSQ_BUILD_SEED: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(-1);
-
-/// `hnswsq.build_backlink_mode`: how backlink edges are admitted during an
-/// in-memory build.  1 (default) = the exact incremental re-prune, whose output
-/// is bit-identical to re-running the full neighbor-selection heuristic over
-/// the merged candidate set; 0 = the Lance-style ranked list (append, prune on
-/// overflow, skip edges that cannot beat the target's current worst neighbour).
-///
-/// Measured on clustered 16-dim data (1 k nodes, same build seed): ranked is
-/// *slower* (backlink_select 508 ms vs 294 ms) and slightly lower recall
-/// (0.995 vs 1.000), so the exact mode stays the default; ranked is kept for
-/// experimentation on other data shapes and m0/ef_construction settings.  Both modes are WAL/format-neutral: this is in-memory build
-/// bookkeeping only.
-pub static HNSWSQ_BACKLINK_MODE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(1);
-
-/// `hnswsq.build_engine`: which in-memory build engine `CREATE INDEX` uses.
-///
-/// 0 (default) = the legacy `MemGraph` engine (exact incremental backlink
-/// re-prune, `list_dists`/`list_masks`); 1 = the new flat engine (flat slabs, ids
-/// only, pgvector-style append/shrink backlinks).  Temporary: it exists so both
-/// engines can be A/B'd in one binary while the new one is brought up, and it
-/// disappears with the legacy engine (see
-/// `.design/hnswsq_parallel_build_todos.md`).
-pub static HNSWSQ_BUILD_ENGINE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
-
-/// `hnswsq.build_backfill`: fill a node's own neighbour list to capacity with the
-/// closest *pruned* candidates (the legacy engine's behaviour) instead of keeping
-/// only the occlusion heuristic's output.
-///
-/// 0 (default) = heuristic only, which is the decided flat-engine policy; 1 = with
-/// backfill.  Measured at 100k dim-128: backfill costs +51% build time (apply 2.2x,
-/// because every backlink then lands on a saturated target and pays the full
-/// re-measure plus occlusion walk) and buys +9.5 recall points at ef 40 on that hard
-/// dataset, plus 93 fewer nodes without an incoming edge.  Temporary knob so the 1M
-/// BIGANN operating point can decide it without code churn; it goes away with the
-/// engine consolidation.
-pub static HNSWSQ_BUILD_BACKFILL: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
-
-/// `hnswsq.build_workers`: parallel workers for an in-memory build.
-///
-/// `0` (the default) means the single-builder path, which is the safe choice today: the parallel
-/// path refuses a build whose rows do not fit the arena (`maintenance_work_mem`, the same GUC that
-/// sizes the single-builder graph) rather than spilling mid-build the way the single-builder path
-/// does -- though `ambuild` skips the parallel build up front when the row count is known to be too
-/// large, so most such builds simply fall back.  `N > 0` asks for N workers.
-///
-/// Purely a build-time choice: the transactional insert and query paths are unaffected.
-pub static HNSWSQ_BUILD_WORKERS: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
-
-/// `hnswsq.parallel_stage`: **debug only** -- stop a parallel worker after this many steps, so
-/// a crash in the worker path can be bisected without recompiling.  `0` is a real build.
-///
-/// The stages are, in order: 9 before the worker does anything at all, 1 after opening the
-/// relations, 2 after `BuildIndexInfo`, 3 after `table_beginscan_parallel`, 4 after the worker's
-/// `BuildState`, then -- inside the row callback -- 5 before reading the tuple, 6 after
-/// extracting the vector, 7 after deciding the level.  Anything else means "run to completion".  Stage 9 exists to separate "my
-/// worker code is wrong" from "PostgreSQL's worker startup is unhappy with how I drove it".  It exists because the worker path is new and a segfault there tells you
-/// nothing about which call caused it.
-pub static HNSWSQ_PARALLEL_STAGE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
-
-static mut RELOPT_KIND_HNSW: pg_sys::relopt_kind::Type = 0;
+static mut RELOPT_KIND_HNSW2: pg_sys::relopt_kind::Type = 0;
 
 /// Initialize GUC variables and reloptions for the hnswsq access method.
 pub unsafe fn init() {
     pgrx::GucRegistry::define_int_guc(
-        unsafe { std::ffi::CStr::from_ptr("hnswsq.ef_search".as_pg_cstr()) },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "The search width (ef) used when querying an hnswsq index".as_pg_cstr(),
-            )
-        },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "Higher values increase recall at the cost of speed; must be at \
-                 least the query's LIMIT."
-                    .as_pg_cstr(),
-            )
-        },
-        &HNSWSQ_EF_SEARCH,
+        c"hnswsq.ef_search",
+        c"The search width (ef) used when querying an hnswsq index",
+        c"Higher values increase recall at the cost of speed; must be at least the query's LIMIT.",
+        &HNSW_EF_SEARCH,
         1,
         1000,
         pgrx::GucContext::Userset,
         pgrx::GucFlags::default(),
     );
 
-    pgrx::GucRegistry::define_bool_guc(
-        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_stats".as_pg_cstr()) },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "Report per-phase hnswsq build timing counters when a build finishes".as_pg_cstr(),
-            )
-        },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "Diagnostic only: adds a few Instant::now() calls per inserted node.".as_pg_cstr(),
-            )
-        },
-        &HNSWSQ_BUILD_STATS,
+    pgrx::GucRegistry::define_enum_guc(
+        c"hnswsq.iterative_scan",
+        c"Continues index scans to find more tuples (off, relaxed, strict)",
+        c"Filtered queries need this; relaxed stops early when the index runs out of candidates, strict also enforces exact non-decreasing distance order.",
+        &HNSW_ITERATIVE_SCAN,
         pgrx::GucContext::Userset,
         pgrx::GucFlags::default(),
     );
 
     pgrx::GucRegistry::define_int_guc(
-        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_backlink_mode".as_pg_cstr()) },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "Backlink admission during hnswsq builds (0 = ranked/cutoff, 1 = exact)".as_pg_cstr(),
-            )
-        },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "0 selects the Lance-style ranked list (append, prune on overflow, skip edges \
-                 worse than the target's current worst neighbour); 1 selects the exact \
-                 incremental re-prune.  Build-only; index contents and transactional \
-                 behaviour are otherwise unchanged."
-                    .as_pg_cstr(),
-            )
-        },
-        &HNSWSQ_BACKLINK_MODE,
-        0,
-        1,
-        pgrx::GucContext::Userset,
-        pgrx::GucFlags::default(),
-    );
-
-    pgrx::GucRegistry::define_int_guc(
-        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_engine".as_pg_cstr()) },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "In-memory build engine (0 = legacy MemGraph, 1 = flat engine)".as_pg_cstr(),
-            )
-        },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "Development switch for A/B testing the two in-memory build engines; \
-                 the two can differ slightly in graph quality because their backlink \
-                 policies differ."
-                    .as_pg_cstr(),
-            )
-        },
-        &HNSWSQ_BUILD_ENGINE,
-        0,
-        1,
-        pgrx::GucContext::Userset,
-        pgrx::GucFlags::default(),
-    );
-
-    pgrx::GucRegistry::define_int_guc(
-        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_backfill".as_pg_cstr()) },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "Fill own neighbour lists with the closest pruned candidates (0 = heuristic only)".as_pg_cstr(),
-            )
-        },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "Development knob: backfill trades build time for recall; measured at 100k dim-128 it costs ~51% build time and gains ~9.5 recall points at ef 40."
-                    .as_pg_cstr(),
-            )
-        },
-        &HNSWSQ_BUILD_BACKFILL,
-        0,
-        1,
-        pgrx::GucContext::Userset,
-        pgrx::GucFlags::default(),
-    );
-
-    pgrx::GucRegistry::define_int_guc(
-        unsafe { std::ffi::CStr::from_ptr("hnswsq.parallel_stage".as_pg_cstr()) },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "Debug only: stop a parallel worker after N steps (0 = run the build)."
-                    .as_pg_cstr(),
-            )
-        },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "1 relations, 2 index info, 3 scan, 4 worker state; 0 or >4 runs the build."
-                    .as_pg_cstr(),
-            )
-        },
-        &HNSWSQ_PARALLEL_STAGE,
-        0,
-        9,
-        pgrx::GucContext::Userset,
-        pgrx::GucFlags::default(),
-    );
-
-    pgrx::GucRegistry::define_int_guc(
-        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_seed".as_pg_cstr()) },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "RNG seed for hnswsq index builds (-1 = entropy)".as_pg_cstr(),
-            )
-        },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "Pins the level-assignment RNG so repeated builds of the same data are                  identical; -1 (default) seeds from entropy as in production."
-                    .as_pg_cstr(),
-            )
-        },
-        &HNSWSQ_BUILD_SEED,
+        c"hnswsq.max_scan_tuples",
+        c"Max tuples an hnswsq iterative scan examines (-1 = unlimited)",
+        c"Bounds the work a filtered query can do; only applies when iterative_scan is on.",
+        &HNSW_MAX_SCAN_TUPLES,
         -1,
         i32::MAX,
         pgrx::GucContext::Userset,
@@ -333,30 +201,20 @@ pub unsafe fn init() {
     );
 
     pgrx::GucRegistry::define_int_guc(
-        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_workers".as_pg_cstr()) },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "Parallel workers for an in-memory build. 0 = single-builder path (the safe default); N > 0 asks for N workers. The parallel path refuses a build whose rows do not fit the arena (maintenance_work_mem, which also sizes the single-builder graph) instead of spilling mid-build; ambuild skips it up front when the row count is known to be too big. Build-time only: the transactional insert and query paths are unaffected.".as_pg_cstr(),
-            )
-        },
-        unsafe {
-            std::ffi::CStr::from_ptr(
-                "Parallelizes only the in-memory build; index contents and transactional \
-                 behaviour are unchanged. 0 selects min(cores, 4); 1 disables parallelism."
-                    .as_pg_cstr(),
-            )
-        },
-        &HNSWSQ_BUILD_WORKERS,
-        0,
-        64,
+        c"hnswsq.build_seed",
+        c"RNG seed for hnswsq index builds (-1 = entropy)",
+        c"Pins the level-assignment RNG so repeated builds of the same data are identical; -1 (default) seeds from entropy as in production.",
+        &HNSW_BUILD_SEED,
+        -1,
+        i32::MAX,
         pgrx::GucContext::Userset,
         pgrx::GucFlags::default(),
     );
 
-    RELOPT_KIND_HNSW = pg_sys::add_reloption_kind();
+    RELOPT_KIND_HNSW2 = pg_sys::add_reloption_kind();
 
     pg_sys::add_string_reloption(
-        RELOPT_KIND_HNSW,
+        RELOPT_KIND_HNSW2,
         "storage_layout".as_pg_cstr(),
         "Node vector precision: plain, ieeefp16 (f16), ieeefp8, or f8 (sq8)"
             .as_pg_cstr(),
@@ -366,7 +224,7 @@ pub unsafe fn init() {
     );
 
     pg_sys::add_int_reloption(
-        RELOPT_KIND_HNSW,
+        RELOPT_KIND_HNSW2,
         "m".as_pg_cstr(),
         "Maximum number of neighbors per node per upper layer (layer 0 uses 2*m)"
             .as_pg_cstr(),
@@ -377,7 +235,7 @@ pub unsafe fn init() {
     );
 
     pg_sys::add_int_reloption(
-        RELOPT_KIND_HNSW,
+        RELOPT_KIND_HNSW2,
         "ef_construction".as_pg_cstr(),
         "The search list size used during build and insert".as_pg_cstr(),
         DEFAULT_EF_CONSTRUCTION,
@@ -387,7 +245,7 @@ pub unsafe fn init() {
     );
 
     pg_sys::add_int_reloption(
-        RELOPT_KIND_HNSW,
+        RELOPT_KIND_HNSW2,
         "sample_size".as_pg_cstr(),
         "Vectors reservoir-sampled for SQ8 (f8) calibration (0 = auto, 30000)"
             .as_pg_cstr(),
@@ -427,7 +285,7 @@ pub unsafe extern "C-unwind" fn amoptions(
         {
             pg_sys::relopt_parse_elt {
                 optname: optname.as_pg_cstr(),
-                opttype: opttype,
+                opttype,
                 offset,
             }
         }
@@ -435,7 +293,7 @@ pub unsafe extern "C-unwind" fn amoptions(
         {
             pg_sys::relopt_parse_elt {
                 optname: optname.as_pg_cstr(),
-                opttype: opttype,
+                opttype,
                 offset,
                 isset_offset: 0,
             }
@@ -446,111 +304,33 @@ pub unsafe extern "C-unwind" fn amoptions(
         make_relopt_parse_elt(
             "storage_layout",
             pg_sys::relopt_type::RELOPT_TYPE_STRING,
-            offset_of!(TSVHnswOptions, storage_layout_offset) as i32,
+            offset_of!(Hnsw2Options, storage_layout_offset) as i32,
         ),
         make_relopt_parse_elt(
             "m",
             pg_sys::relopt_type::RELOPT_TYPE_INT,
-            offset_of!(TSVHnswOptions, m) as i32,
+            offset_of!(Hnsw2Options, m) as i32,
         ),
         make_relopt_parse_elt(
             "ef_construction",
             pg_sys::relopt_type::RELOPT_TYPE_INT,
-            offset_of!(TSVHnswOptions, ef_construction) as i32,
+            offset_of!(Hnsw2Options, ef_construction) as i32,
         ),
         make_relopt_parse_elt(
             "sample_size",
             pg_sys::relopt_type::RELOPT_TYPE_INT,
-            offset_of!(TSVHnswOptions, sample_size) as i32,
+            offset_of!(Hnsw2Options, sample_size) as i32,
         ),
     ];
 
-    /* Parse the user-given reloptions */
-    let rdopts = pg_sys::build_reloptions(
-        reloptions,
-        validate,
-        RELOPT_KIND_HNSW,
-        std::mem::size_of::<TSVHnswOptions>(),
-        tab.as_ptr(),
-        tab.len() as i32,
-    );
-
-    rdopts as *mut pg_sys::bytea
-}
-
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
-mod tests {
-    use super::*;
-    use pgrx::*;
-
-    #[pg_test]
-    unsafe fn test_hnswsq_options_defaults() -> spi::Result<()> {
-        crate::access_method::hnswsq::lock_suite_for_test();
-        Spi::run(
-            "CREATE TABLE test(encoding vector(3));
-        CREATE INDEX idxtest
-                  ON test
-               USING hnswsq(encoding);",
-        )?;
-
-        let index_oid =
-            Spi::get_one::<pg_sys::Oid>("SELECT 'idxtest'::regclass::oid")?.expect("oid was null");
-        let indexrel = PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid));
-        let options = TSVHnswOptions::from_relation(&indexrel);
-        assert_eq!(options.get_m(), DEFAULT_M as u16);
-        assert_eq!(options.get_ef_construction(), DEFAULT_EF_CONSTRUCTION as u32);
-        assert_eq!(options.get_precision(), HnswPrecision::Plain);
-        assert_eq!(options.get_sample_size(), None);
-        Ok(())
-    }
-
-    #[pg_test]
-    unsafe fn test_hnswsq_options_custom() -> spi::Result<()> {
-        crate::access_method::hnswsq::lock_suite_for_test();
-        Spi::run(
-            "CREATE TABLE test(encoding vector(3));
-        CREATE INDEX idxtest
-                  ON test
-               USING hnswsq(encoding)
-               WITH (storage_layout = ieeefp8, m = 24, ef_construction = 128, sample_size = 500);",
-        )?;
-
-        let index_oid =
-            Spi::get_one::<pg_sys::Oid>("SELECT 'idxtest'::regclass::oid")?.expect("oid was null");
-        let indexrel = PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid));
-        let options = TSVHnswOptions::from_relation(&indexrel);
-        assert_eq!(options.get_m(), 24);
-        assert_eq!(options.get_ef_construction(), 128);
-        assert_eq!(options.get_precision(), HnswPrecision::IeeeFp8);
-        assert_eq!(options.get_sample_size(), Some(500));
-        Ok(())
-    }
-
-    #[pg_test]
-    unsafe fn test_hnswsq_options_aliases() -> spi::Result<()> {
-        crate::access_method::hnswsq::lock_suite_for_test();
-        Spi::run(
-            "CREATE TABLE test(encoding vector(3));
-        CREATE INDEX idx16 ON test USING hnswsq(encoding) WITH (storage_layout = f16);
-        CREATE INDEX idxsq8 ON test USING hnswsq(encoding) WITH (storage_layout = sq8);",
-        )?;
-
-        let oid16 =
-            Spi::get_one::<pg_sys::Oid>("SELECT 'idx16'::regclass::oid")?.expect("oid was null");
-        let rel16 = PgRelation::from_pg(pg_sys::RelationIdGetRelation(oid16));
-        assert_eq!(
-            TSVHnswOptions::from_relation(&rel16).get_precision(),
-            HnswPrecision::IeeeFp16
-        );
-
-        let oid8 =
-            Spi::get_one::<pg_sys::Oid>("SELECT 'idxsq8'::regclass::oid")?.expect("oid was null");
-        let rel8 = PgRelation::from_pg(pg_sys::RelationIdGetRelation(oid8));
-        assert_eq!(
-            TSVHnswOptions::from_relation(&rel8).get_precision(),
-            HnswPrecision::Sq8
-        );
-        Ok(())
+    unsafe {
+        pg_sys::build_reloptions(
+            reloptions,
+            validate,
+            RELOPT_KIND_HNSW2,
+            std::mem::size_of::<Hnsw2Options>(),
+            tab.as_ptr(),
+            tab.len() as i32,
+        ) as *mut pg_sys::bytea
     }
 }
