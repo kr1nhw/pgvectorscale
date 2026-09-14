@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M6/BIGANN: parallel is 2.1x SLOWER than single-builder** | **open** | 374.7 s vs 179.5 s at 4 workers, while recall is *better* (0.775 vs 0.742 at ef=10) |
 | **M3 step 6a: full hnswsq suite green after the parallel work** | **done** | 122 passed, 0 failed (356 s) |
 | M3 step 5z: recall at 7 workers | **done** | identical to 4 workers (0.6/0.8/0.8/1.0/1.0) with `no_incoming` doubled |
 | M3 step 5y: 8-worker point, sweep complete | **done** | 7 of 8 launched, 23.4 s vs 35.3 s at 4; `no_incoming` 3375 (0.34%) |
@@ -2108,6 +2109,48 @@ verification.
 3j.22 because a `#[pg_test]`'s fixtures are uncommitted and a worker's snapshot cannot see them.  The
 `CREATE INDEX` path has since made that test redundant in substance (the same thing is verified
 against real committed tables every round), so it should be deleted rather than left ignored.
+
+### 3j.43 BIGANN, dim 128: the parallel build is *slower* than single-builder
+
+Host 121 (32 vCPU, 121 GB), `items_1m` (1M rows, dim 128), `gt_1m` (100 queries), `m=16`,
+`ef_construction=64`, plain layout, `maintenance_work_mem=2GB`, fresh index per build, this source
+built and installed there:
+
+| build | wall | recall@10 at ef 10 / 20 / 40 / 80 / 160 / 320 / 640 | `no_incoming` |
+|---|---|---|---|
+| single-builder, flat engine, 1 worker | **179.5 s** | 0.742 / 0.830 / 0.913 / 0.966 / 0.991 / 0.999 / 1.000 | 16 |
+| parallel, 4 workers | **374.7 s** | 0.775 / 0.879 / 0.938 / 0.976 / 0.992 / 0.999 / 1.000 | 8 |
+
+The baseline reproduces the recorded single-core flat BIGANN build exactly (178 s recorded, and the
+recall sweep 74.2 / 83.0 / 91.3 / 96.6 / 99.1 matches the recorded figures), so the control is sound
+and the comparison is like-for-like.
+
+Two findings, and they point in opposite directions:
+
+* **the time acceptance target is not met on this dataset**: 374.7 s against <=160 s, and 2.1x
+  *slower* than the single-builder path it is supposed to accelerate.  Every local measurement said
+  the opposite (1M dim-16: 109.5 s at 1 worker, 23.4 s at 7), so the difference tracks the vector
+  stride -- dim 16 (64 B) versus dim 128 (512 B), i.e. an arena of ~718 MB against ~28 MB.
+* **recall is better at every ef** (and `no_incoming` is 8 rather than 16), which is consistent with
+  the earlier observation that the parallel graph differs rather than degrades.
+
+Hypotheses for the slowdown, none yet tested:
+
+1. **Lock traffic.**  Each backlink takes its target's node write lock; with `ef_construction=64` that
+   is O(64) lock operations per insert, or ~64M for the build, all on a shared arena.  The
+   single-builder path takes none.  If a large part of that is *contended* (popular nodes, the entry
+   region), four workers can spend their time queuing rather than computing.
+2. **The arena is a dsm segment.**  A 718 MB arena lives in shared memory (`/dev/shm`), while the
+   single-builder graph is private anonymous memory; different NUMA and huge-page behaviour on a
+   32-core box could account for a factor of two on its own.
+3. **Search under a moving graph.**  A worker searching the shared graph sees inserts arriving, so its
+   candidate sets are less stable than a single builder's monotone view -- plausible, but it should
+   change *quality*, not cost this much.
+
+The decisive next measurement is the worker-count scan already launched on the same dataset (1, 2, 8
+workers, same definition): if cost grows with the worker count it is contention; if one worker is
+already slower than the single-builder baseline, it is the infrastructure (arena placement or the
+per-insert lock discipline) rather than concurrency.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
