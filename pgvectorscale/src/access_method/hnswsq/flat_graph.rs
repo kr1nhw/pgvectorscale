@@ -39,6 +39,11 @@ pub struct FlatGraph {
     /// Ids per (node, layer) slab (`max(m, m0)`).
     cap: usize,
     levels: Vec<u8>,
+    /// Nodes handed out so far -- the authoritative node count, in both modes.
+    /// It is not `levels.len()`: with the level region in the chunk the `Vec` is
+    /// empty.  Also the id the next claim gets, so it must advance before anything
+    /// else can observe the new slot.
+    nodes_used: usize,
     tids: Vec<ItemPointer>,
     clamped: Vec<bool>,
     /// `len * stride` bytes: node `i`'s encoded vector at `i * stride`.  Empty when
@@ -46,8 +51,8 @@ pub struct FlatGraph {
     vectors: Vec<u8>,
     /// When set, node storage lives in this chunk (the arena shape) instead of the
     /// `Vec`s, and `layout` describes its regions.  Being converted region by region:
-    /// `vectors`, `ids` and `lens` are in the chunk, the rest follow, at which point
-    /// the `Vec` fields disappear.
+    /// `vectors`, `ids`, `lens` and `levels` are in the chunk, the rest follow, at
+    /// which point the `Vec` fields disappear.
     chunk: Option<Chunk>,
     layout: ArenaLayout,
     /// `slab_off[node]` = index of the node's layer-0 slab; a node with
@@ -87,6 +92,7 @@ impl FlatGraph {
             stride,
             cap,
             levels: Vec::new(),
+            nodes_used: 0,
             tids: Vec::new(),
             clamped: Vec::new(),
             vectors: Vec::new(),
@@ -117,7 +123,7 @@ impl FlatGraph {
         // region, so the `Vec` copy stays empty (and `heap_bytes` reports the layout).
         g.layout = arena_layout(stride, cap, max_nodes, max_slabs);
         g.chunk = Some(Chunk::new(g.layout));
-        g.levels.reserve_exact(max_nodes);
+        // `levels` is a chunk region now too, so no `Vec` capacity for it.
         g.tids.reserve_exact(max_nodes);
         g.clamped.reserve_exact(max_nodes);
         g.slab_off.reserve_exact(max_nodes);
@@ -145,8 +151,13 @@ impl FlatGraph {
         if self.len() >= self.max_nodes || self.slabs_used + layers > self.max_slabs {
             return None;
         }
-        let id = self.len() as u32;
-        self.levels.push(level);
+        let id = self.nodes_used as u32;
+        self.nodes_used += 1;
+        match self.chunk.as_mut() {
+            Some(chunk) => chunk.region_bytes_mut(self.layout.levels)[id as usize] = level,
+            None => self.levels.push(level),
+        }
+        debug_assert!(self.chunk.is_some() || self.levels.len() == self.nodes_used);
         self.tids.push(ItemPointer::new_invalid());
         self.clamped.push(false);
         if self.chunk.is_none() {
@@ -225,7 +236,7 @@ impl FlatGraph {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.levels.len()
+        self.nodes_used
     }
 
     #[inline]
@@ -270,7 +281,7 @@ impl FlatGraph {
             .claim_slot(level)
             .expect("graph capacity exhausted (use try_push_node, or claim/publish)");
         self.publish(id, tid, clamped, encoded);
-        debug_assert_eq!(self.slab_off.len(), self.levels.len());
+        debug_assert_eq!(self.slab_off.len(), self.nodes_used);
         debug_assert!(self.slab_base(id).is_some());
     }
 
@@ -328,7 +339,10 @@ impl FlatGraph {
 
     #[inline]
     pub fn level(&self, id: u32) -> u8 {
-        self.levels[id as usize]
+        match &self.chunk {
+            Some(chunk) => chunk.region_bytes(self.layout.levels)[id as usize],
+            None => self.levels[id as usize],
+        }
     }
 
     #[inline]
@@ -374,14 +388,14 @@ impl FlatGraph {
     #[inline]
     fn slab(&self, id: u32, layer: usize) -> Option<usize> {
         let base = self.slab_base(id)?;
-        (layer <= self.levels[id as usize] as usize).then_some(base + layer)
+        (layer <= self.level(id) as usize).then_some(base + layer)
     }
 
     #[inline]
     fn slab_base(&self, id: u32) -> Option<usize> {
         let base = *self.slab_off.get(id as usize)? as usize;
         // A node with `level + 1` layers must own that many slabs.
-        let layers = self.levels[id as usize] as usize + 1;
+        let layers = self.level(id) as usize + 1;
         (base + layers <= self.slabs_used).then_some(base)
     }
 }
@@ -741,6 +755,17 @@ mod tests {
         let claimed = g.claim_slot(2).expect("room for a 3-layer node");
         assert_eq!(g.slab_usage(), (5, 9), "a 3-layer claim reserves 3 slabs");
         assert_eq!(g.slab_base(claimed), Some(2));
+        assert_eq!(g.len(), 3, "the node cursor advanced with the claim");
+        assert_eq!(g.level(claimed), 2, "the level comes from the chunk's region");
+        assert_eq!(g.level(0), 0, "and earlier nodes keep theirs");
+        assert_eq!(
+            g.chunk.as_ref().unwrap().region_bytes(g.layout.levels)[claimed as usize],
+            2
+        );
+        assert!(g.levels.is_empty(), "no Vec copy of the levels either");
+        // Layers beyond the node's level are not slabs of its own.
+        assert_eq!(g.slab_base(0), Some(0));
+        assert_eq!(g.neighbors(0, 1), &[] as &[u32], "level-0 node has one layer");
         // Claimed-but-unwritten storage reads as zeros from the zeroed chunk.
         assert_eq!(g.vector(claimed), &[0u8; 8]);
         g.publish(claimed, tid(3), false, &[3u8; 8]);
@@ -755,6 +780,9 @@ mod tests {
         assert!(!g.vectors.is_empty());
         assert_eq!(g.slab_usage(), (2, usize::MAX), "grow mode counts slabs too");
         assert_eq!(g.lens.len(), 2, "and keeps the length store in lockstep");
+        assert_eq!(g.len(), 1, "the node cursor counts nodes, not slabs");
+        assert_eq!(g.level(0), 1);
+        assert_eq!(g.levels.len(), 1, "and keeps the level store in lockstep");
         assert_eq!(g.slab_base(0), Some(0));
     }
 

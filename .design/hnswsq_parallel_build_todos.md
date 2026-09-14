@@ -22,7 +22,7 @@ pinned seed, release, same host, unless stated):
 | structural gate (`check_lists`, both engines) | done | wired into the stats line; found the connectivity finding below |
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
-| M3 storage swap (region by region) | in progress | `vectors` ✓, `ids` ✓, `lens` ✓ + `slabs_used` cursor; fingerprint gate bit-identical after each (§3j) |
+| M3 storage swap (region by region) | in progress | `vectors` ✓, `ids` ✓, `lens` ✓ + `slabs_used`, `levels` ✓ + `nodes_used`; fingerprint gate bit-identical after each (§3j) |
 | suite has 2 pre-existing red IVF tests | not ours | `ivf::options::tests::pg_test_ivf_options_{defaults,custom}`: no default opclass exists (§3j) |
 
 **Remaining, in order:**
@@ -717,6 +717,7 @@ bytes live, never which graph is built.
 | 1 | `vectors` (encoded node vectors) | identical, 22.84 s |
 | 2 | `ids` (`slabs * cap` neighbour ids) | identical |
 | 3 | `lens` (slab lengths, + new `slabs_used` cursor) | identical |
+| 4 | `levels` (node levels, + new `nodes_used` cursor; `len()` reads it) | identical |
 
 Two consequences worth naming:
 
@@ -727,9 +728,16 @@ Two consequences worth naming:
   while grow mode still owns the storage.  The `ids`/`lens` `Vec` reserves in
   `with_limits` are gone, saving up to `max_slabs * cap * 4` bytes of dead
   allocation.
-* the remaining `Vec` fields (`levels`, `tids`, `clamped`, `published_flags`,
-  `slab_off`) each need the same treatment, and `len()` is `levels.len()` today,
-  so `levels` introduces the `nodes_used` cursor alongside `slabs_used`.
+* `levels` is the same shape of problem one level up: `len()` *was*
+  `levels.len()`, and the node cursor is what the id stream, the capacity budget
+  and the writeout all key off.  `nodes_used: usize` is now authoritative in both
+  modes, advanced in `claim_slot` before anything else can observe the slot, with
+  `level()` reading the chunk region and `slab`/`slab_base` going through that
+  accessor.  Grow mode keeps `levels`/`lens` `Vec`s exactly in lockstep (asserted),
+  so both modes answer identically while the conversion is in flight.
+* the remaining `Vec` fields (`tids`, `clamped`, `published_flags`, `slab_off`)
+  each need the same treatment; all four are fixed-width per node, so they need no
+  new cursor -- `nodes_used` already bounds them.
 
 **Suite state:** `cargo pgrx test pg18` reports 247 passed, 10 ignored, and **2
 failures that are pre-existing and unrelated**:
