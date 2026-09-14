@@ -22,7 +22,7 @@ pinned seed, release, same host, unless stated):
 | structural gate (`check_lists`, both engines) | done | wired into the stats line; found the connectivity finding below |
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
-| M3 storage swap (region by region) | in progress | `vectors` ✓, `ids` ✓, `lens` ✓ + `slabs_used`, `levels` ✓ + `nodes_used`; fingerprint gate bit-identical after each (§3j) |
+| M3 storage swap (region by region) | in progress | `vectors` ✓, `ids` ✓, `lens` ✓ + `slabs_used`, `levels` ✓ + `nodes_used`, `clamped`/`published` ✓; gate bit-identical after each (§3j) |
 | suite has 2 pre-existing red IVF tests | not ours | `ivf::options::tests::pg_test_ivf_options_{defaults,custom}`: no default opclass exists (§3j) |
 
 **Remaining, in order:**
@@ -718,6 +718,7 @@ bytes live, never which graph is built.
 | 2 | `ids` (`slabs * cap` neighbour ids) | identical |
 | 3 | `lens` (slab lengths, + new `slabs_used` cursor) | identical |
 | 4 | `levels` (node levels, + new `nodes_used` cursor; `len()` reads it) | identical |
+| 5 | `clamped` + `published` (per-node flags, byte regions) | identical |
 
 Two consequences worth naming:
 
@@ -735,9 +736,16 @@ Two consequences worth naming:
   `level()` reading the chunk region and `slab`/`slab_base` going through that
   accessor.  Grow mode keeps `levels`/`lens` `Vec`s exactly in lockstep (asserted),
   so both modes answer identically while the conversion is in flight.
-* the remaining `Vec` fields (`tids`, `clamped`, `published_flags`, `slab_off`)
-  each need the same treatment; all four are fixed-width per node, so they need no
-  new cursor -- `nodes_used` already bounds them.
+* the two per-node flags are byte regions and need no new cursor (`nodes_used`
+  bounds them).  They are the one place where the arena leans on something other
+  than an explicit write: the chunk arrives zeroed, so a freshly claimed node
+  already reads "unclamped, unpublished" -- and publication is what makes a node
+  observable, which is exactly the state the watermark relies on.  `claim_slot`
+  therefore writes both zeros anyway, so correctness never rests on allocation
+  zeroing.
+* left: `tids` and `slab_off`.  `tids` is the first region whose element is not a
+  scalar (`ItemPointer`, 6 bytes), so it reads through `region_slice::<T>` and
+  depends on the region's alignment being at least `align_of::<ItemPointer>()`.
 
 **Suite state:** `cargo pgrx test pg18` reports 247 passed, 10 ignored, and **2
 failures that are pre-existing and unrelated**:
