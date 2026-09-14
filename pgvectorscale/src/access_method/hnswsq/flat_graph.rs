@@ -29,6 +29,7 @@
 //! on-disk node format uses, so a slab can never hold more than a node page item
 //! would.
 
+use crate::access_method::hnswsq::arena::{arena_layout, ArenaLayout, Chunk};
 use crate::util::ItemPointer;
 
 /// Flat memory graph: parallel slabs, fixed capacity, no per-node allocation.
@@ -40,8 +41,15 @@ pub struct FlatGraph {
     levels: Vec<u8>,
     tids: Vec<ItemPointer>,
     clamped: Vec<bool>,
-    /// `len * stride` bytes: node `i`'s encoded vector at `i * stride`.
+    /// `len * stride` bytes: node `i`'s encoded vector at `i * stride`.  Empty when
+    /// the graph is chunk-backed (see `chunk`).
     vectors: Vec<u8>,
+    /// When set, node storage lives in this chunk (the arena shape) instead of the
+    /// `Vec`s, and `layout` describes its regions.  Being converted region by region:
+    /// `vectors` is the first (the hottest read path), the rest follow, at which point
+    /// the `Vec` fields disappear.
+    chunk: Option<Chunk>,
+    layout: ArenaLayout,
     /// `slab_off[node]` = index of the node's layer-0 slab; a node with
     /// `level + 1` layers owns `slab_off[node] .. slab_off[node] + level + 1`.
     slab_off: Vec<u32>,
@@ -78,6 +86,8 @@ impl FlatGraph {
             tids: Vec::new(),
             clamped: Vec::new(),
             vectors: Vec::new(),
+            chunk: None,
+            layout: arena_layout(0, 0, 0, 0),
             slab_off: Vec::new(),
             ids: Vec::new(),
             lens: Vec::new(),
@@ -98,10 +108,13 @@ impl FlatGraph {
         let mut g = Self::new(stride, cap);
         g.max_nodes = max_nodes;
         g.max_slabs = max_slabs;
+        // Chunk-backed from here on: the vector arena lives in the chunk's `vectors`
+        // region, so the `Vec` copy stays empty (and `heap_bytes` reports the layout).
+        g.layout = arena_layout(stride, cap, max_nodes, max_slabs);
+        g.chunk = Some(Chunk::new(g.layout));
         g.levels.reserve_exact(max_nodes);
         g.tids.reserve_exact(max_nodes);
         g.clamped.reserve_exact(max_nodes);
-        g.vectors.reserve_exact(max_nodes * stride);
         g.slab_off.reserve_exact(max_nodes);
         g.lens.reserve_exact(max_slabs);
         g.ids.reserve_exact(max_slabs * cap);
@@ -130,7 +143,9 @@ impl FlatGraph {
         self.levels.push(level);
         self.tids.push(ItemPointer::new_invalid());
         self.clamped.push(false);
-        self.vectors.resize(self.vectors.len() + self.stride, 0);
+        if self.chunk.is_none() {
+            self.vectors.resize(self.vectors.len() + self.stride, 0);
+        }
         self.slab_off.push(self.lens.len() as u32);
         self.lens.resize(self.lens.len() + layers, 0);
         self.ids.resize(self.lens.len() * self.cap, 0);
@@ -149,7 +164,13 @@ impl FlatGraph {
         self.tids[i] = tid;
         self.clamped[i] = clamped;
         let start = i * self.stride;
-        self.vectors[start..start + self.stride].copy_from_slice(encoded);
+        match self.chunk.as_mut() {
+            Some(chunk) => {
+                chunk.region_bytes_mut(self.layout.vectors)[start..start + self.stride]
+                    .copy_from_slice(encoded);
+            }
+            None => self.vectors[start..start + self.stride].copy_from_slice(encoded),
+        }
         self.published_flags[i] = true;
         while self.watermark < self.published_flags.len() && self.published_flags[self.watermark] {
             self.watermark += 1;
@@ -292,16 +313,26 @@ impl FlatGraph {
         self.clamped[id as usize]
     }
 
-    /// `id`'s encoded vector.
+    /// `id`'s encoded vector (from the chunk when the graph is chunk-backed, which
+    /// is the shape the arena uses: the same bytes, addressed by offset).
     #[inline]
     pub fn vector(&self, id: u32) -> &[u8] {
         let i = id as usize;
-        &self.vectors[i * self.stride..(i + 1) * self.stride]
+        let start = i * self.stride;
+        match &self.chunk {
+            Some(chunk) => {
+                &chunk.region_bytes(self.layout.vectors)[start..start + self.stride]
+            }
+            None => &self.vectors[start..start + self.stride],
+        }
     }
 
     /// Bytes of heap storage the graph's own structures occupy (used by the
     /// maintenance_work_mem budget accounting).
     pub fn heap_bytes(&self) -> usize {
+        if let Some(chunk) = &self.chunk {
+            return chunk.total_bytes();
+        }
         self.levels.capacity()
             + self.tids.capacity() * std::mem::size_of::<ItemPointer>()
             + self.clamped.capacity()
@@ -644,6 +675,36 @@ mod tests {
         assert_eq!(c.published, 1);
         assert_eq!(c.reachable_from_entry, 1, "{}", c.summary(4));
         assert!(!c.is_healthy(4), "an unpublished reachable id is not healthy");
+    }
+
+    #[test]
+    fn chunk_backed_graph_stores_vectors_in_the_chunk() {
+        let (stride, cap) = (8usize, 4usize);
+        let mut g = FlatGraph::with_limits(stride, cap, 8, 9);
+        assert!(g.chunk.is_some(), "with_limits is the arena shape");
+        assert_eq!(g.heap_bytes(), g.layout.total_bytes);
+
+        let a = [1u8; 8];
+        let b = [2u8; 8];
+        g.push_node(0, tid(1), false, &a);
+        g.push_node(0, tid(2), false, &b);
+        assert_eq!(g.vector(0), &a, "vectors come back from the chunk");
+        assert_eq!(g.vector(1), &b);
+        assert!(g.vectors.is_empty(), "no Vec copy alongside the chunk");
+
+        // ... and a claimed-but-unpublished node reads as zeros from the chunk.
+        let claimed = g.claim_slot(0).expect("room");
+        assert_eq!(g.vector(claimed), &[0u8; 8]);
+        g.publish(claimed, tid(3), false, &[3u8; 8]);
+        assert_eq!(g.vector(claimed), &[3u8; 8]);
+        assert_eq!(g.watermark(), 3);
+
+        // The grow-mode graph still uses its Vec.
+        let mut g = FlatGraph::new(stride, cap);
+        assert!(g.chunk.is_none());
+        g.push_node(0, tid(1), false, &a);
+        assert_eq!(g.vector(0), &a);
+        assert!(!g.vectors.is_empty());
     }
 
     #[test]
