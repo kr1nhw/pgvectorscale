@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5g: params carry the dimension; meta-page ordering found | done | worker codec is derivable; leader must write meta before launching |
 | M3 step 5f: level from a raw `ItemPointerData` | done | block hi/lo decoding pinned, incl. blocks > 65535 |
 | M3 step 5e: one insert body, two level sources | done | `flat_insert_at_level` + `level_seed`; gate bit-identical |
 | M3 step 5d: post-join entry promotion | done | `promote_best_entry`; workers never promote |
@@ -1276,6 +1277,29 @@ large block does not decode to its own low half.
   `build.rs:~1545`.
 * the `index_build_range_scan` loop around it, plus the leader's writeout after the join and
   `amcanbuildparallel` under `build_parallel`.
+
+### 3j.19 What the worker must read from the index, and an ordering constraint
+
+Sizing up the worker's `BuildState` by reading how the leader derives its own produced two
+useful facts.
+
+**Almost nothing has to be re-derived.**  `m`, `m0`, `ef_construction`, precision, distance
+type, stride, `ml`, `max_level` and the seed all travel in `BuildParams` (that is what the
+struct is for), so a worker builds its state from the parameters rather than from the index's
+reloptions.  The one thing `BuildParams` was missing is the **dimension**: `stride = dim *
+elem_bytes` and `elem_bytes` depends on the precision, so the dimension is not recoverable
+from the stride alone.  It is now carried, and the driver tests still pass.
+
+**The meta page is the exception, and it sets an ordering constraint.**  `ml` and `max_level`
+come from the index's meta page, which the leader writes *during its own build*, so a parallel
+build has to write block 0 and the calibration chain **before launching workers** -- otherwise
+a worker would seed its state from a meta page that does not exist yet.  That is recorded on
+`leader_setup`, where the driver will need it.
+
+Still open for the worker body, and now precisely scoped: the `BuildState` literal has ~18
+fields, so growing one from `BuildParams` means reading the remaining ones (`m0`, `stats`,
+`reference_backlinks`, `backlink_mode`, ...) -- mechanical, but it is the next round's first
+move rather than something to guess at.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

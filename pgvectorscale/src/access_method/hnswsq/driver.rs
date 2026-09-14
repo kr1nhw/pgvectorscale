@@ -112,6 +112,14 @@ pub unsafe fn estimate_arena(
 
 /// Leader: allocate the segment and put the arena in it.
 ///
+/// **Ordering constraint, found by reading how the parameters are derived:** `ml` and
+/// `max_level` come from the index's *meta page*, which the leader writes during its own
+/// build.  So a parallel build has to write the meta page (block 0) and the calibration
+/// chain *before* launching workers, or a worker would seed its state from a meta page that
+/// does not exist yet.  The dimensions, `m`/`m0`/`ef_construction`, precision and distance
+/// type all travel in [`BuildParams`] instead of being re-derived, so the meta page is the
+/// only thing a worker still has to read from the index.
+///
 /// # Safety
 ///
 /// `pcxt` must have been sized with [`estimate_arena`] for the same `sizing`, and must not
@@ -172,6 +180,10 @@ pub struct BuildParams {
     pub heap_oid: u32,
     pub index_oid: u32,
     pub stride: u32,
+    /// Vector dimension.  The worker builds its `Codec` from this plus `precision`, and
+    /// `stride` alone is not enough to recover it (`stride = dim * elem_bytes`, and elem_bytes
+    /// depends on the precision).
+    pub num_dimensions: u32,
     pub cap: u32,
     pub m: u32,
     pub m0: u32,
@@ -512,6 +524,7 @@ mod tests {
                 heap_oid: 1,
                 index_oid: 2,
                 stride: stride as u32,
+                num_dimensions: 2,
                 cap: cap as u32,
                 m: 8,
                 m0: 16,
