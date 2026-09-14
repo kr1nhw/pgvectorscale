@@ -445,6 +445,39 @@ remaining question is purely the recall/build trade above; if legacy is at zero,
 append/shrink engine needs fix (2) (unconditional admission of the nearest backlink
 target, the `always_admit` shape from ranked mode).
 
+## 3e. Control experiment: the invisible nodes are normal for HNSW here, and the gate must change
+
+`MemGraph::list_checks` mirrors `flat_graph::check_lists`, so the legacy engine now
+reports the same structural numbers.  Same 100k dim-128 build, same seed:
+
+| engine | build | `no_incoming` | `reachable` | fingerprint |
+|---|---|---|---|---|
+| legacy (exact re-prune) | 21.54 s | **384** (0.38%) | 99 616 | `e4aaa8fa5d6b7f25` |
+| flat (append/shrink) | 20.90 s | **519** (0.52%) | 99 477 | `30db11c54b7edd31` |
+
+Three corrections follow, and they matter more than the code change:
+
+1. **The flat engine has no connectivity defect.**  The legacy engine -- the shipped,
+   exact policy -- also leaves 384 nodes without an incoming edge at this scale and
+   configuration (`m = 16`, `ef_construction = 64`, 100k rows).  The flat engine is
+   135 nodes (0.14 percentage points) worse; that is a policy delta, not a bug.
+2. **The gate "zero nodes without an incoming edge" is wrong as written.**  It came
+   from the 1000-node in-memory harness, where it holds; at 100k it does not hold for
+   either engine.  The acceptance criterion for `workers > 0` must therefore be
+   *relative to the same-policy single-worker build*: `no_incoming(W)` and
+   `reachable(W)` within a small tolerance of `no_incoming(1)`/`reachable(1)`, which
+   is exactly the same-policy comparison the recall gate already uses.  Absolute
+   connectivity stays useful as a *reported* number (and as a smoke check for the
+   arena), not as a pass/fail.
+3. **Fixes (1) and (2) are quality knobs, not defect fixes.**  Backfill measured as
+   +51% build for +9.5 recall points at ef 40 on this dataset and -93 invisible nodes;
+   unconditional admission of the nearest backlink would be a similar knob.  Both
+   belong to the same decision, to be taken on 1M BIGANN where the recall effect is
+   measurable at the operating point (99.4% at ef 160), not on this dataset.
+
+Also worth recording: `max_len == 32 == m0` in both engines, and `self_links == 0`,
+`duplicates == 0` in both, so the structural invariants that *must* hold do hold.
+
 ## 4. Test plan and gates
 
 * **Unit:** arena allocation/exhaustion/margin, `Rel<T>` round-trip, lock-order

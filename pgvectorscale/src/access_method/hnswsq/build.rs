@@ -116,6 +116,53 @@ impl MemGraph {
         self.list_masks.push(vec![[0u64; LIST_MASK_WORDS]; layers]);
     }
 
+    /// Structural gate on the in-memory graph, mirroring `flat_graph::check_lists`
+    /// so both engines report the same numbers: `(nodes, no_incoming, reachable,
+    /// self_links, duplicates, max_len)`.  This is the control that says whether the
+    /// flat engine's connectivity is normal for HNSW at this scale or a defect of
+    /// the append/shrink policy.
+    fn list_checks(&self, cap: usize) -> (usize, usize, usize, usize, usize, usize) {
+        let n = self.len();
+        let mut incoming = vec![0usize; n];
+        let (mut self_links, mut duplicates, mut max_len) = (0usize, 0usize, 0usize);
+        for node in 0..n {
+            let list = &self.neighbors[node][0];
+            max_len = max_len.max(list.len());
+            for (i, &nb) in list.iter().enumerate() {
+                let ni = nb as usize;
+                if ni == node {
+                    self_links += 1;
+                }
+                if list[..i].contains(&nb) {
+                    duplicates += 1;
+                }
+                if ni < n {
+                    incoming[ni] += 1;
+                }
+            }
+        }
+        let _ = cap; // capacity is reported by the caller's checks
+        let no_incoming = incoming.iter().filter(|&&c| c == 0).count();
+        let mut reachable = 0usize;
+        if let Some(entry) = self.entry.filter(|&e| (e as usize) < n) {
+            let mut seen = vec![false; n];
+            let mut stack = vec![entry];
+            seen[entry as usize] = true;
+            reachable = 1;
+            while let Some(node) = stack.pop() {
+                for &nb in &self.neighbors[node as usize][0] {
+                    let ni = nb as usize;
+                    if ni < n && !seen[ni] {
+                        seen[ni] = true;
+                        reachable += 1;
+                        stack.push(nb);
+                    }
+                }
+            }
+        }
+        (n, no_incoming, reachable, self_links, duplicates, max_len)
+    }
+
     /// Stable fingerprint of the graph's neighbour lists: nodes in id order,
     /// layers in ascending order, ids in list order, with a terminator between
     /// layers.  Iteration order only, so it never depends on hashing.  Used to
@@ -352,6 +399,19 @@ fn writeout_graph(state: &mut BuildState) {
             state.stats.check_max_len = checks.max_list_len;
         }
         state.graph = flat_to_mem(&flat.graph);
+        return;
+    }
+    if state.stats.enabled {
+        // Legacy engine: the same structural gate, as the control for the flat
+        // engine's connectivity numbers.
+        let (published, no_incoming, reachable, self_links, duplicates, max_len) =
+            state.graph.list_checks(state.m0);
+        state.stats.check_published = published;
+        state.stats.check_no_incoming = no_incoming;
+        state.stats.check_reachable = reachable;
+        state.stats.check_self_links = self_links;
+        state.stats.check_duplicates = duplicates;
+        state.stats.check_max_len = max_len;
     }
 }
 
