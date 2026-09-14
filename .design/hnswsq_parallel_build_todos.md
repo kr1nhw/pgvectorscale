@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 4c: arena in a `shm_toc` segment | done | `SharedArena::allocate`/`attach` by key; `pg_test` round-trips a real dsm segment |
 | M3 step 4b: node locks as LWLocks | done | `NodeLocks` over `RwLock`s *or* a tranche we register at runtime; 2 `pg_test`s |
 | M3 step 4a: chunk over shared memory | done | `Chunk` owns a `Vec<u64>` *or* borrows a segment (`attach`); relocation asserted by test (§3j) |
 | incremental exact-match probe test | flaky, not ours | `pg_test_hnswsq_incremental_empty_start_sq8_provisional`: 1 failure in one grouped run, clean on rerun (§3k) |
@@ -825,9 +826,35 @@ crate *without* `cfg(test)`, so the failure is "function tests.foo() does not ex
 at run time.  The module must be gated
 `#[cfg(any(test, feature = "pg_test"))]` and carry `#[pgrx::pg_schema]`.
 
-Still to come in step 4: the graph handle is built over the `shm_toc` lookup instead
-of `Chunk::new`, and the driver allocates the segment (chunk + locks together) so a
-worker attaches both from the toc.
+### 3j.3 The arena inside a segment (M3 step 4, third piece)
+
+`SharedArena` is what a participant actually holds: the shared header, the chunk and
+the node locks, all three living in a `shm_toc`.  The leader calls
+`SharedArena::allocate(toc, stride, cap, nodes, slabs, tranche)` once; every worker
+calls `unsafe SharedArena::attach(toc)` and gets the same three by **key**, never by
+pointer -- which is the whole point, since a worker's mapping address differs from
+the leader's.
+
+* `ArenaHeader` is `#[repr(C)]` POD carrying the region map and capacities, so the
+  two ends of a segment cannot disagree about the shape.  `Region`/`ArenaLayout` are
+  `#[repr(C)]` now too: they cross a process boundary, so their field layout must be
+  fixed rather than whatever the compiler prefers.
+* `attach` uses the new `shared_locks_in_segment`, which does **not** initialize the
+  LWLocks: re-running `init_shared_locks` would reset a lock a peer may be holding.
+  Initialization is the leader's job, once.
+* The three toc keys are fixed constants, and the segment magic is fixed rather than
+  random -- leader and workers are the same binary, and a wrong toc fails loudly at
+  the first key lookup instead of silently reading garbage.
+* `SharedArena::segment_bytes` gives the leader its payload estimate for
+  `shm_toc_estimate_chunk`; it deliberately excludes the toc's own key/alignment
+  overhead, which `shm_toc_estimate_keys` accounts for separately in the driver.
+
+Asserted by `a_shared_arena_round_trips_through_a_segment`: a real `dsm_create` +
+`shm_toc_create` segment, an arena allocated by key, then a second `attach` that sees
+the leader's writes, shares one lock array, and re-acquires locks after releasing
+them (which would hang rather than fail if a release leaked).  Still to come: the
+driver -- entry rendezvous, `table_index_build_scan`, and the shared cursors that
+today still live in `FlatGraph`'s own fields.
 
 **The swap is done:** every per-node array is a chunk region, the `Vec`s are empty in
 chunk mode, and only `nodes_used`/`slabs_used` are kept on the side.  The `Vec` arms

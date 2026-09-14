@@ -100,6 +100,22 @@ pub fn register_tranche(name: &'static std::ffi::CStr) -> i32 {
     }
 }
 
+/// The arena's view of LWLocks the leader already initialized.  Workers use this:
+/// re-running [`init_shared_locks`] would reset locks a peer may be holding.
+///
+/// # Safety
+///
+/// `locks` must point to `count` LWLocks in the shared segment that are initialized
+/// with a registered tranche and live as long as the segment does.
+pub unsafe fn shared_locks_in_segment(
+    locks: *mut pgrx::pg_sys::LWLock,
+    count: usize,
+) -> NodeLocks {
+    NodeLocks {
+        locks: LockBacking::Shared { locks, count },
+    }
+}
+
 /// Initialize `count` LWLocks in the shared segment and return the arena's view of
 /// them.  The leader calls this once, before any worker attaches.
 ///
@@ -238,6 +254,158 @@ impl NodeLocks {
 }
 
 // ---------------------------------------------------------------------------
+// The shared arena: one segment, allocated by the leader, attached by everyone
+// ---------------------------------------------------------------------------
+
+/// Magic for the segment's toc.  Fixed rather than random: the leader and every
+/// worker are the same binary, and a wrong toc is caught by the key lookup failing.
+pub const HNSWSQ_TOC_MAGIC: u64 = 0x686e_7377_7371_0001; // "hnswsq" + 1
+
+/// Fixed keys, so nobody has to negotiate who allocated what.
+pub const TOC_KEY_HEADER: u64 = 0x686e_7377_7371_0002;
+pub const TOC_KEY_CHUNK: u64 = 0x686e_7377_7371_0003;
+pub const TOC_KEY_LOCKS: u64 = 0x686e_7377_7371_0004;
+
+/// Everything a participant needs to find and size the arena: the region map, the
+/// capacities, and the tranche the node locks were initialized with.
+///
+/// Plain data -- `#[repr(C)]`, no pointers, no borrowed lifetimes -- because it is
+/// written once by the leader and read by workers in other processes.  The region
+/// map is offsets, which is what makes the arena relocatable in the first place.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ArenaHeader {
+    pub layout: ArenaLayout,
+    pub stride: usize,
+    pub cap: usize,
+    pub max_nodes: usize,
+    pub max_slabs: usize,
+    /// Registered tranche id of the node locks (diagnostics: shows up in `pg_locks`).
+    pub tranche: i32,
+    /// Keeps the struct's size independent of the `i32` above, so the two ends of the
+    /// segment cannot disagree about the offset of anything after it.
+    pub reserved: i32,
+}
+
+/// The arena as one participant holds it: the shared header, the chunk, and the
+/// node locks.  The leader allocates all three into a `shm_toc`; a worker (or the
+/// leader re-reading its own segment) attaches them by key.
+pub struct SharedArena {
+    header: *mut ArenaHeader,
+    chunk: Chunk,
+    locks: NodeLocks,
+}
+
+// SAFETY: the header, chunk and locks all live in the shared segment, which is
+// mapped in every participant; access is mediated by the LWLocks (cross-process)
+// and the arena protocol, exactly as for `NodeLocks` alone.
+unsafe impl Send for SharedArena {}
+unsafe impl Sync for SharedArena {}
+
+impl SharedArena {
+    /// Total segment bytes `allocate` will need for an arena of this shape, for the
+    /// leader's `shm_toc_estimate_chunk` call.
+    pub fn segment_bytes(stride: usize, cap: usize, nodes: usize, slabs: usize) -> usize {
+        let layout = arena_layout(stride, cap, nodes, slabs);
+        std::mem::size_of::<ArenaHeader>()
+            + layout.total_bytes
+            // Packed, not `LWLockPadded`: correctness first, and the padded variant is
+            // a false-sharing question the worker sweep can answer with data.
+            + nodes * std::mem::size_of::<pgrx::pg_sys::LWLock>()
+    }
+
+    /// Leader: allocate the whole arena inside `toc` and initialize its locks.
+    ///
+    /// # Safety
+    ///
+    /// `toc` must be a live `shm_toc` covering at least
+    /// [`SharedArena::segment_bytes`] plus room for three keys, and it must be
+    /// called exactly once per segment (a second call would hand out a second arena
+    /// under the same keys).
+    pub unsafe fn allocate(
+        toc: *mut pgrx::pg_sys::shm_toc,
+        stride: usize,
+        cap: usize,
+        nodes: usize,
+        slabs: usize,
+        tranche: i32,
+    ) -> Self {
+        let layout = arena_layout(stride, cap, nodes, slabs);
+        let header = pgrx::pg_sys::shm_toc_allocate(
+            toc,
+            std::mem::size_of::<ArenaHeader>(),
+        )
+        .cast::<ArenaHeader>();
+        let words = pgrx::pg_sys::shm_toc_allocate(toc, layout.total_bytes).cast::<u64>();
+        let lock_mem = pgrx::pg_sys::shm_toc_allocate(
+            toc,
+            nodes * std::mem::size_of::<pgrx::pg_sys::LWLock>(),
+        )
+        .cast::<pgrx::pg_sys::LWLock>();
+
+        header.write(ArenaHeader {
+            layout,
+            stride,
+            cap,
+            max_nodes: nodes,
+            max_slabs: slabs,
+            tranche,
+            reserved: 0,
+        });
+        pgrx::pg_sys::shm_toc_insert(toc, TOC_KEY_HEADER, header.cast());
+        pgrx::pg_sys::shm_toc_insert(toc, TOC_KEY_CHUNK, words.cast());
+        pgrx::pg_sys::shm_toc_insert(toc, TOC_KEY_LOCKS, lock_mem.cast());
+
+        Self {
+            header,
+            chunk: Chunk::attach(words, layout),
+            locks: init_shared_locks(lock_mem, nodes, tranche),
+        }
+    }
+
+    /// Worker (or the leader re-reading its own segment): attach by key.
+    ///
+    /// # Safety
+    ///
+    /// `toc` must contain an arena produced by [`SharedArena::allocate`] in the same
+    /// segment, and the segment must stay mapped for as long as this handle lives.
+    pub unsafe fn attach(toc: *mut pgrx::pg_sys::shm_toc) -> Self {
+        let header =
+            pgrx::pg_sys::shm_toc_lookup(toc, TOC_KEY_HEADER, false).cast::<ArenaHeader>();
+        let max_nodes = (*header).max_nodes;
+        let layout = (*header).layout;
+        let words = pgrx::pg_sys::shm_toc_lookup(toc, TOC_KEY_CHUNK, false).cast::<u64>();
+        let lock_mem =
+            pgrx::pg_sys::shm_toc_lookup(toc, TOC_KEY_LOCKS, false).cast::<pgrx::pg_sys::LWLock>();
+        Self {
+            header,
+            chunk: Chunk::attach(words, layout),
+            // No init: the leader already did it, and re-initializing would reset
+            // locks a peer may be holding.
+            locks: shared_locks_in_segment(lock_mem, max_nodes),
+        }
+    }
+
+    /// A copy of the shared header (it is POD, so this is a snapshot, not a borrow).
+    pub fn header(&self) -> ArenaHeader {
+        // SAFETY: `header` points into the mapped segment for this handle's lifetime.
+        unsafe { *self.header }
+    }
+
+    pub fn chunk(&self) -> &Chunk {
+        &self.chunk
+    }
+
+    pub fn chunk_mut(&mut self) -> &mut Chunk {
+        &mut self.chunk
+    }
+
+    pub fn locks(&self) -> &NodeLocks {
+        &self.locks
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared-chunk layout
 // ---------------------------------------------------------------------------
 
@@ -245,6 +413,7 @@ impl NodeLocks {
 /// pointers — the chunk is mapped at a different address in every process, so the
 /// graph may only ever refer to its own storage by offset (which the flat arrays
 /// already do: every access is index arithmetic).
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Region {
     pub offset: usize,
@@ -262,6 +431,7 @@ impl Region {
 /// Byte layout of the arena for `nodes` node slots and `slabs` `(node, layer)`
 /// lists.  Mirrors the flat graph's arrays one-for-one, so the storage swap is
 /// "point each array at its region" rather than a reshape.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArenaLayout {
     pub total_bytes: usize,
@@ -759,6 +929,67 @@ mod tests {
         let mut arena = arena;
         arena.grow_to(2); // no-op, exactly at capacity
         assert_eq!(arena.len(), 2);
+    }
+
+    #[pgrx::pg_test]
+    fn a_shared_arena_round_trips_through_a_segment() {
+        // The real allocation path: a dsm segment with a shm_toc in it, the arena
+        // allocated by key, then a second attach -- which is all a worker gets.
+        let size = 1usize << 20;
+        // SAFETY: a fresh backend-owned segment, detached before the test returns.
+        let seg = unsafe { pgrx::pg_sys::dsm_create(size, 0) };
+        assert!(!seg.is_null(), "dsm_create failed");
+        let toc = unsafe {
+            pgrx::pg_sys::shm_toc_create(
+                HNSWSQ_TOC_MAGIC,
+                pgrx::pg_sys::dsm_segment_address(seg),
+                size,
+            )
+        };
+        let tranche = register_tranche(c"hnswsq_shared_arena_test");
+        let (stride, cap, nodes, slabs) = (8usize, 4usize, 8usize, 9usize);
+        assert!(
+            SharedArena::segment_bytes(stride, cap, nodes, slabs) < size,
+            "the estimate must fit the segment the leader asks for"
+        );
+
+        let mut leader =
+            unsafe { SharedArena::allocate(toc, stride, cap, nodes, slabs, tranche) };
+        let header = leader.header();
+        assert_eq!((header.stride, header.cap), (stride, cap));
+        assert_eq!((header.max_nodes, header.max_slabs), (nodes, slabs));
+        assert_eq!(header.tranche, tranche, "the tranche travels with the header");
+
+        // Write through the leader's handle, read through a fresh attach: same bytes,
+        // found by key rather than passed by pointer.
+        let layout = header.layout;
+        leader.chunk_mut().region_bytes_mut(layout.levels)[3] = 5;
+        leader.chunk_mut().region_u32_mut(layout.slab_off)[1] = 7;
+        assert!(!leader.chunk().is_owned(), "a segment chunk is never freed by us");
+
+        let view = unsafe { SharedArena::attach(toc) };
+        assert_eq!(view.header().max_nodes, nodes);
+        assert_eq!(view.chunk().region_bytes(layout.levels)[3], 5);
+        assert_eq!(view.chunk().region_u32(layout.slab_off)[1], 7);
+        assert!(view.locks().is_shared());
+        assert_eq!(view.locks().len(), nodes);
+
+        // Both handles share one lock array, so re-acquiring after a guard drops
+        // would hang rather than fail if a release were missing.
+        {
+            let _w = leader.locks().write(0);
+        }
+        {
+            let _w = view.locks().write(0);
+        }
+        {
+            let _r = view.locks().read(0);
+        }
+
+        drop(view);
+        drop(leader);
+        // SAFETY: no handle references the mapping any more.
+        unsafe { pgrx::pg_sys::dsm_detach(seg) };
     }
 
     #[pgrx::pg_test]
