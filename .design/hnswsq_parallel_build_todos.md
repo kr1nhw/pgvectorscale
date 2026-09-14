@@ -626,6 +626,61 @@ workers), so the acceptance number is about worker scaling, not about squeezing 
 sequential engine -- and if recall at low ef is the binding constraint, `bf=1` buys it
 back inside the same budget.
 
+## 3i. Storage swap: the route that does not ripple (Route C), and why the others do
+
+The swap must not change any signature the engine, the driver or the tests use, or it
+becomes the "half-ported hot file" the side-by-side approach exists to avoid.  Three
+routes were considered:
+
+* **Route A -- `FlatGraph<'a>` with slices.**  Replace the eight `Vec` fields with
+  `&'a mut [T]` slices taken from the chunk.  Zero indirection change, but the lifetime
+  parameter ripples through `search_layer_flat`, `select_neighbors_flat`, `plan_flat`,
+  `apply_flat`, `flat_insert`, `FlatEngineState`, every test helper and the globals that
+  hold them -- a wide, compile-iteration-heavy change.
+* **Route B -- a storage trait with two implementations.**  The arena cannot hand out a
+  borrowed `&[u32]` without leaking a lock guard, so the trait's read methods would have
+  to be copy-into-buffer, which *changes* the hot search/selection loops (and their
+  allocation behaviour) -- the one thing the flat layout was built to fix.
+* **Route C -- keep the field list, replace the backing (recommended).**  `FlatGraph`
+  holds **one** `Chunk` plus the `ArenaLayout` offsets and two cursors (`nodes`,
+  `slabs`), and every existing accessor is implemented over the chunk:
+
+  | today | after |
+  |---|---|
+  | `levels: Vec<u8>` | `chunk.region_bytes(&layout.levels)[..nodes]` |
+  | `tids: Vec<ItemPointer>` | `chunk.region_slice::<ItemPointer>(&layout.tids)[..nodes]` |
+  | `clamped`, `published_flags: Vec<bool>` | `chunk.region_bytes(..)[..nodes]` (one byte per node; `bool` only at the edges) |
+  | `vectors: Vec<u8>` | `chunk.region_bytes(&layout.vectors)[..nodes * stride]` |
+  | `slab_off: Vec<u32>` | `chunk.region_u32(&layout.slab_off)[..nodes]` |
+  | `lens: Vec<u16>` | `chunk.region_u16(&layout.lens)[..slabs]` |
+  | `ids: Vec<u32>` | `chunk.region_u32(&layout.ids)[..slabs * cap]` |
+
+  `Chunk` needs read-only twins of the three mutable accessors (`region_bytes`,
+  `region_u32`, `region_u16`, `region_slice`), which is mechanical.  Consequences:
+
+  * **no signature changes anywhere** -- `push_node`, `try_push_node`, `claim_slot`,
+    `publish`, `set_list`, `neighbors`, `copy_neighbors`, `vector`, `watermark`,
+    `check_lists`, and therefore the engine, the driver and the tests all compile as-is;
+  * growth mode (`usize::MAX` budgets) becomes "a chunk sized by the caller"; the
+    prototype keeps a grow-mode path by reallocating a bigger chunk and copying, which is
+    only used by tests and by the non-parallel driver -- or, simpler, `new()` allocates a
+    chunk sized by a default cap and `with_limits` by the budget, dropping the growing
+    behaviour the arena never uses;
+  * `heap_bytes()` becomes `layout.total_bytes` (plus the chunk's own overhead), so budget
+    accounting gets *more* accurate than the `Vec::capacity` sum it reports today;
+  * verification is already in place: the 100k and 1M builds must reproduce their
+    fingerprints (`30db11c54b7edd31` at 100k, `7ff861f019ba8dc3` at BIGANN 1M, both with
+    `build_backfill = 0`), and `check_lists` must report the same numbers.  A swap that
+    changes either has changed behaviour.
+
+**Order of work for the next session** (each step compiles and tests on its own):
+1. add `Chunk`'s read-only accessors + a couple of unit tests;
+2. replace `FlatGraph`'s fields with `chunk` + `layout` + cursors, keeping the accessor
+   bodies as thin wrappers (this is the one wide-ish edit, and it is confined to
+   `flat_graph.rs`);
+3. run `cargo pgrx test pg18 flat_` (25 tests) and the two fingerprint builds;
+4. only then allocate the chunk from `shm_toc` and swap `NodeLocks` for LWLock tranches.
+
 ## 4. Test plan and gates
 
 * **Unit:** arena allocation/exhaustion/margin, `Rel<T>` round-trip, lock-order
