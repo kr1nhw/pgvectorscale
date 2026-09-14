@@ -28,7 +28,7 @@ use crate::access_method::hnswsq::graph::{
     distance_encoded, greedy_descent, random_level, search_layer, ExpandResult, GraphAccess,
     HeapItem, ProbeResult, SearchHit, VisitData,
 };
-use crate::access_method::hnswsq::flat_engine::{apply_flat, plan_flat, FlatPairBuf};
+use crate::access_method::hnswsq::flat_engine::{apply_flat, plan_flat, FlatPairBuf, Locking};
 use crate::access_method::hnswsq::flat_graph::FlatGraph;
 use crate::access_method::hnswsq::insert::{codec_for, insert_vector, InsertCtx};
 use crate::access_method::hnswsq::meta_page::HnswMetaPage;
@@ -338,7 +338,21 @@ fn flat_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) ->
         state.stats.search_ns += t.elapsed().as_nanos() as u64;
     }
     let t_apply = state.stats.enabled.then(std::time::Instant::now);
-    apply_flat(codec, dist_fn, graph, buf, id, level, plan, m, m0);
+    // Single-builder build: this thread is the graph's only writer, so the engine
+    // takes no node locks.  A parallel driver passes `Locking::Locks(arena.locks())`
+    // here instead, and the heuristic runs identically.
+    apply_flat(
+        codec,
+        dist_fn,
+        graph,
+        &Locking::SoleWriter,
+        buf,
+        id,
+        level,
+        plan,
+        m,
+        m0,
+    );
     if let Some(t) = t_apply {
         state.stats.backlink_select_ns += t.elapsed().as_nanos() as u64;
     }

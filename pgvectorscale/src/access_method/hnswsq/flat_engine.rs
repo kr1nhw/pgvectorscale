@@ -30,6 +30,7 @@
 
 use crate::access_method::distance::DistanceType;
 use crate::access_method::hnswsq::build::SearchScratch;
+use crate::access_method::hnswsq::arena::NodeLocks;
 use crate::access_method::hnswsq::flat_graph::FlatGraph;
 use crate::access_method::hnswsq::graph::{distance_encoded, HeapItem, SearchHit};
 use crate::access_method::hnswsq::quantize::Codec;
@@ -375,10 +376,50 @@ pub fn plan_flat(
 /// Both branches are pure functions of the current lists and the stored vectors,
 /// which is what makes the update deterministic and lock-friendly: no version,
 /// no mask, nothing to keep consistent across revisions.
+/// How the engine writes a list it does **not** own (a backlink).
+///
+/// The backlink step is the only destructive work a worker does on another worker's
+/// node, so it is the only place the strategy has to be stated.  Keeping it as a
+/// parameter rather than two copies of `backlink_flat` means the single-builder and
+/// parallel paths cannot drift apart in policy -- they run the identical heuristic,
+/// only the exclusion differs.
+pub enum Locking<'a> {
+    /// One writer for the whole graph: the caller holds it exclusively, so no lock is
+    /// needed and none is taken.
+    SoleWriter,
+    /// Several workers on one arena: the node write lock is what excludes them.
+    Locks(&'a NodeLocks),
+}
+
+impl Locking<'_> {
+    /// Write a node's **own** list -- the node the caller just claimed.
+    #[inline]
+    fn write_own(&self, g: &mut FlatGraph, id: u32, layer: usize, ids: &[u32]) {
+        match self {
+            // Safe path: `&mut` is the whole exclusion argument, and it works for both
+            // backings, grow mode included.
+            Locking::SoleWriter => g.set_list(id, layer, ids),
+            // SAFETY: the caller claimed `id`, so it is the only writer of its slabs
+            // until it publishes them.
+            Locking::Locks(_) => unsafe { g.set_list_concurrent(id, layer, ids) },
+        }
+    }
+
+    /// Replace a **target**'s list, which may be a node the caller does not own.
+    #[inline]
+    fn write_target(&self, g: &mut FlatGraph, id: u32, layer: usize, ids: &[u32]) {
+        match self {
+            Locking::SoleWriter => g.set_list(id, layer, ids),
+            Locking::Locks(locks) => g.set_list_locked(locks, id, layer, ids),
+        }
+    }
+}
+
 fn backlink_flat(
     codec: &Codec,
     dist_fn: crate::access_method::distance::DistanceFn,
     g: &mut FlatGraph,
+    locking: &Locking<'_>,
     buf: &mut FlatPairBuf,
     target: u32,
     new_id: u32,
@@ -401,7 +442,7 @@ fn backlink_flat(
     if existing.len() < cap {
         let mut list = existing;
         list.push(new_id);
-        g.set_list(target, layer, &list);
+        locking.write_target(g, target, layer, &list);
         return;
     }
 
@@ -433,7 +474,7 @@ fn backlink_flat(
         }
         list.push(entry.1);
     }
-    g.set_list(target, layer, &list);
+    locking.write_target(g, target, layer, &list);
 }
 
 /// Mutating half of one insert: publish the node's own lists, then apply the
@@ -442,7 +483,11 @@ fn backlink_flat(
 pub fn apply_flat(
     codec: &Codec,
     dist_fn: crate::access_method::distance::DistanceFn,
+    // `&mut` even in the parallel case: a worker owns *its handle* and shares the
+    // arena, not the graph, so entry promotion needs no lock discipline of its own --
+    // but see `promote` below for why only one writer may do it.
     g: &mut FlatGraph,
+    locking: &Locking<'_>,
     buf: &mut FlatPairBuf,
     new_id: u32,
     level: u8,
@@ -451,17 +496,35 @@ pub fn apply_flat(
     m0: usize,
 ) {
     if g.entry().is_none() {
-        g.promote_entry(new_id);
+        promote(locking, g, new_id);
         return;
     }
     for LayerPlanFlat { layer, ids } in plan {
-        g.set_list(new_id, layer, &ids);
+        // The new node's *own* list, and the backlinks into nodes its neighbours own:
+        // the two writes differ only in who is allowed to make them, which is what
+        // `Locking` carries.
+        locking.write_own(g, new_id, layer, &ids);
         let cap = if layer == 0 { m0 } else { m };
         for &neighbour in &ids {
-            backlink_flat(codec, dist_fn, g, buf, neighbour, new_id, layer, cap);
+            backlink_flat(codec, dist_fn, g, locking, buf, neighbour, new_id, layer, cap);
         }
     }
-    g.promote_entry(new_id);
+    promote(locking, g, new_id);
+}
+
+/// Promote the entry point, if this writer is allowed to.
+///
+/// A worker must not: every insert would serialize on the entry, and promotion only
+/// matters once the graph stops growing.  The driver promotes after the workers stop,
+/// which is also the first moment a searcher can observe it.
+#[inline]
+fn promote(locking: &Locking<'_>, g: &mut FlatGraph, new_id: u32) {
+    match locking {
+        Locking::SoleWriter => {
+            g.promote_entry(new_id);
+        }
+        Locking::Locks(_) => {}
+    }
 }
 
 #[cfg(test)]
@@ -711,6 +774,7 @@ mod tests {
             &codec,
             distance_l2,
             &mut g,
+            &Locking::SoleWriter,
             &mut buf,
             1,
             0,
@@ -737,6 +801,7 @@ mod tests {
             &codec,
             distance_l2,
             &mut g,
+            &Locking::SoleWriter,
             &mut buf,
             3,
             0,
@@ -767,6 +832,7 @@ mod tests {
             &codec,
             distance_l2,
             &mut g,
+            &Locking::SoleWriter,
             &mut buf,
             3,
             0,
@@ -792,6 +858,7 @@ mod tests {
                     &codec,
                     distance_l2,
                     &mut g,
+                    &Locking::SoleWriter,
                     &mut buf,
                     new_id,
                     0,

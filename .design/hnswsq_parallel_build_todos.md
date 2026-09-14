@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 4g: engine runs behind `Locking` | done | `apply_flat` takes `Locking::{SoleWriter, Locks}`; same heuristic either way |
 | M3 step 4f: shared-write + node-lock path | done | `set_list_concurrent`/`set_list_locked`; contention test (no torn lists) |
 | M3 step 4e: `FlatGraph` over a shared arena | done | cursors read the segment (`in_arena`); 2 latent cursor bugs surfaced by the shared path |
 | M3 step 4d: shared cursors (`ArenaState`) | done | packed claim CAS, contiguous watermark, entry + rendezvous; 4 tests |
@@ -936,6 +937,28 @@ over a segment is shareable, but a grow-mode graph owns `Vec`s that would race, 
 impl has to be attached to the shared construction (`in_arena`) rather than to the
 type.  Doing it as a blanket impl for a test's convenience would have made the
 grow-mode graph quietly unsound.
+
+### 3j.7 The engine runs behind `Locking` (M3 step 4, seventh piece)
+
+`apply_flat` and `backlink_flat` no longer care whether they are the only writer.
+`Locking::{SoleWriter, Locks(&NodeLocks)}` is the parameter, and the two writes a
+build makes go through it:
+
+* `write_own` -- the node just claimed, so no lock is needed.  `SoleWriter` uses the
+  safe `set_list` (which is the *only* path that works for a grow-mode graph, whose
+  `Vec` would reallocate); `Locks` uses the concurrent write.
+* `write_target` -- a backlink into a node the caller does not own.  `SoleWriter` still
+  uses the safe path; `Locks` takes the node's write lock.
+
+Keeping one function with a parameter, rather than a second copy of `backlink_flat`,
+means the single-builder and parallel builds cannot drift apart in *policy* -- they run
+the identical heuristic, and only the exclusion differs.  That matters here because the
+append/shrink policy is exactly what the fingerprint gate checks.
+
+Entry promotion is deliberately **not** done by a worker: every insert would serialize
+on the entry, and promotion only matters once the graph stops growing.  `Locking::Locks`
+skips it and the driver promotes after the workers stop, which is also the first moment
+a searcher may observe it.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
