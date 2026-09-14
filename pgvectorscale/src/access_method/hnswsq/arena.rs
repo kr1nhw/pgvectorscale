@@ -187,22 +187,101 @@ pub fn arena_layout(stride: usize, cap: usize, nodes: usize, slabs: usize) -> Ar
 }
 
 /// Prototype of the arena's shared chunk: **one** allocation, regions addressed by
-/// offset.  The prototype owns a `Vec<u64>` instead of a `shm_toc` segment, but the
-/// addressing discipline is the real one — offset-based and therefore valid at any
-/// mapping address — and `u64` words give the 8-byte alignment every region in
-/// [`arena_layout`] needs (u8/u16/u32/ItemPointer).
+/// offset.  The backing is either a `Vec<u64>` this handle owns (the prototype and
+/// the local path) or a borrowed segment -- a `shm_toc` allocation in a parallel
+/// build -- but the addressing discipline is the same in both cases, and that is the
+/// point: every region is reached as `base + offset`, so the arena works at whatever
+/// address the segment is mapped to, and `u64` words give the 8-byte alignment every
+/// region in [`arena_layout`] needs (u8/u16/u32/ItemPointer).  Nothing inside the
+/// chunk may be an absolute pointer, or relocation would break it.
 pub struct Chunk {
-    words: Vec<u64>,
+    backing: Backing,
     layout: ArenaLayout,
+}
+
+/// Where a chunk's bytes live.  `Owned` is the prototype and the local path: this
+/// handle allocated the words and frees them on drop.  `Borrowed` is the shared
+/// path -- the `shm_toc` allocation a parallel build maps into every participant --
+/// where the handle must *not* free anything and the pointer is only valid while
+/// the segment is mapped.
+enum Backing {
+    Owned(Vec<u64>),
+    Borrowed { words: *mut u64, count: usize },
+}
+
+impl Backing {
+    #[inline]
+    fn ptr(&self) -> *mut u8 {
+        match self {
+            Backing::Owned(v) => v.as_ptr().cast_mut().cast::<u8>(),
+            // SAFETY: `Borrowed` is only built by `Chunk::attach`, whose contract
+            // requires a live, 8-byte-aligned allocation of `total_bytes` bytes.
+            Backing::Borrowed { words, .. } => (*words).cast::<u8>(),
+        }
+    }
+
+    #[inline]
+    fn ptr_mut(&mut self) -> *mut u8 {
+        match self {
+            Backing::Owned(v) => v.as_mut_ptr().cast::<u8>(),
+            Backing::Borrowed { words, .. } => (*words).cast::<u8>(),
+        }
+    }
+
+    #[inline]
+    fn words(&self) -> usize {
+        match self {
+            Backing::Owned(v) => v.len(),
+            Backing::Borrowed { count, .. } => *count,
+        }
+    }
 }
 
 impl Chunk {
     pub fn new(layout: ArenaLayout) -> Self {
         let words = layout.total_bytes.div_ceil(8);
         Self {
-            words: vec![0u64; words],
+            backing: Backing::Owned(vec![0u64; words]),
             layout,
         }
+    }
+
+    /// Borrow someone else's segment as this chunk's storage -- the shape a parallel
+    /// build uses, where the leader allocates from `shm_toc` and every participant
+    /// (including the leader) addresses the same bytes at whatever address the
+    /// segment happens to be mapped to.
+    ///
+    /// # Safety
+    ///
+    /// `words` must point to a live, 8-byte-aligned allocation of at least
+    /// `layout.total_bytes` bytes that stays valid for this handle's lifetime, and
+    /// nothing else may write it concurrently except through the arena's own locks.
+    /// It must be zero -- or already hold a graph -- when attached: the arena reads
+    /// storage it has not explicitly written (a claimed slot's flags, an unwritten
+    /// slab's length), and its invariants assume those read as "empty".
+    pub unsafe fn attach(words: *mut u64, layout: ArenaLayout) -> Self {
+        assert!(
+            (words as usize) % std::mem::align_of::<u64>() == 0,
+            "chunk base must be 8-byte aligned"
+        );
+        let count = layout.total_bytes.div_ceil(8);
+        Self {
+            backing: Backing::Borrowed { words, count },
+            layout,
+        }
+    }
+
+    /// Whether this handle owns (and will free) its storage.
+    pub fn is_owned(&self) -> bool {
+        matches!(self.backing, Backing::Owned(_))
+    }
+
+    /// The whole chunk as bytes -- what a `shm_toc` allocation copies, and what the
+    /// relocation test moves to another address.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `words()` words are allocated, i.e. at least `total_bytes` bytes,
+        // and the shared borrow of `self` keeps an owned `Vec` from reallocating.
+        unsafe { std::slice::from_raw_parts(self.backing.ptr(), self.layout.total_bytes) }
     }
 
     pub fn layout(&self) -> ArenaLayout {
@@ -219,7 +298,7 @@ impl Chunk {
     /// through the chunk instead of a `Vec` field.
     pub fn region_bytes(&self, r: Region) -> &[u8] {
         assert!(r.end() <= self.layout.total_bytes, "region outside the chunk");
-        let base = self.words.as_ptr().cast::<u8>();
+        let base = self.backing.ptr() as *const u8;
         // SAFETY: the allocation covers `[r.offset, r.end())` (checked above), and the
         // shared borrow of `self` prevents any aliasing write while the slice lives.
         unsafe { std::slice::from_raw_parts(base.add(r.offset), r.len) }
@@ -261,7 +340,7 @@ impl Chunk {
     /// Byte view of a region.  Every other accessor is built on this one.
     pub fn region_bytes_mut(&mut self, r: Region) -> &mut [u8] {
         assert!(r.end() <= self.layout.total_bytes, "region outside the chunk");
-        let base = self.words.as_mut_ptr().cast::<u8>();
+        let base = self.backing.ptr_mut();
         // SAFETY: the allocation is `words` contiguous u64s, i.e. `words * 8` bytes
         // with `words * 8 >= total_bytes`, so `[r.offset, r.end())` is inside it; the
         // returned slice borrows `self` mutably, so no other reference to the region
@@ -458,6 +537,44 @@ mod tests {
         let locks = NodeLocks::new(4);
         let _outer = locks.write(0);
         let _inner = locks.write(1); // would be an A→B / B→A deadlock waiting to happen
+    }
+
+    #[test]
+    fn an_attached_chunk_borrows_storage_it_does_not_own() {
+        let layout = arena_layout(8, 4, 8, 9);
+        let mut words = vec![0u64; layout.total_bytes.div_ceil(8)];
+        let ptr = words.as_mut_ptr();
+
+        // SAFETY: `words` is a live, 8-byte-aligned, zeroed allocation of exactly the
+        // size `attach` requires, and it outlives `chunk`.
+        let mut chunk = unsafe { Chunk::attach(ptr, layout) };
+        assert!(!chunk.is_owned(), "an attached handle must not free the segment");
+        assert_eq!(chunk.total_bytes(), layout.total_bytes);
+
+        // Writes land in the segment, and reads come back out of it -- through the
+        // same offset discipline as an owned chunk.
+        chunk.region_bytes_mut(layout.levels)[3] = 7;
+        chunk.region_u32_mut(layout.slab_off)[1] = 0xdead_beef;
+        assert_eq!(chunk.region_bytes(layout.levels)[3], 7);
+        assert_eq!(chunk.region_u32(layout.slab_off)[1], 0xdead_beef);
+        // ... and the owner of the segment sees them, because it is the same memory.
+        // SAFETY: `layout.levels.offset` is inside `total_bytes`, so the byte at that
+        // offset plus 3 is inside the allocation `words` owns.
+        let owner_byte = unsafe { *words.as_ptr().cast::<u8>().add(layout.levels.offset + 3) };
+        assert_eq!(owner_byte, 7, "the segment's owner sees the same byte");
+
+        drop(chunk); // must not free `words`
+        assert_eq!(words.len(), layout.total_bytes.div_ceil(8));
+    }
+
+    #[test]
+    #[should_panic(expected = "8-byte aligned")]
+    fn attach_rejects_a_misaligned_base() {
+        let layout = arena_layout(8, 4, 8, 9);
+        let mut words = vec![0u64; layout.total_bytes.div_ceil(8) + 1];
+        let misaligned = unsafe { words.as_mut_ptr().cast::<u8>().add(4).cast::<u64>() };
+        // SAFETY: never dereferenced -- `attach` rejects it before touching memory.
+        let _ = unsafe { Chunk::attach(misaligned, layout) };
     }
 
     #[test]

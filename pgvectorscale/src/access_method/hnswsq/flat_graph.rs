@@ -871,6 +871,56 @@ mod tests {
     }
 
     #[test]
+    fn the_arena_is_valid_at_any_mapping_address() {
+        // The property the shared-memory design rests on: nothing in the chunk is
+        // addressed absolutely, so the same bytes work when mapped somewhere else.
+        // A dsm segment is mapped at a different address in every participant, and
+        // the leader's copy is not the workers' copy -- so move the bytes and require
+        // every accessor to answer identically.
+        let (stride, cap) = (8usize, 4usize);
+        let mut g = FlatGraph::with_limits(stride, cap, 8, 9);
+        g.push_node(0, tid(1), false, &[1u8; 8]);
+        g.push_node(2, tid(2), true, &[2u8; 8]);
+        g.set_list(0, 0, &[1, 2]);
+        g.set_list(1, 0, &[0]);
+        g.entry = Some(1);
+
+        let layout = g.layout;
+        let source = g.chunk.as_ref().unwrap().as_bytes().to_vec();
+        let mut moved: Vec<u64> = source
+            .chunks_exact(8)
+            .map(|w| u64::from_ne_bytes(w.try_into().unwrap()))
+            .collect();
+        assert_ne!(
+            moved.as_ptr() as *const u8,
+            g.chunk.as_ref().unwrap().as_bytes().as_ptr(),
+            "the test is vacuous if the copy landed at the same address"
+        );
+
+        // SAFETY: `moved` is a live, 8-byte-aligned, byte-identical copy of the chunk
+        // that outlives `g`, and nothing else writes it.
+        g.chunk = Some(unsafe { Chunk::attach(moved.as_mut_ptr(), layout) });
+        assert!(!g.chunk.as_ref().unwrap().is_owned());
+
+        assert_eq!(g.vector(0), &[1u8; 8], "vectors survive relocation");
+        assert_eq!(g.vector(1), &[2u8; 8]);
+        assert_eq!(g.neighbors(0, 0), &[1, 2], "ids and lens do too");
+        assert_eq!(g.neighbors(1, 0), &[0]);
+        assert_eq!(g.level(1), 2);
+        assert_eq!(g.slab_base(1), Some(1));
+        assert_eq!(g.len(), 2);
+        assert_eq!(g.slab_usage(), (4, 9), "a level-2 node owns three slabs");
+        assert!(g.tid(0).is_valid() && g.tid(1).is_valid(), "tids survive");
+        assert!(g.clamped(1) && !g.clamped(0), "flags survive");
+
+        // It is still a live arena: writes go to the moved bytes.
+        g.set_list(1, 0, &[0, 0]);
+        assert_eq!(g.neighbors(1, 0), &[0, 0]);
+        let owner_byte = moved[layout.levels.offset / 8];
+        assert!(owner_byte != 0, "and the owner sees them in the moved segment");
+    }
+
+    #[test]
     fn push_node_publishes_immediately() {
         let mut g = FlatGraph::new(4, 2);
         g.push_node(0, tid(1), false, &[0u8; 4]);

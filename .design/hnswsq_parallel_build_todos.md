@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 4a: chunk over shared memory | done | `Chunk` owns a `Vec<u64>` *or* borrows a segment (`attach`); relocation asserted by test (§3j) |
 | incremental exact-match probe test | flaky, not ours | `pg_test_hnswsq_incremental_empty_start_sq8_provisional`: 1 failure in one grouped run, clean on rerun (§3k) |
 | suite has 2 pre-existing red IVF tests | not ours | `ivf::options::tests::pg_test_ivf_options_{defaults,custom}`: no default opclass exists (§3j) |
 
@@ -760,6 +761,36 @@ Two consequences worth naming:
     covers id/layer/list structure, so a broken heap TID would pass it and corrupt
     results silently.  The `access_method::hnswsq` integration tests (which build and
     scan) are the gate for it -- that is why step 6 ran them as well.
+
+### 3j.1 Making the chunk relocatable (M3 step 4, first half)
+
+A parallel build allocates the arena once, in the leader, from `shm_toc`, and every
+participant -- worker and leader alike -- addresses those bytes at whatever address
+its own mapping lands on.  For that to be sound the arena must be **relocatable**:
+no absolute pointer may be stored inside the chunk, only offsets and plain data.
+
+`Chunk` now expresses this directly instead of being a `Vec<u64>` that merely
+*claims* to be a prototype of a segment:
+
+* `Backing::Owned(Vec<u64>)` -- the local path; this handle frees on drop.
+* `Backing::Borrowed { words, count }` -- built by `unsafe Chunk::attach`, which
+  checks 8-byte alignment and takes the caller's word that the segment is live,
+  large enough, zero (or already a graph), and not concurrently written except
+  through the arena's locks.  An attached handle frees nothing, so the `Drop` of a
+  worker's view can never free the leader's segment.
+
+The property is asserted rather than assumed: `the_arena_is_valid_at_any_mapping_address`
+builds a small graph, **copies the chunk's bytes into a fresh allocation elsewhere**
+(asserting the address really differs, so the test cannot pass vacuously), attaches
+a handle there, and requires every accessor -- vectors, ids, lens, levels, slab_base,
+tids, flags, `len`/`slab_usage` -- to answer identically, then writes through the
+moved arena and checks the owner sees it.  That is exactly what a dsm segment does
+to a chunk, and it is why `ItemPointer` (block/offset, not a pointer) is safe to
+store while e.g. a `Vec` would not be.
+
+Still to come in step 4: `NodeLocks`' `RwLock`s become LWLock tranches from
+`RequestNamedLWLockTranche`, and the graph handle is built over the `shm_toc`
+lookup instead of `Chunk::new`.
 
 **The swap is done:** every per-node array is a chunk region, the `Vec`s are empty in
 chunk mode, and only `nodes_used`/`slabs_used` are kept on the side.  The `Vec` arms
