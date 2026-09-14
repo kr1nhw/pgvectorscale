@@ -103,9 +103,145 @@ impl NodeLocks {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared-chunk layout
+// ---------------------------------------------------------------------------
+
+/// One region of the arena chunk: where it starts and how big it is.  Offsets, not
+/// pointers — the chunk is mapped at a different address in every process, so the
+/// graph may only ever refer to its own storage by offset (which the flat arrays
+/// already do: every access is index arithmetic).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub offset: usize,
+    pub len: usize,
+    /// Alignment the region's element type requires.
+    pub align: usize,
+}
+
+impl Region {
+    pub fn end(&self) -> usize {
+        self.offset + self.len
+    }
+}
+
+/// Byte layout of the arena for `nodes` node slots and `slabs` `(node, layer)`
+/// lists.  Mirrors the flat graph's arrays one-for-one, so the storage swap is
+/// "point each array at its region" rather than a reshape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArenaLayout {
+    pub total_bytes: usize,
+    pub vectors: Region,
+    pub ids: Region,
+    pub lens: Region,
+    pub levels: Region,
+    pub tids: Region,
+    pub clamped: Region,
+    pub published: Region,
+    pub slab_off: Region,
+}
+
+#[inline]
+fn align_up(x: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (x + align - 1) & !(align - 1)
+}
+
+/// Plan the chunk.  Regions are laid out in descending alignment need and never
+/// overlap; `total_bytes` is what the shared segment has to reserve (before the
+/// allocator's own margin).
+pub fn arena_layout(stride: usize, cap: usize, nodes: usize, slabs: usize) -> ArenaLayout {
+    let mut off = 0usize;
+    let mut take = |len: usize, align: usize, off: &mut usize| -> Region {
+        let start = align_up(*off, align);
+        *off = start + len;
+        Region {
+            offset: start,
+            len,
+            align,
+        }
+    };
+    let vectors = take(nodes * stride, 1, &mut off);
+    let tids = take(
+        nodes * std::mem::size_of::<crate::util::ItemPointer>(),
+        std::mem::align_of::<crate::util::ItemPointer>(),
+        &mut off,
+    );
+    let slab_off = take(nodes * std::mem::size_of::<u32>(), 4, &mut off);
+    let ids = take(slabs * cap * std::mem::size_of::<u32>(), 4, &mut off);
+    let lens = take(slabs * std::mem::size_of::<u16>(), 2, &mut off);
+    let levels = take(nodes, 1, &mut off);
+    let clamped = take(nodes, 1, &mut off);
+    let published = take(nodes, 1, &mut off);
+    ArenaLayout {
+        total_bytes: off,
+        vectors,
+        ids,
+        lens,
+        levels,
+        tids,
+        clamped,
+        published,
+        slab_off,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_regions_are_aligned_and_disjoint() {
+        let stride = 512;
+        let cap = 32;
+        let (nodes, slabs) = (1000usize, 1100usize);
+        let l = arena_layout(stride, cap, nodes, slabs);
+
+        let regions = [
+            l.vectors, l.tids, l.slab_off, l.ids, l.lens, l.levels, l.clamped, l.published,
+        ];
+        for r in regions {
+            assert_eq!(r.offset % r.align, 0, "region at {} needs align {}", r.offset, r.align);
+            assert!(r.end() <= l.total_bytes, "region runs past the chunk");
+        }
+        // Sizes match the array shapes the graph uses.
+        assert_eq!(l.vectors.len, nodes * stride);
+        assert_eq!(l.ids.len, slabs * cap * 4);
+        assert_eq!(l.lens.len, slabs * 2);
+        assert_eq!(l.levels.len, nodes);
+        assert_eq!(l.slab_off.len, nodes * 4);
+
+        // Ordered layout: every region starts at or after the previous one's end.
+        let mut sorted = regions;
+        sorted.sort_by_key(|r| r.offset);
+        for pair in sorted.windows(2) {
+            assert!(pair[0].end() <= pair[1].offset, "regions overlap");
+        }
+    }
+
+    #[test]
+    fn layout_fits_the_budget_it_was_planned_for() {
+        use super::super::flat_graph::plan_capacity;
+        let (stride, cap) = (512, 32);
+        let budget = 1u64 << 30;
+        let margin = 0.7;
+        let sizing = plan_capacity(stride, cap, budget, 1.07, margin);
+        assert!(sizing.nodes > 0);
+
+        let l = arena_layout(stride, cap, sizing.nodes, sizing.slabs);
+        let allowed = (budget as f64 * margin) as usize;
+        assert!(
+            l.total_bytes <= allowed,
+            "layout {} exceeds the {} bytes the plan allowed",
+            l.total_bytes,
+            allowed
+        );
+        // ... and the layout is not wildly smaller than planned either, which would
+        // mean the two formulas had drifted apart.
+        assert!(l.total_bytes as f64 > 0.9 * allowed as f64);
+        // A node's vectors alone are the floor.
+        assert!(l.total_bytes >= sizing.nodes * stride);
+    }
 
     #[test]
     fn read_guards_nest_freely() {
