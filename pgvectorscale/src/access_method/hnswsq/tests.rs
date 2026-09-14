@@ -260,7 +260,11 @@ pub mod tests {
              CREATE INDEX hs_i_idx ON hs_i USING hnswsq (embedding vector_l2_ops)
                WITH (storage_layout = {});
              SET enable_seqscan = off;
-             SET hnswsq.ef_search = 500;",
+             SET hnswsq.ef_search = 500;
+             -- Pin the insert-path level RNG for the same reason recall_case does:
+             -- entropy-seeded levels make the exact-match probe a random sample of
+             -- the incremental graph (it flaked once in a full-suite run).
+             SET hnswsq.build_seed = 20240912;",
             dim, layout
         ))
         .unwrap();

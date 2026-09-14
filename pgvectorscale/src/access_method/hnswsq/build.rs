@@ -540,22 +540,26 @@ fn sort_ranked_list(ids: &mut Vec<u32>, dists: &mut Vec<f32>, mask: &mut [u64; L
 
 /// Reusable per-search state for the memory-graph beam search.
 ///
+/// Shared with the flat engine (`flat_engine.rs`), which runs the same beam
+/// search over its slabs: the epoch-mark discipline (no hashing, O(visited)
+/// reset) and the reused heaps are worth keeping in exactly one place.
+///
 /// Lance's builder passes a `VisitedGenerator` (bitmap + recently-visited list)
 /// into every insert; the equivalent here is an epoch-stamped mark array plus
 /// reusable heaps, so a search allocates nothing per visited node and does no
 /// hashing at all.
-struct SearchScratch {
+pub(crate) struct SearchScratch {
     /// Per node id: the epoch in which it was visited.
-    visited_epoch: Vec<u32>,
+    pub(crate) visited_epoch: Vec<u32>,
     /// Per node id: the epoch in which its neighbour list was expanded.
-    expanded_epoch: Vec<u32>,
-    epoch: u32,
-    candidates: std::collections::BinaryHeap<std::cmp::Reverse<HeapItem<u32>>>,
-    results: std::collections::BinaryHeap<HeapItem<u32>>,
+    pub(crate) expanded_epoch: Vec<u32>,
+    pub(crate) epoch: u32,
+    pub(crate) candidates: std::collections::BinaryHeap<std::cmp::Reverse<HeapItem<u32>>>,
+    pub(crate) results: std::collections::BinaryHeap<HeapItem<u32>>,
 }
 
 impl SearchScratch {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             visited_epoch: Vec::new(),
             expanded_epoch: Vec::new(),
@@ -566,7 +570,7 @@ impl SearchScratch {
     }
 
     /// Start a new search epoch, growing the mark arrays as the graph grows.
-    fn begin(&mut self, nodes: usize) {
+    pub(crate) fn begin(&mut self, nodes: usize) {
         if self.visited_epoch.len() < nodes {
             self.visited_epoch.resize(nodes, 0);
             self.expanded_epoch.resize(nodes, 0);

@@ -19,6 +19,7 @@
 //!   lock at a time, two-phase optimistic neighbor updates.
 
 pub mod build;
+pub mod flat_engine;
 pub mod flat_graph;
 pub mod graph;
 pub mod insert;
