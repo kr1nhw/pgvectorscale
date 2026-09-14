@@ -186,6 +186,82 @@ pub fn arena_layout(stride: usize, cap: usize, nodes: usize, slabs: usize) -> Ar
     }
 }
 
+/// Prototype of the arena's shared chunk: **one** allocation, regions addressed by
+/// offset.  The prototype owns a `Vec<u64>` instead of a `shm_toc` segment, but the
+/// addressing discipline is the real one — offset-based and therefore valid at any
+/// mapping address — and `u64` words give the 8-byte alignment every region in
+/// [`arena_layout`] needs (u8/u16/u32/ItemPointer).
+pub struct Chunk {
+    words: Vec<u64>,
+    layout: ArenaLayout,
+}
+
+impl Chunk {
+    pub fn new(layout: ArenaLayout) -> Self {
+        let words = layout.total_bytes.div_ceil(8);
+        Self {
+            words: vec![0u64; words],
+            layout,
+        }
+    }
+
+    pub fn layout(&self) -> ArenaLayout {
+        self.layout
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.layout.total_bytes
+    }
+
+    /// Byte view of a region.  Every other accessor is built on this one.
+    pub fn region_bytes_mut(&mut self, r: Region) -> &mut [u8] {
+        assert!(r.end() <= self.layout.total_bytes, "region outside the chunk");
+        let base = self.words.as_mut_ptr().cast::<u8>();
+        // SAFETY: the allocation is `words` contiguous u64s, i.e. `words * 8` bytes
+        // with `words * 8 >= total_bytes`, so `[r.offset, r.end())` is inside it; the
+        // returned slice borrows `self` mutably, so no other reference to the region
+        // (or to the words it overlaps) can exist while it lives.
+        unsafe { std::slice::from_raw_parts_mut(base.add(r.offset), r.len) }
+    }
+
+    /// `u32` view of a region (ids, `slab_off`).
+    pub fn region_u32_mut(&mut self, r: Region) -> &mut [u32] {
+        assert_eq!(r.offset % 4, 0, "u32 region must be 4-byte aligned");
+        assert_eq!(r.len % 4, 0, "u32 region length must be a multiple of 4");
+        let bytes = self.region_bytes_mut(r);
+        let ptr = bytes.as_mut_ptr().cast::<u32>();
+        let n = r.len / 4;
+        // SAFETY: 4-byte aligned, `n * 4 == r.len` bytes, and `u32` accepts any bit
+        // pattern; the borrow of `bytes` (hence of `self`) is moved into the result.
+        unsafe { std::slice::from_raw_parts_mut(ptr, n) }
+    }
+
+    /// `u16` view of a region (the per-slab lengths).
+    pub fn region_u16_mut(&mut self, r: Region) -> &mut [u16] {
+        assert_eq!(r.offset % 2, 0, "u16 region must be 2-byte aligned");
+        assert_eq!(r.len % 2, 0, "u16 region length must be a multiple of 2");
+        let bytes = self.region_bytes_mut(r);
+        let ptr = bytes.as_mut_ptr().cast::<u16>();
+        let n = r.len / 2;
+        // SAFETY: as for `region_u32_mut`, with 2-byte alignment.
+        unsafe { std::slice::from_raw_parts_mut(ptr, n) }
+    }
+
+    /// View of a region as a `Vec<T>`-shaped slice, for the swap of the flat arrays.
+    pub fn region_slice_mut<T: Copy>(&mut self, r: Region) -> &mut [T] {
+        let size = std::mem::size_of::<T>();
+        assert!(size > 0, "zero-sized region element");
+        assert_eq!(r.offset % std::mem::align_of::<T>(), 0, "region misaligned for T");
+        assert_eq!(r.len % size, 0, "region length is not a multiple of size_of::<T>()");
+        let bytes = self.region_bytes_mut(r);
+        let ptr = bytes.as_mut_ptr().cast::<T>();
+        let n = r.len / size;
+        // SAFETY: alignment and length checked, and the borrow of `self` is moved
+        // into the result.  All current uses are `Copy` POD (ItemPointer, u32, u16).
+        unsafe { std::slice::from_raw_parts_mut(ptr, n) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +317,54 @@ mod tests {
         assert!(l.total_bytes as f64 > 0.9 * allowed as f64);
         // A node's vectors alone are the floor.
         assert!(l.total_bytes >= sizing.nodes * stride);
+    }
+
+    #[test]
+    fn chunk_regions_do_not_overlap() {
+        let layout = arena_layout(8, 4, 64, 70);
+        let mut c = Chunk::new(layout);
+        assert_eq!(c.total_bytes(), layout.total_bytes);
+
+        c.region_bytes_mut(layout.levels).fill(0xAA);
+        c.region_u32_mut(layout.ids).fill(0xDEAD_BEEF);
+        c.region_u16_mut(layout.lens).fill(7);
+
+        // Every region kept its own bytes.
+        assert!(c.region_bytes_mut(layout.levels).iter().all(|&b| b == 0xAA));
+        assert!(c
+            .region_u32_mut(layout.ids)
+            .iter()
+            .all(|&v| v == 0xDEAD_BEEF));
+        assert!(c.region_u16_mut(layout.lens).iter().all(|&v| v == 7));
+        // ... and the untouched regions are still zero.
+        assert!(c.region_bytes_mut(layout.vectors).iter().all(|&b| b == 0));
+        assert!(c.region_bytes_mut(layout.clamped).iter().all(|&b| b == 0));
+        assert!(c.region_bytes_mut(layout.published).iter().all(|&b| b == 0));
+        assert!(c.region_u32_mut(layout.slab_off).iter().all(|&v| v == 0));
+        assert!(c
+            .region_slice_mut::<crate::util::ItemPointer>(layout.tids)
+            .iter()
+            .all(|p| !p.is_valid()));
+    }
+
+    #[test]
+    fn chunk_regions_have_the_shapes_the_graph_needs() {
+        let (stride, cap, nodes, slabs) = (8usize, 4usize, 64usize, 70usize);
+        let layout = arena_layout(stride, cap, nodes, slabs);
+        let mut c = Chunk::new(layout);
+
+        assert_eq!(c.region_bytes_mut(layout.vectors).len(), nodes * stride);
+        let ids = c.region_u32_mut(layout.ids);
+        assert_eq!(ids.len(), slabs * cap);
+        ids[slabs * cap - 1] = 42;
+        assert_eq!(c.region_u32_mut(layout.ids)[slabs * cap - 1], 42, "same storage");
+        assert_eq!(c.region_u16_mut(layout.lens).len(), slabs);
+        assert_eq!(c.region_u32_mut(layout.slab_off).len(), nodes);
+        assert_eq!(c.region_bytes_mut(layout.levels).len(), nodes);
+        assert_eq!(
+            c.region_slice_mut::<crate::util::ItemPointer>(layout.tids).len(),
+            nodes
+        );
     }
 
     #[test]
