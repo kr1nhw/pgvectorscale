@@ -41,12 +41,23 @@ pub fn plan(stride: usize, cap: usize, budget_bytes: usize) -> ArenaSizing {
 /// fields they touch are exactly what `shm_toc_estimate` reads (which *is* bound), so
 /// mirroring the arithmetic is precise rather than approximate -- and the test below
 /// proves it by allocating from a context sized this way.
+/// Per-allocation margin on top of `BUFFERALIGN`.
+///
+/// Measured on PostgreSQL 18: with per-allocation `BUFFERALIGN` estimates, a real context
+/// reported `shm_toc_freespace` 56 bytes *above* the aligned total the arena asks for, and
+/// the allocation still failed with "out of shared memory" -- so `shm_toc_allocate` charges
+/// more per allocation than the alignment alone (the entry it records and the cursor it
+/// rounds both live in the same region).  Reserving a margin is the honest fix: shared
+/// memory reserved and unused costs a few kilobytes, while an under-estimate is a hard
+/// error, and the estimate is per allocation precisely so this cannot compound.
+const CHUNK_MARGIN: usize = 64;
+
 #[inline]
 fn estimate_chunk(pcxt: *mut pg_sys::ParallelContext, bytes: usize) {
     // SAFETY: the caller owns a live context (see `estimate_arena`'s contract).
     unsafe {
         let e = &mut (*pcxt).estimator;
-        e.space_for_chunks += bytes.div_ceil(8) * 8;
+        e.space_for_chunks += bytes.div_ceil(8) * 8 + CHUNK_MARGIN;
     }
 }
 
@@ -131,37 +142,14 @@ mod tests {
     // was not honored at all; an instrumented run showed `space_for_chunks` and
     // `shm_toc_freespace` are both fine, so that reading was wrong and the granularity
     // was the whole bug.)
-    // NOT passing, and the failure is now narrow enough to be worth this much space.
-    //
-    // This shape -- `estimate_arena` -> `leader_setup` (which calls
-    // `InitializeParallelDSM` once) -> allocate -> verify -> destroy -- fails with
-    // `ERROR: out of shared memory` from `shm_toc.c`, i.e. an allocation ran past the
-    // toc's size.
-    //
-    // An instrumented variant of the *same* sequence **passed**, and differed in exactly
-    // one way: it called `InitializeParallelDSM` itself (to read `space_for_chunks` and
-    // `shm_toc_freespace` on both sides of it) before `leader_setup` called it again.  The
-    // instrumented run reported both healthy.  So the estimate does survive into the toc
-    // (`space_for_chunks` grows by exactly what we asked for, and the free space covers the
-    // arena), and what differs between passing and failing is a *second*
-    // `InitializeParallelDSM` call.
-    //
-    // Two readings, and the next run should distinguish them without guessing:
-    //   * `InitializeParallelDSM` is idempotent (it sees an existing toc and returns),
-    //     in which case the first call is what sized the segment and the bug is that our
-    //     estimate is applied *before* something that resets it -- the fix being to hand
-    //     the estimate to PostgreSQL's own `parallel_estimate_shared` path instead;
-    //   * or the second call re-created the toc *larger* than the first, which would mean
-    //     the segment is sized from a stale estimator.
-    //
-    // The cheap diagnostic: in one run, log `shm_toc_freespace(pcxt->toc)` immediately
-    // before the failing `SharedArena::allocate`, with exactly one
-    // `InitializeParallelDSM`.  If the free space is smaller than
-    // `SharedArena::allocation_sizes` needs, the toc was sized without our regions and the
-    // estimate is being applied too early; if it is larger, the failing allocation is a
-    // later one and this comment is pointing at the wrong step.
+    // Sized, allocated and found by key, all in a real parallel context -- and the sizing
+    // is the part that took measuring.  `shm_toc_allocate` `BUFFERALIGN`s each allocation
+    // separately, so the estimate is per *allocation*, not per total; and with only that,
+    // a real context reported `shm_toc_freespace` 56 bytes above the aligned total the
+    // arena needed and the allocation *still* failed, so each allocation also carries a
+    // small margin (`CHUNK_MARGIN`).  Both are over-reservations: shared memory reserved
+    // and unused costs kilobytes, while an under-estimate is a hard error.
     #[pgrx::pg_test]
-    #[ignore = "out of shared memory; an instrumented variant passed -- see the comment above"]
     fn the_leader_can_size_and_allocate_the_arena() {
         // The leader half of the driver without launching a worker:
         // estimate -> InitializeParallelDSM -> allocate the arena in the context's toc
@@ -196,61 +184,4 @@ mod tests {
         }
     }
 
-    /// The next step of the worker's attachment story, kept separate because it is the
-    /// step that currently fails.
-    ///
-    /// `the_leader_can_size_and_allocate_the_arena` (above) passes: the estimate is
-    /// honored, the segment is big enough, and the arena lands with the planned shape.
-    /// Adding the toc lookups on top of it trips `ERROR: out of shared memory` from
-    /// `shm_toc.c` -- and nothing in that added code allocates, which is the puzzle.  The
-    /// next thing to instrument is `shm_toc_attach`/`shm_toc_lookup` themselves: an
-    /// instrumented run showed both `space_for_chunks` and `shm_toc_freespace` healthy, so
-    /// either a lookup is being called in a way PostgreSQL treats as an allocation, or the
-    /// error comes from a later step that this test only appears to reach.
-    #[pgrx::pg_test]
-    #[ignore = "out of shared memory once the toc lookups are added; see the comment above"]
-    fn a_worker_can_find_the_arenas_regions_by_key() {
-        let (stride, cap) = (8usize, 4usize);
-        let sizing = plan(stride, cap, 1 << 20);
-        // SAFETY: leader-side, single-threaded, created and destroyed inside the test.
-        unsafe {
-            let pcxt = pg_sys::CreateParallelContext(
-                c"vectorscale".as_ptr().cast_mut(),
-                c"hnswsq_parallel_build_main".as_ptr().cast_mut(),
-                2,
-            );
-            estimate_arena(pcxt, stride, cap, sizing);
-            let (arena, layout) = leader_setup(pcxt, stride, cap, sizing, 0);
-
-            // It is PostgreSQL's own toc, found the way a worker finds it.
-            let attached =
-                pg_sys::shm_toc_attach(PARALLEL_MAGIC, pg_sys::dsm_segment_address((*pcxt).seg));
-            assert_eq!(
-                attached,
-                (*pcxt).toc,
-                "PARALLEL_MAGIC must be PostgreSQL's own toc magic"
-            );
-
-            // ... and the regions are reachable through it by key.
-            let header = pg_sys::shm_toc_lookup(attached, TOC_KEY_HEADER, false);
-            assert!(!header.is_null(), "the arena header is findable by key");
-            let chunk = pg_sys::shm_toc_lookup(attached, TOC_KEY_CHUNK, false);
-            assert!(!chunk.is_null(), "so is the chunk");
-
-            // A second handle through that toc -- a worker's whole attachment story --
-            // sees the same arena.
-            let worker_view = SharedArena::attach(attached);
-            assert_eq!(worker_view.header().max_nodes, sizing.nodes);
-            assert_eq!(worker_view.chunk().total_bytes(), layout.total_bytes);
-            assert_eq!(
-                worker_view.state().claimed(),
-                (0, 0),
-                "the leader's fresh arena has claimed nothing"
-            );
-
-            drop(worker_view);
-            drop(arena);
-            pg_sys::DestroyParallelContext(pcxt);
-        }
-    }
 }

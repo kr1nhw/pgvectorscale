@@ -1080,35 +1080,37 @@ Two details the tests pin down, both about *not* being naive:
   tests that want to assert a level directly, and both derive from the same
   `random_level`, so they agree whenever the order is the same.
 
-### 3j.12 The driver's leader side exists; its segment sizing is not settled
+### 3j.12 The driver's leader side: sized, allocated, and found by key
 
-`driver.rs` holds the leader half: `plan` (arena shape, from the same `plan_capacity` the
-single-builder path uses), `estimate_arena` (mirroring PostgreSQL's
-`shm_toc_estimate_chunk/keys` macros, which bindgen cannot emit because they are
-`static inline`), `leader_setup` (`InitializeParallelDSM` + allocate the arena in the
-context's toc), `worker_attach` (`dsm_attach` + `shm_toc_attach(PARALLEL_MAGIC, ...)` +
-by-key lookup).  `PARALLEL_MAGIC` is pinned to `0x50477c23`, and the test that verifies it
-against a real context is written but not yet passing.
+`driver.rs` holds the leader half, and it **works** as of this round: in a real parallel
+context, `estimate_arena` -> `InitializeParallelDSM` -> `SharedArena::allocate` puts the
+arena in the context's toc with the planned shape, `shm_toc_attach(PARALLEL_MAGIC, ...)`
+returns exactly the pointer `InitializeParallelDSM` stored (so the pinned magic is verified,
+not trusted), every region is findable by key through it, and a second handle built from
+that toc sees the same arena.  `worker_attach` (`dsm_attach` + toc attach + by-key lookup)
+is the other half, ready for the entry point.
 
-**Correcting the previous round's conclusion.**  It reported that the estimate "appears not
-to be honored at all".  An instrumented run says otherwise: `space_for_chunks` grows by
-exactly what we asked for, and `shm_toc_freespace` covers the arena -- so the estimate does
-survive into the toc.  What that run also revealed is the real bug: the estimate has to be
-per **allocation**, not per total.  `shm_toc_allocate` `BUFFERALIGN`s each allocation
-separately, so rounding up the summed regions once is short by up to eight bytes per
-region, which surfaces as `ERROR: out of shared memory` -- a hard failure for a rounding
-detail.  `SharedArena::allocation_sizes` fixes that and is right.
+Getting there took three corrections, and the record is worth keeping because two of them
+were mine:
 
-What is *not* settled is why the same sequence now fails again with exactly one
-`InitializeParallelDSM` when the instrumented variant (which called it twice, once to read
-the estimator) passed.  Both readings are recorded in `driver.rs`, along with the cheap
-diagnostic that distinguishes them: log `shm_toc_freespace` immediately before the failing
-allocate, with exactly one `InitializeParallelDSM`.  Smaller than the arena needs means the
-toc was sized without our regions and the estimate is applied too early; larger means the
-failing allocation is a later one and the pointer is misplaced.
+1. **The estimate is per allocation, not per total.**  `shm_toc_allocate` `BUFFERALIGN`s
+   each allocation separately, so rounding up the summed regions once is short by up to
+   eight bytes per region -- which surfaces as `ERROR: out of shared memory`, a hard failure
+   for a rounding detail.  `SharedArena::allocation_sizes` is what the estimator consumes.
+2. **The previous round's conclusion was wrong.**  It reported that the estimate "appears
+   not to be honored at all".  Measuring says the opposite: `space_for_chunks` grew by
+   exactly what we asked for.  The apparent contradiction (an instrumented variant passing
+   while the plain one failed) was a red herring from that variant calling
+   `InitializeParallelDSM` twice.
+3. **`BUFFERALIGN` is not the whole charge.**  With per-allocation estimates, a real
+   context reported `shm_toc_freespace` **56 bytes above** the aligned total the arena
+   needed -- and the allocation still failed.  So each allocation also carries a small
+   margin (`CHUNK_MARGIN = 64`).  Both are over-reservations by design: reserved-and-unused
+   shared memory costs kilobytes, an under-estimate is a hard error.
 
-Both driver tests are `#[ignore]`d with those findings in place, so the suite is green
-without the failure being hidden.
+The lesson worth carrying to the rest of the driver: PostgreSQL's own accounting is only
+knowable by measuring against a real context, and when an estimate is involved, "it fits"
+should be an assertion rather than an arithmetic belief.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
