@@ -360,13 +360,26 @@ impl FlatGraph {
     }
 
     #[inline]
+    /// The graph's entry point -- the third cursor, and the third place a private copy
+    /// would go wrong: with a shared state the field is `None` forever, so every worker
+    /// would see an empty graph, plan an empty list and produce a graph with no edges
+    /// at all (which is exactly what the structure gate caught).
     pub fn entry(&self) -> Option<u32> {
-        self.entry
+        match self.shared_state() {
+            Some(state) => match state.entry() {
+                super::arena::NO_ENTRY => None,
+                id => Some(id),
+            },
+            None => self.entry,
+        }
     }
 
     #[inline]
     pub fn entry_level(&self) -> usize {
-        self.entry_level
+        match self.shared_state() {
+            Some(state) => state.entry_level(),
+            None => self.entry_level,
+        }
     }
 
     /// Promote `id` to entry point when its level is higher than the current
@@ -374,9 +387,17 @@ impl FlatGraph {
     /// searcher never lands on an unlinked entry).
     pub fn promote_entry(&mut self, id: u32) -> bool {
         let level = self.level(id) as usize;
-        if level > self.entry_level || self.entry.is_none() {
-            self.entry = Some(id);
-            self.entry_level = level;
+        if level > self.entry_level() || self.entry().is_none() {
+            match self.shared_state() {
+                // One store, level first: a reader that sees the id must see the level
+                // that belongs with it.  Callers serialize promotion (the driver
+                // promotes after the workers stop; a worker never promotes at all).
+                Some(state) => state.set_entry(id, level),
+                None => {
+                    self.entry = Some(id);
+                    self.entry_level = level;
+                }
+            }
             true
         } else {
             false
@@ -577,6 +598,40 @@ impl FlatGraph {
         // A node with `level + 1` layers must own that many slabs.
         let layers = self.level(id) as usize + 1;
         (base + layers <= self.slabs_used()).then_some(base)
+    }
+}
+
+/// A graph handle that may be handed to another worker.
+///
+/// `Send`/`Sync` are asserted **here**, on the shared construction, and not on
+/// `FlatGraph`: only a chunk-backed graph over an arena segment can be shared -- the
+/// growth, the cursors and the locking discipline are all the arena's -- while a
+/// grow-mode graph owns `Vec`s that a second writer would race.  Putting the impls on
+/// `FlatGraph` would silently permit exactly that, and nothing in the type would say
+/// which one a caller had.
+pub struct SharedGraph(FlatGraph);
+
+// SAFETY: the inner graph was built by `FlatGraph::in_arena`, so its storage is the
+// arena's segment and its cursors are the arena's `ArenaState`.  Every mutation of a
+// node the handle does not own goes through that node's lock (`set_list_locked`), the
+// claim/publish protocol is atomic, and no `Vec` field is populated in this mode.
+unsafe impl Send for SharedGraph {}
+unsafe impl Sync for SharedGraph {}
+
+impl SharedGraph {
+    /// A worker's handle on a shared arena.  Cheap: it is pointers and offsets.
+    pub fn new(arena: &SharedArena) -> Self {
+        Self(FlatGraph::in_arena(arena))
+    }
+
+    pub fn graph(&self) -> &FlatGraph {
+        &self.0
+    }
+
+    /// Mutable access for what only the owner of a node may do: claiming it, writing
+    /// its own lists, and publishing it.  Nothing here touches another worker's node.
+    pub fn graph_mut(&mut self) -> &mut FlatGraph {
+        &mut self.0
     }
 }
 
@@ -1102,6 +1157,212 @@ mod tests {
         drop(b);
         drop(peer_arena);
         drop(a);
+        drop(arena);
+        // SAFETY: no handle references the mapping any more.
+        unsafe { pgrx::pg_sys::dsm_detach(seg) };
+    }
+
+    #[pgrx::pg_test]
+    fn two_threads_run_the_engine_over_one_arena() {
+        // The design's central claim: two writers can build one graph, each searching
+        // the shared arena and backlinking under the target's lock.  Threads again, so
+        // the *cross-process* LWLock case remains the build's to prove -- but the
+        // protocol, the claim/publish watermark, the search's watermark bound and the
+        // lock discipline all run here for real.
+        use super::super::build::SearchScratch;
+        use super::super::flat_engine::{apply_flat, plan_flat, FlatPairBuf, Locking};
+        use super::super::quantize::HnswPrecision;
+        use crate::access_method::distance::{distance_l2, DistanceType};
+
+        let size = 1usize << 20;
+        // SAFETY: a fresh backend-owned segment, detached before the test returns.
+        let seg = unsafe { pgrx::pg_sys::dsm_create(size, 0) };
+        let toc = unsafe {
+            pgrx::pg_sys::shm_toc_create(
+                super::super::arena::HNSWSQ_TOC_MAGIC,
+                pgrx::pg_sys::dsm_segment_address(seg),
+                size,
+            )
+        };
+        let codec = Codec::new(HnswPrecision::Plain, 2);
+        let (m, m0, efc) = (2usize, 4usize, 8usize);
+        let (stride, cap, nodes, slabs) = (codec.vector_bytes(), m0, 64usize, 128usize);
+        let tranche = super::super::arena::register_tranche(c"hnswsq_two_threads_test");
+        let arena =
+            unsafe { super::super::arena::SharedArena::allocate(toc, stride, cap, nodes, slabs, tranche) };
+        let per = 20usize;
+        // The workers' rows; the seed above is node 0, so the graph ends up with one
+        // more node than this.
+        let total = (2 * per) as u32;
+
+        // The leader seeds the entry point *before* any worker starts.  Without one,
+        // every search finds nothing and every node is born with an empty list -- this
+        // test asserted exactly that first (40 published nodes, `max_list_len=0`,
+        // `reachable=0`), which is the failure mode the rendezvous exists to prevent.
+        {
+            let mut seed = SharedGraph::new(&arena);
+            let mut scratch = SearchScratch::new();
+            // The dimension, not `m0`: the buffer holds one vector per pair.
+            let mut buf = FlatPairBuf::new(2);
+            let v = [0.0f32, 0.0];
+            let mut encoded = Vec::with_capacity(stride);
+            let clamped = codec.encode_into(&v, &mut encoded);
+            let subject = codec.decode(&encoded);
+            let id = seed.graph_mut().claim_slot(0).expect("room for the seed");
+            let plan = plan_flat(
+                &codec, DistanceType::L2, distance_l2, seed.graph(), &mut scratch, &mut buf,
+                id, 0, &subject, m, m0, efc, false,
+            );
+            // `SoleWriter`: the seed is what makes an entry exist, so it must be
+            // promoted here rather than left to the driver's post-join promotion.
+            apply_flat(
+                &codec, distance_l2, seed.graph_mut(), &Locking::SoleWriter, &mut buf,
+                id, 0, plan, m, m0,
+            );
+            seed.graph_mut()
+                .publish(id, crate::util::ItemPointer::new(1, 1), clamped, &encoded);
+            assert_eq!(seed.graph().entry(), Some(id), "the seed owns the entry");
+        }
+        // Locks for the workers.  NOT the arena's: those are LWLocks, PostgreSQL FFI
+        // may only be called from the backend's main thread (pgrx enforces it:
+        // "postgres FFI may not be called from multiple threads"), and a spawned
+        // thread is no substitute for a worker *process*.  In the real build each
+        // worker is its own process with its own main thread, and the arena's LWLocks
+        // are what exclude them; here the storage is still the shared segment, and
+        // `RwLock`s give the threads the same exclusion.  The cross-process LWLock
+        // case is therefore the worker sweep's to prove, not this test's.
+        let locks = NodeLocks::new(nodes);
+
+        // Rendezvous: the nodes that exist when the workers start.
+        arena.state().set_start_nodes(1);
+        assert_eq!(arena.state().start_nodes(), 1);
+
+        // Panics inside a scoped thread lose their message (the hook writes to the
+        // backend's stderr), so each worker catches its own and hands the payload back.
+        fn payload(e: Box<dyn std::any::Any + Send>) -> String {
+            if let Some(s) = e.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic>".to_string()
+            }
+        }
+        let built: Vec<Result<Vec<u32>, String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2u32)
+                .map(|w| {
+                    let arena = &arena;
+                    let codec = &codec;
+                    let locks = &locks;
+                    scope.spawn(move || {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let mut handle = SharedGraph::new(arena);
+                        let mut scratch = SearchScratch::new();
+                        // The dimension, not `m0`: the buffer holds one vector per pair.
+            let mut buf = FlatPairBuf::new(2);
+                        let mut mine = Vec::new();
+                        for k in 0..per as u32 {
+                            let x = (w * per as u32 + k) as f32;
+                            let v = [x, (k % 3) as f32];
+                            let mut encoded = Vec::with_capacity(stride);
+                            let clamped = codec.encode_into(&v, &mut encoded);
+                            let subject = codec.decode(&encoded);
+                            let Some(id) = handle.graph_mut().claim_slot(0) else {
+                                break;
+                            };
+                            let plan = plan_flat(
+                                codec,
+                                DistanceType::L2,
+                                distance_l2,
+                                handle.graph(),
+                                &mut scratch,
+                                &mut buf,
+                                id,
+                                0,
+                                &subject,
+                                m,
+                                m0,
+                                efc,
+                                false,
+                            );
+                            apply_flat(
+                                codec,
+                                distance_l2,
+                                handle.graph_mut(),
+                                &Locking::Locks(locks),
+                                &mut buf,
+                                id,
+                                0,
+                                plan,
+                                m,
+                                m0,
+                            );
+                            // Publish last: the node becomes searchable only once its
+                            // vector and its own lists are all written.
+                            handle.graph_mut().publish(
+                                id,
+                                crate::util::ItemPointer::new(1, 1),
+                                clamped,
+                                &encoded,
+                            );
+                            mine.push(id);
+                        }
+                        mine
+                        }))
+                        .map_err(payload)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let built: Vec<Vec<u32>> = built
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|e| panic!("a worker panicked: {}", e)))
+            .collect();
+
+        let mut all: Vec<u32> = built.iter().flatten().copied().collect();
+        let claimed = all.len();
+        assert_eq!(claimed, total as usize, "every row became a node: {:?}", built);
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), claimed, "no id was handed out twice");
+        assert_eq!(
+            arena.state().watermark(),
+            claimed + 1,
+            "every node was published (the workers' plus the seed), so the watermark \
+             reached the end"
+        );
+
+        // The arena's own structural gate, over the graph two threads built.
+        let g = FlatGraph::in_arena(&arena);
+        let checks = check_lists(&g, cap);
+        assert_eq!(checks.nodes, claimed + 1, "the workers' nodes plus the seed");
+        assert_eq!(checks.self_links, 0, "no node links to itself: {}", checks.summary(cap));
+        assert_eq!(
+            checks.duplicate_links, 0,
+            "no list repeats an id: {}",
+            checks.summary(cap)
+        );
+        assert!(
+            checks.max_list_len > 0,
+            "the backlinks actually landed: {}",
+            checks.summary(cap)
+        );
+        assert!(
+            checks.max_list_len <= cap,
+            "capacity respected: {}",
+            checks.summary(cap)
+        );
+        assert!(
+            checks.reachable_from_entry as usize >= claimed / 2,
+            "the seeded entry reaches the graph both threads built: {}",
+            checks.summary(cap)
+        );
+
+        drop(g);
         drop(arena);
         // SAFETY: no handle references the mapping any more.
         unsafe { pgrx::pg_sys::dsm_detach(seg) };

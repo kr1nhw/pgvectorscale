@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 4h: two threads build one shared graph | done | `SharedGraph`; entry-cursor bug found; the whole engine runs concurrently |
 | M3 step 4g: engine runs behind `Locking` | done | `apply_flat` takes `Locking::{SoleWriter, Locks}`; same heuristic either way |
 | M3 step 4f: shared-write + node-lock path | done | `set_list_concurrent`/`set_list_locked`; contention test (no torn lists) |
 | M3 step 4e: `FlatGraph` over a shared arena | done | cursors read the segment (`in_arena`); 2 latent cursor bugs surfaced by the shared path |
@@ -959,6 +960,40 @@ Entry promotion is deliberately **not** done by a worker: every insert would ser
 on the entry, and promotion only matters once the graph stops growing.  `Locking::Locks`
 skips it and the driver promotes after the workers stop, which is also the first moment
 a searcher may observe it.
+
+### 3j.8 Two threads build one shared graph (and the entry cursor)
+
+`SharedGraph` is the handle workers share: `Send`/`Sync` are asserted on this *type*,
+which is only constructible from a shared arena, rather than on `FlatGraph` -- a
+chunk-backed graph over a segment is shareable, a grow-mode graph owns `Vec`s that
+would race, and a blanket impl would silently permit the second.
+
+`two_threads_run_the_engine_over_one_arena` then runs the *whole* engine -- search,
+plan, apply, backlink, publish -- from two threads over one arena, and asserts through
+the structure gate: 40 nodes handed out with no duplicates, the watermark past all of
+them, no self-links, no duplicates, capacity respected, and at least half the graph
+reachable from the entry.
+
+Four things this cost, all worth keeping:
+
+* **The entry point was the third cursor with two homes.**  `entry()`/`promote_entry`
+  read the local field, which is `None` forever in shared mode, so every worker saw an
+  empty graph, planned an empty list and published a node with *no edges at all*.  The
+  structure gate caught it in the plainest possible terms: `nodes=40 published=40
+  max_list_len=0/4 no_incoming=40 reachable=0`.  Both accessors now go through
+  `ArenaState`, and promotion writes the level before the id so a reader cannot see an
+  entry without its level.
+* **The first node must be an entry before any worker starts** -- otherwise there is
+  nothing to search from and *every* node is born unlinked.  The test now seeds it and
+  sets `start_nodes`, which is precisely the rendezvous the driver formalises.
+* **PostgreSQL FFI may not be called from spawned threads** (pgrx enforces it:
+  "postgres FFI may not be called from multiple threads"), and the arena's locks *are*
+  FFI -- LWLocks.  A thread is not a substitute for a worker process.  The test
+  therefore locks with `NodeLocks::new` (`RwLock`s) while storing into the real shared
+  segment; the cross-process LWLock case stays the worker sweep's to prove.
+* worker panics lose their message inside a scoped thread (the hook writes to the
+  backend's stderr), so each worker catches its own and hands the payload back.  That
+  is what turned "a scoped thread panicked" into the two real diagnoses above.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
