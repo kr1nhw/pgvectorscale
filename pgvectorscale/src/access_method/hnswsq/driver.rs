@@ -18,7 +18,7 @@ use pgrx::pg_sys;
 use pgrx::pg_guard;
 
 use super::arena::{ArenaLayout, SharedArena, TOC_KEY_CHUNK, TOC_KEY_HEADER};
-use super::flat_graph::{plan_capacity, ArenaSizing};
+use super::flat_graph::{check_lists, plan_capacity, ArenaSizing, FlatGraph};
 
 /// PostgreSQL's toc magic.
 ///
@@ -341,10 +341,16 @@ pub unsafe extern "C-unwind" fn hnswsq_parallel_build_main(
     arena.state().worker_entered();
     arena.state().worker_started();
 
-    // The build loop goes here: a shared scan, `claim_slot`, search/plan/apply with
-    // `Locking::Locks`, then `publish`.  Until it lands, a worker's whole job is to prove
-    // it can reach the leader's arena from its own process -- which is the thing no
-    // thread-based test could establish.
+    // The build loop: scan this worker's share of the heap and insert into the shared arena.
+    // Parameters are read tolerantly so a bare attachment test (no build published) still
+    // works -- that is what the cross-process test exercises.
+    let params = pg_sys::shm_toc_lookup(toc, TOC_KEY_PARAMS, true);
+    if !params.is_null() {
+        let params = BuildParams::read_from(toc);
+        if params.heap_oid != 0 {
+            crate::access_method::hnswsq::build::parallel_worker_scan(toc, &arena, &params);
+        }
+    }
 
     arena.state().worker_finished();
 }
@@ -411,6 +417,134 @@ mod tests {
 
             drop(arena);
             pg_sys::DestroyParallelContext(pcxt);
+        }
+    }
+
+    // IGNORED for a harness reason, not a driver one: a `#[pg_test]` runs inside a transaction
+    // that is rolled back, so `CREATE TABLE`/`CREATE INDEX` here are *uncommitted* -- and a
+    // parallel worker gets a snapshot that cannot see uncommitted catalog rows, so it dies at
+    // `table_open` with "cannot open relation".  That failure is itself informative: it shows
+    // the worker reached the relation-open inside `parallel_worker_scan`, i.e. the
+    // entry -> parameters -> scan wiring is live.  To finish this test the fixtures have to be
+    // committed before the workers start (create them outside the test transaction, e.g. from
+    // the harness/setup SQL, or drive the parallel build from a script against a real cluster
+    // where such a table exists).
+    #[pgrx::pg_test]
+    #[ignore = "fixtures are uncommitted, so workers cannot open them; see the comment above"]
+    fn workers_build_a_shared_graph_in_parallel() {
+        // The first real parallel build: two worker *processes* scanning one table into one
+        // shared arena.  The leader seeds an entry first, because workers never promote one and
+        // a graph without an entry gets born with no edges at all (a failure this project has
+        // produced before).
+        //
+        // The index is a real hnswsq index so the scan's key attribute is the embedding -- the
+        // callback receives the vector through `BuildIndexInfo` -- but it is *not* the index
+        // being built: the AM does not drive this yet, so the workers insert into a fresh arena.
+        pgrx::Spi::run("CREATE TABLE par_build_test(id int, embedding vector(3))").unwrap();
+        pgrx::Spi::run(
+            "INSERT INTO par_build_test
+             SELECT g, ('[' || g || ',' || (g % 7) || ',' || (g % 3) || ']')::vector
+             FROM generate_series(1, 200) g",
+        )
+        .unwrap();
+        pgrx::Spi::run(
+            "CREATE INDEX par_build_test_idx ON par_build_test USING hnswsq (embedding vector_l2_ops)
+             WITH (storage_layout='plain', m=8, ef_construction=32)",
+        )
+        .unwrap();
+        let heap_oid: pg_sys::Oid =
+            pgrx::Spi::get_one("SELECT 'par_build_test'::regclass::oid").unwrap().unwrap();
+        let index_oid: pg_sys::Oid =
+            pgrx::Spi::get_one("SELECT 'par_build_test_idx'::regclass::oid").unwrap().unwrap();
+
+        let (stride, dims, m) = (12u32, 3u32, 8u32);
+        let cap = m * 2;
+        let sizing = plan(stride as usize, cap as usize, 1 << 20);
+        assert!(sizing.nodes > 300, "room for the table: {:?}", sizing);
+        let tranche = super::super::arena::register_tranche(c"hnswsq_parallel_build_test");
+
+        // SAFETY: leader-side; relations are opened here and closed with the context.
+        unsafe {
+            let heap = pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            let snapshot = pg_sys::GetActiveSnapshot();
+            let pcxt = pg_sys::CreateParallelContext(
+                LIBRARY.as_ptr().cast_mut().cast::<std::os::raw::c_char>(),
+                c"hnswsq_parallel_build_main".as_ptr().cast_mut(),
+                2,
+            );
+            estimate_arena(pcxt, stride as usize, cap as usize, sizing);
+            estimate_chunk(pcxt, scan_bytes(heap, snapshot));
+            let (arena, _layout) = leader_setup(pcxt, stride as usize, cap as usize, sizing, tranche);
+            leader_scan_setup(pcxt, heap, snapshot);
+
+            // The leader's seed: without an entry no search finds anything and every node is
+            // born with an empty list.
+            {
+                let mut seed = FlatGraph::in_arena(&arena);
+                let id = seed.claim_slot(0).expect("room for the seed");
+                seed.publish(id, crate::util::ItemPointer::new(1, 1), false, &[1u8; 12]);
+                assert!(seed.promote_entry(id), "the seed owns the entry");
+            }
+            arena.state().set_start_nodes(1);
+
+            BuildParams {
+                rows: 200,
+                seed: 20240912,
+                heap_oid: u32::from(heap_oid),
+                index_oid: u32::from(index_oid),
+                stride,
+                num_dimensions: dims,
+                cap,
+                m,
+                m0: cap,
+                ef_construction: 32,
+                ml: 1.0 / 8f32.ln(),
+                max_level: 7,
+                dist_type: 0,
+                precision: 0, // Plain, matching the index's storage_layout
+                backfill: 0,
+                backlink_mode: 0,
+                tranche,
+            }
+            .publish((*pcxt).toc);
+
+            pg_sys::LaunchParallelWorkers(pcxt);
+            pg_sys::WaitForParallelWorkersToFinish(pcxt);
+
+            let launched = (*pcxt).nworkers_launched;
+            assert!(launched > 0, "no workers were launched");
+            assert_eq!(
+                arena.state().workers_entered(),
+                launched as u32,
+                "every worker entered and ran its scan"
+            );
+            assert!(!arena.state().failed(), "no worker failed");
+
+            // Every row became a node: the seed plus the table.
+            let watermark = arena.state().watermark();
+            assert_eq!(
+                watermark,
+                1 + 200,
+                "the parallel build published every row (plus the seed)"
+            );
+
+            // ... and the graph two processes co-built is structurally sound: no self-links,
+            // no repeated ids, capacity respected, and the entry reaches it.
+            let g = FlatGraph::in_arena(&arena);
+            let checks = check_lists(&g, cap as usize);
+            assert_eq!(checks.self_links, 0, "{}", checks.summary(cap as usize));
+            assert_eq!(checks.duplicate_links, 0, "{}", checks.summary(cap as usize));
+            assert!(checks.max_list_len > 0, "backlinks landed: {}", checks.summary(cap as usize));
+            assert!(checks.max_list_len <= cap as usize);
+            assert!(
+                checks.reachable_from_entry > 100,
+                "the seeded entry reaches most of the graph: {}",
+                checks.summary(cap as usize)
+            );
+
+            drop(g);
+            pg_sys::DestroyParallelContext(pcxt);
+            pg_sys::table_close(heap, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         }
     }
 

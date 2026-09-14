@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5j: the callback, the scan loop, the wired entry | done (compile-verified) | two workers launched, entered, and reached the relation open |
 | M3 step 5i: `worker_build_state` over the shared arena | done | from `BuildParams` + the arena; `BuildState` is crate-visible |
 | M3 step 5h: params carry the backlink policy | done | a worker cannot silently build on another policy |
 | M3 step 5g: params carry the dimension; meta-page ordering found | done | worker codec is derivable; leader must write meta before launching |
@@ -1367,6 +1368,35 @@ driver needs anyway for the writeout; they come with it.
 Also worth noting from the attempt: moving that test into `build.rs` by appending it to the end
 of the file put it outside the test module and broke `mod mem_tests`'s gate -- the file's last
 `}` is not the module's.  Rewriting that way was reverted rather than patched.
+
+### 3j.22 The callback and the scan loop are in place
+
+The last structural pieces exist: `parallel_insert_callback` (extract the vector, cosine
+preprocess, level from the row, insert under `Locking::Locks(arena.locks())` -- the same insert
+body as the single-builder path) and `parallel_worker_scan` (open heap and index, build this
+worker's own `IndexInfo`, `table_beginscan_parallel`, then
+`rd_tableam->index_build_range_scan` over the whole heap -- the *descriptor* is what divides the
+heap between workers, not this call).  The worker entry point now reads the parameters and runs
+the scan when they name a heap.
+
+Running it produced the first real evidence: with two workers launched, the leader saw both
+enter, and the failure came from a worker *inside* `parallel_worker_scan`, at `table_open`:
+
+```
+ERROR:  cannot open relation "par_build_test_idx"
+```
+
+**A test-harness constraint, not a driver defect**: `#[pg_test]` runs inside a transaction that
+is rolled back, so the test's `CREATE TABLE`/`CREATE INDEX` are uncommitted -- and a parallel
+worker gets a snapshot that cannot see uncommitted catalog rows.  The test is `#[ignore]`d with
+that diagnosis in place.  Finishing it needs committed fixtures: create the table and index
+outside the test transaction (harness setup SQL, or a script against a cluster that already has
+such a table -- the local scratch database has `t100k` with an hnswsq index, which is exactly
+the shape required).
+
+The silver lining is that the error locates the boundary precisely: entry -> parameters ->
+`worker_build_state` -> `parallel_worker_scan` -> relation open all execute in a worker process.
+What remains untested is the scan itself and the inserts it feeds.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

@@ -451,6 +451,109 @@ fn writeout_graph(state: &mut BuildState) {
 }
 
 /// Pass-2 build state.
+/// What a worker's scan callback needs: its own state, the leader's parameters, and the
+/// arena's node locks.
+///
+/// The locks are a raw pointer rather than a borrow because the callback is `extern "C"` and
+/// gets a `void *`: the arena outlives the scan, so the pointer stays valid for as long as it
+/// is used, and every use is inside an `unsafe` block that says so.
+pub(crate) struct ParallelInsertCtx {
+    state: BuildState,
+    params: crate::access_method::hnswsq::driver::BuildParams,
+    locks: *const crate::access_method::hnswsq::arena::NodeLocks,
+}
+
+/// One row, from the table scan into the shared graph.
+///
+/// This is the parallel counterpart of the single-builder callback: same extraction, same
+/// cosine preprocessing, same insert body -- the two differences are that the level comes from
+/// the row rather than from an RNG stream (which worker draws next is not deterministic), and
+/// that backlinks take the target's node lock.
+unsafe extern "C-unwind" fn parallel_insert_callback(
+    _index: pg_sys::Relation,
+    tid: pg_sys::ItemPointer,
+    values: *mut pg_sys::Datum,
+    isnull: *mut bool,
+    _tuple_is_alive: bool,
+    state: *mut std::os::raw::c_void,
+) {
+    if unsafe { *isnull } {
+        return;
+    }
+    let ctx = unsafe { &mut *(state as *mut ParallelInsertCtx) };
+    let mut vec = unsafe { extract_vector(*values) };
+    if ctx.state.distance_type == DistanceType::Cosine {
+        preprocess_cosine(&mut vec);
+    }
+    let heap_tid = ItemPointer::with_item_pointer_data(unsafe { *tid });
+    let level = crate::access_method::hnswsq::levels::level_for_item_pointer(
+        ctx.params.seed,
+        ctx.params.ml,
+        ctx.params.max_level,
+        unsafe { *tid },
+    );
+    // SAFETY: the arena (and so its locks) outlives the scan, and this is the only writer of
+    // the nodes it touches that does not hold their lock.
+    let locking = Locking::Locks(unsafe { &*ctx.locks });
+    flat_insert_at_level(&mut ctx.state, heap_tid, &vec, level, &locking);
+}
+
+/// A worker's whole job: scan this worker's share of the heap and insert every row into the
+/// shared arena.
+///
+/// # Safety
+///
+/// `toc` must hold the leader's parameters and scan descriptor, the relations they name must be
+/// openable, and `arena` must be the leader's arena.
+pub(crate) unsafe fn parallel_worker_scan(
+    toc: *mut pg_sys::shm_toc,
+    arena: &crate::access_method::hnswsq::arena::SharedArena,
+    params: &crate::access_method::hnswsq::driver::BuildParams,
+) {
+    let lockmode = unsafe { pg_sys::AccessShareLock as pg_sys::LOCKMODE };
+    let heap = unsafe { pg_sys::table_open(pg_sys::Oid::from(params.heap_oid), lockmode) };
+    let index = unsafe { pg_sys::table_open(pg_sys::Oid::from(params.index_oid), lockmode) };
+    // Each worker builds its own IndexInfo: it is palloc'd, so it cannot be shared, and it is
+    // a deterministic function of the relation anyway.  It is what tells the scan which
+    // column to hand the callback -- i.e. where the vector comes from.
+    let index_info = unsafe { pg_sys::BuildIndexInfo(index) };
+    let pscan = unsafe { crate::access_method::hnswsq::driver::scan_descriptor(toc) };
+    let scan = unsafe { pg_sys::table_beginscan_parallel(heap, pscan.cast()) };
+
+    let mut ctx = ParallelInsertCtx {
+        state: worker_build_state(params, arena),
+        params: *params,
+        locks: arena.locks() as *const _,
+    };
+    let am = unsafe { (*heap).rd_tableam };
+    let build_range = unsafe {
+        (*am).index_build_range_scan
+            .expect("the table AM has no index_build_range_scan")
+    };
+    // The whole heap: the scan descriptor is what divides it between workers, not this call.
+    unsafe {
+        build_range(
+            heap,
+            index,
+            index_info,
+            false, // allow_sync
+            false, // anyvisible
+            false, // progress
+            0,
+            u32::MAX as pg_sys::BlockNumber, // InvalidBlockNumber: to the end
+            Some(parallel_insert_callback),
+            &mut ctx as *mut ParallelInsertCtx as *mut std::os::raw::c_void,
+            scan,
+        );
+    }
+
+    unsafe {
+        pg_sys::table_endscan(scan);
+        pg_sys::table_close(index, lockmode);
+        pg_sys::table_close(heap, lockmode);
+    }
+}
+
 /// The state a parallel worker builds with, from the leader's published parameters and the
 /// shared arena -- i.e. the table in the design doc, in code.
 ///
