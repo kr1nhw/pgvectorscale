@@ -141,6 +141,307 @@ pub fn search_layer_flat(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Selection and application (M1, second half)
+// ---------------------------------------------------------------------------
+
+/// Decode-once pairwise-distance buffer for the flat engine (the same idea as
+/// the legacy build's `DistBuf`): candidates are decoded into one flat `f32`
+/// buffer, so the occlusion checks index slices instead of hashing a map.  The
+/// allocation is reused across calls.
+struct FlatPairBuf {
+    dim: usize,
+    data: Vec<f32>,
+}
+
+impl FlatPairBuf {
+    fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            data: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+    }
+
+    /// Decode `id`'s stored vector into the next slot; returns the slot index.
+    fn push(&mut self, codec: &Codec, g: &FlatGraph, id: u32) -> usize {
+        let start = self.data.len();
+        self.data.resize(start + self.dim, 0.0);
+        codec.decode_into(g.vector(id), &mut self.data[start..]);
+        self.data.len() / self.dim - 1
+    }
+
+    #[inline]
+    fn slice(&self, slot: usize) -> &[f32] {
+        &self.data[slot * self.dim..(slot + 1) * self.dim]
+    }
+}
+
+/// Occlusion rule: walking candidates in ascending distance order, keep a
+/// candidate unless an already-kept one is closer to it than the subject is.
+/// Returns indices into the ascending arrays, capped at `cap`.
+fn occlusion_accepted(
+    dist_fn: crate::access_method::distance::DistanceFn,
+    buf: &FlatPairBuf,
+    dists: &[f32],
+    slots: &[usize],
+    cap: usize,
+) -> Vec<usize> {
+    let mut accepted: Vec<usize> = Vec::with_capacity(cap.min(dists.len()));
+    for i in 0..dists.len() {
+        if accepted.len() >= cap {
+            break;
+        }
+        let mut keep = true;
+        for &sel in &accepted {
+            if dist_fn(buf.slice(slots[i]), buf.slice(slots[sel])) < dists[i] {
+                keep = false;
+                break;
+            }
+        }
+        if keep {
+            accepted.push(i);
+        }
+    }
+    accepted
+}
+
+/// Neighbour selection for a node's **own** list: the occlusion heuristic over
+/// the beam-search candidates, in ascending distance order, up to `cap`.
+///
+/// No closest-pruned backfill here (pgvector's forward list is the heuristic's
+/// output alone), so a list can be shorter than `cap` while the graph is young.
+pub fn select_neighbors_flat(
+    dist_fn: crate::access_method::distance::DistanceFn,
+    codec: &Codec,
+    g: &FlatGraph,
+    buf: &mut FlatPairBuf,
+    mut candidates: Vec<(f32, u32)>,
+    cap: usize,
+) -> Vec<u32> {
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    buf.clear();
+    for &(_, id) in candidates.iter() {
+        buf.push(codec, g, id);
+    }
+    let dists: Vec<f32> = candidates.iter().map(|c| c.0).collect();
+    let slots: Vec<usize> = (0..candidates.len()).collect();
+    occlusion_accepted(dist_fn, buf, &dists, &slots, cap)
+        .into_iter()
+        .map(|i| candidates[i].1)
+        .collect()
+}
+
+/// Selected neighbours for one layer, produced by [`plan_flat`] and consumed by
+/// [`apply_flat`].  Ids only — the flat graph stores no per-entry distances, so
+/// the backlink step measures whatever it needs on demand.
+pub struct LayerPlanFlat {
+    pub layer: usize,
+    pub ids: Vec<u32>,
+}
+
+/// Greedy ef=1 descent over the flat graph, used for the upper-layer walk.
+pub fn greedy_descent_flat(
+    codec: &Codec,
+    dist_type: DistanceType,
+    query: &[f32],
+    g: &FlatGraph,
+    entry: (f32, u32),
+    from_layer: usize,
+    to_layer: usize,
+) -> (f32, u32) {
+    let mut cur = entry;
+    for layer in (to_layer..=from_layer).rev() {
+        loop {
+            let mut improved = false;
+            let list = g.neighbors(cur.1, layer);
+            for k in 0..list.len() {
+                let nb = list[k];
+                if nb as usize >= g.len() {
+                    continue;
+                }
+                let d = distance_encoded(codec, dist_type, query, g.vector(nb));
+                if d < cur.0 {
+                    cur = (d, nb);
+                    improved = true;
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
+    cur
+}
+
+/// Read-only planning half of one insert: per layer from the node's top layer
+/// down to 0, run the beam search and select the node's own neighbours.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_flat(
+    codec: &Codec,
+    dist_type: DistanceType,
+    dist_fn: crate::access_method::distance::DistanceFn,
+    g: &FlatGraph,
+    scratch: &mut SearchScratch,
+    buf: &mut FlatPairBuf,
+    new_id: u32,
+    level: u8,
+    subject: &[f32],
+    m: usize,
+    m0: usize,
+    ef_construction: usize,
+) -> Vec<LayerPlanFlat> {
+    let mut plan: Vec<LayerPlanFlat> = Vec::new();
+    let Some(ep) = g.entry() else {
+        return plan; // empty graph: this node becomes the entry, with no lists yet
+    };
+    let entry_level = g.entry_level();
+    let top = (level as usize).min(entry_level);
+
+    let mut cur = (
+        distance_encoded(codec, dist_type, subject, g.vector(ep)),
+        ep,
+    );
+    if entry_level > top {
+        cur = greedy_descent_flat(codec, dist_type, subject, g, cur, entry_level, top + 1);
+    }
+
+    for layer in (0..=top).rev() {
+        let hits = search_layer_flat(
+            codec,
+            dist_type,
+            subject,
+            g,
+            &[cur],
+            ef_construction,
+            layer,
+            scratch,
+        );
+        if let Some(best) = hits.first() {
+            cur = (best.dist, best.id);
+        }
+        let candidates: Vec<(f32, u32)> = hits
+            .iter()
+            .filter(|h| h.id != new_id)
+            .map(|h| (h.dist, h.id))
+            .collect();
+        let cap = if layer == 0 { m0 } else { m };
+        plan.push(LayerPlanFlat {
+            layer,
+            ids: select_neighbors_flat(dist_fn, codec, g, buf, candidates, cap),
+        });
+    }
+    plan
+}
+
+/// One backlink: make `target` link back to `new_id` at `layer`.
+///
+/// The decided policy (pgvector's), expressed without any per-list metadata:
+///
+/// * **append while there is room** — no distance work at all beyond `d(target,
+///   new)`, which is measured once;
+/// * **on overflow, measure and decide**: the merged set `list ∪ {new}` is
+///   ordered by distances measured on demand and the occlusion heuristic decides
+///   who stays.  The list keeps its capacity (`len == cap`) by filling any room
+///   the heuristic leaves with the *existing* members it pruned; the newcomer is
+///   never re-admitted by that fill, so an evicted entry cannot come back through
+///   this path.
+///
+/// Both branches are pure functions of the current lists and the stored vectors,
+/// which is what makes the update deterministic and lock-friendly: no version,
+/// no mask, nothing to keep consistent across revisions.
+fn backlink_flat(
+    codec: &Codec,
+    dist_fn: crate::access_method::distance::DistanceFn,
+    g: &mut FlatGraph,
+    buf: &mut FlatPairBuf,
+    target: u32,
+    new_id: u32,
+    layer: usize,
+    cap: usize,
+) {
+    if target == new_id {
+        return; // never self-link
+    }
+    let existing: Vec<u32> = g.neighbors(target, layer).to_vec();
+    if existing.contains(&new_id) {
+        return; // already linked
+    }
+
+    buf.clear();
+    let t_slot = buf.push(codec, g, target);
+    let n_slot = buf.push(codec, g, new_id);
+    let d_self = dist_fn(buf.slice(t_slot), buf.slice(n_slot));
+
+    if existing.len() < cap {
+        let mut list = existing;
+        list.push(new_id);
+        g.set_list(target, layer, &list);
+        return;
+    }
+
+    // Saturated: order the merged set by distance to the target, measuring each
+    // member on demand (slot 0 is the target, kept for the comparisons).
+    let mut entries: Vec<(f32, u32, usize)> = Vec::with_capacity(existing.len() + 1);
+    entries.push((d_self, new_id, n_slot));
+    for &member in &existing {
+        let slot = buf.push(codec, g, member);
+        entries.push((dist_fn(buf.slice(t_slot), buf.slice(slot)), member, slot));
+    }
+    entries.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let dists: Vec<f32> = entries.iter().map(|e| e.0).collect();
+    let slots: Vec<usize> = entries.iter().map(|e| e.2).collect();
+    let accepted = occlusion_accepted(dist_fn, buf, &dists, &slots, cap);
+
+    let mut is_accepted = vec![false; entries.len()];
+    for &i in &accepted {
+        is_accepted[i] = true;
+    }
+    let mut list: Vec<u32> = accepted.iter().map(|&i| entries[i].1).collect();
+    for (i, entry) in entries.iter().enumerate() {
+        if list.len() >= cap {
+            break;
+        }
+        if is_accepted[i] || entry.1 == new_id {
+            continue; // only *existing* members backfill, never the newcomer
+        }
+        list.push(entry.1);
+    }
+    g.set_list(target, layer, &list);
+}
+
+/// Mutating half of one insert: publish the node's own lists, then apply the
+/// backlinks one target at a time (append/shrink), and finally promote the entry
+/// point — last, so a searcher never lands on an entry without its own list.
+pub fn apply_flat(
+    codec: &Codec,
+    dist_fn: crate::access_method::distance::DistanceFn,
+    g: &mut FlatGraph,
+    buf: &mut FlatPairBuf,
+    new_id: u32,
+    level: u8,
+    plan: Vec<LayerPlanFlat>,
+    m: usize,
+    m0: usize,
+) {
+    if g.entry().is_none() {
+        g.promote_entry(new_id);
+        return;
+    }
+    for LayerPlanFlat { layer, ids } in plan {
+        g.set_list(new_id, layer, &ids);
+        let cap = if layer == 0 { m0 } else { m };
+        for &neighbour in &ids {
+            backlink_flat(codec, dist_fn, g, buf, neighbour, new_id, layer, cap);
+        }
+    }
+    g.promote_entry(new_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +601,196 @@ mod tests {
             &mut scratch,
         );
         assert_eq!(at_l0.len(), 1, "layer 0 has no edges in this graph");
+    }
+
+    /// Small graph with explicit positions and lists, for the selection/backlink
+    /// tests (dim 2 so the geometry is easy to reason about).
+    fn graph_with(positions: &[[f32; 2]], cap: usize, lists: &[&[u32]]) -> (FlatGraph, Codec) {
+        let codec = Codec::new(HnswPrecision::Plain, 2);
+        let mut g = FlatGraph::new(codec.vector_bytes(), cap);
+        for (i, p) in positions.iter().enumerate() {
+            g.push_node(
+                0,
+                ItemPointer::new(i as u32 + 1, 1),
+                false,
+                &codec.encode(&p.to_vec()),
+            );
+        }
+        for (i, list) in lists.iter().enumerate() {
+            g.set_list(i as u32, 0, list);
+        }
+        (g, codec)
+    }
+
+    fn all_lists(g: &FlatGraph) -> Vec<Vec<u32>> {
+        (0..g.len() as u32)
+            .map(|i| g.neighbors(i, 0).to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn own_list_is_heuristic_output_without_backfill() {
+        // Subject at the origin; node 1 is close to node 2 and node 3 is farther
+        // but sits near node 1, so both are occluded by node 1.  Distances are the
+        // real squared-L2 values the search produces (the occlusion rule compares
+        // in those units — feeding fabricated distances here silently changes who
+        // is occluded, which is how this test first failed).
+        let (g, codec) = graph_with(
+            &[[0.0, 0.0], [1.0, 0.0], [1.2, 0.0], [3.0, 0.0]],
+            4,
+            &[&[], &[], &[], &[]],
+        );
+        let subject = [0.0f32, 0.0];
+        let cands = vec![
+            (distance_l2(&subject, &[1.0, 0.0]), 1),
+            (distance_l2(&subject, &[1.2, 0.0]), 2),
+            (distance_l2(&subject, &[3.0, 0.0]), 3),
+        ];
+        let mut buf = FlatPairBuf::new(2);
+        let selected = select_neighbors_flat(distance_l2, &codec, &g, &mut buf, cands, 4);
+        assert_eq!(
+            selected,
+            vec![1],
+            "occluded candidates are dropped and nothing backfills them"
+        );
+    }
+
+    #[test]
+    fn own_list_keeps_diverse_candidates() {
+        // Candidates that are mutually far apart relative to their distance from
+        // the subject are all kept: diversity is what the heuristic is for.  (Note
+        // (1,±1) would NOT qualify: from a subject at the origin they are occluded
+        // by (1,0), which is how this test first failed.)
+        let (g, codec) = graph_with(
+            &[[0.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0]],
+            4,
+            &[&[], &[], &[], &[]],
+        );
+        let subject = [0.0f32, 0.0];
+        let cands = vec![
+            (distance_l2(&subject, &[1.0, 0.0]), 1),
+            (distance_l2(&subject, &[-1.0, 0.0]), 2),
+            (distance_l2(&subject, &[0.0, 1.0]), 3),
+        ];
+        let mut buf = FlatPairBuf::new(2);
+        let selected = select_neighbors_flat(distance_l2, &codec, &g, &mut buf, cands, 4);
+        assert_eq!(selected.len(), 3, "mutually distant candidates all survive");
+        assert_eq!(selected[0], 1, "ascending by (distance, id)");
+    }
+
+    #[test]
+    fn backlink_appends_while_there_is_room() {
+        // entry at the origin, newcomer selects it: node 0 must gain it as an
+        // incoming edge, which is what makes the newcomer reachable at all.
+        let (mut g, codec) = graph_with(&[[0.0, 0.0], [1.0, 0.0]], 4, &[&[], &[]]);
+        assert!(g.promote_entry(0));
+        let mut buf = FlatPairBuf::new(2);
+        apply_flat(
+            &codec,
+            distance_l2,
+            &mut g,
+            &mut buf,
+            1,
+            0,
+            vec![LayerPlanFlat { layer: 0, ids: vec![0] }],
+            2,
+            4,
+        );
+        assert_eq!(g.neighbors(1, 0), &[0], "own list published");
+        assert_eq!(g.neighbors(0, 0), &[1], "backlink appended (room was left)");
+    }
+
+    #[test]
+    fn saturated_backlink_keeps_capacity_and_evicts_by_distance() {
+        // node 0's list is full with node 1 (close) and node 2 (far); the newcomer
+        // at 0.5 is closer than both, so one of them must go.
+        let (mut g, codec) = graph_with(
+            &[[0.0, 0.0], [1.0, 0.0], [5.0, 0.0], [0.5, 0.0]],
+            2,
+            &[&[1, 2], &[], &[], &[]],
+        );
+        assert!(g.promote_entry(0));
+        let mut buf = FlatPairBuf::new(2);
+        apply_flat(
+            &codec,
+            distance_l2,
+            &mut g,
+            &mut buf,
+            3,
+            0,
+            vec![LayerPlanFlat { layer: 0, ids: vec![0] }],
+            1,
+            2,
+        );
+        let list = g.neighbors(0, 0);
+        assert_eq!(list.len(), 2, "capacity is kept (no backfill by the newcomer)");
+        assert!(list.contains(&3), "the closer newcomer was admitted");
+        assert!(!list.contains(&2), "the farthest member lost its slot");
+        assert!(list.contains(&1));
+    }
+
+    #[test]
+    fn occluded_newcomer_does_not_join_a_saturated_list() {
+        // node 3 sits between node 1 and node 2, both closer to the target than
+        // node 3 and mutually occluding, so node 3 is occluded from every
+        // accepted entry and the list keeps its membership.
+        let (mut g, codec) = graph_with(
+            &[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [1.2, 0.0]],
+            2,
+            &[&[1, 2], &[], &[], &[]],
+        );
+        assert!(g.promote_entry(0));
+        let mut buf = FlatPairBuf::new(2);
+        apply_flat(
+            &codec,
+            distance_l2,
+            &mut g,
+            &mut buf,
+            3,
+            0,
+            vec![LayerPlanFlat { layer: 0, ids: vec![0] }],
+            1,
+            2,
+        );
+        assert_eq!(g.neighbors(0, 0), &[1, 2], "membership unchanged");
+    }
+
+    #[test]
+    fn apply_is_deterministic_for_the_same_inputs() {
+        let build = || -> (FlatGraph, Codec) {
+            let (mut g, codec) = graph_with(
+                &[[0.0, 0.0], [1.0, 0.0], [5.0, 0.0], [0.5, 0.0], [2.5, 0.3]],
+                2,
+                &[&[1, 2], &[], &[], &[], &[]],
+            );
+            assert!(g.promote_entry(0));
+            let mut buf = FlatPairBuf::new(2);
+            for (new_id, target) in [(3u32, 0u32), (4, 0), (4, 1)] {
+                apply_flat(
+                    &codec,
+                    distance_l2,
+                    &mut g,
+                    &mut buf,
+                    new_id,
+                    0,
+                    vec![LayerPlanFlat { layer: 0, ids: vec![target] }],
+                    1,
+                    2,
+                );
+            }
+            (g, codec)
+        };
+        let (a, _) = build();
+        let (b, _) = build();
+        assert_eq!(all_lists(&a), all_lists(&b), "same inputs, same graph");
+        for i in 0..a.len() as u32 {
+            let list = a.neighbors(i, 0);
+            assert!(list.len() <= 2, "no list exceeds capacity");
+            assert!(!list.contains(&i), "no self-link");
+            let mut sorted = list.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), list.len(), "no duplicate neighbour");
+        }
     }
 }
