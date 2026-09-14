@@ -1053,6 +1053,33 @@ fault.  Neither has been demonstrated, and the parallel build -- which locks wit
 arena's LWLocks across *processes* -- is where it will matter, so the worker sweep is the
 place to settle it.
 
+### 3j.11 Corrected: a parallel level assignment must key on the row, not the ordinal
+
+Building the driver's scan exposed a flaw in the previous round's design.  An
+ordinal-indexed `LevelTable` is enough for a single-builder build, but **not** for
+`table_index_build_scan`: which worker sees which row, and in which order, depends on
+scheduling, so "the i-th row processed" is no more stable than "the i-th random draw" --
+the table would merely move the nondeterminism from the RNG to the scan.  The level
+assignment has to key on something intrinsic to the row.
+
+`levels::level_for_tid(seed, ml, max_level, tid)` is that: a pure function of the pinned
+seed and the row's heap TID, so the same row yields the same level whichever worker gets
+it, and the whole assignment becomes a function of the table's contents.  That is what the
+fingerprint gate -- and the acceptance test that `workers = 0` is bit-identical -- will
+need from a parallel build.
+
+Two details the tests pin down, both about *not* being naive:
+
+* the seed is mixed with an FNV-1a hash of the TID (plus one avalanche round) rather than
+  offset by it.  Sequential TIDs are adjacent numbers; feeding those to a generator
+  correlates neighbouring rows, which shows up as long constant runs or levels drifting
+  together.  The test asserts the geometric shape survives *and* that the longest constant
+  run stays short.
+* processing order cannot change a level: the same rows in reverse order produce the
+  identical assignment.  The ordinal table is kept for the single-builder path and for
+  tests that want to assert a level directly, and both derive from the same
+  `random_level`, so they agree whenever the order is the same.
+
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
 documented concurrent-write view, since sibling workers write sibling bytes without a

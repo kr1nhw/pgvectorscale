@@ -8,8 +8,15 @@
 //! in the leader, where the seed is pinned: the levels become a function of the row
 //! count alone, and the fingerprint gate keeps working for a parallel build.
 //!
-//! Storing the table also makes the level of an id something a test can assert
-//! directly, instead of re-deriving it by replaying the RNG.
+//! **An ordinal-indexed table is not enough for a parallel scan**, and that is worth
+//! stating because it is the obvious first design: with `table_index_build_scan`, which
+//! worker sees which row -- and in which order -- depends on scheduling, so "the i-th
+//! row processed" is no more stable than "the i-th random draw".  What *is* stable is the
+//! row itself, so the parallel path derives a level from the row's heap TID
+//! ([`level_for_tid`]), which is a pure function of `(seed, tid)` and therefore
+//! independent of who processes it.  The ordinal table remains useful for a
+//! single-builder build (and for tests that want to assert a level directly), and both
+//! use the same `random_level`, so the two agree when the order is the same.
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -73,6 +80,43 @@ impl LevelTable {
     }
 }
 
+/// A row's level, derived from its heap TID rather than from when it was processed.
+///
+/// This is what makes a **parallel** build deterministic: `table_index_build_scan` hands
+/// rows to workers in an order that depends on scheduling, so neither a shared counter
+/// nor an RNG stream is stable.  The heap TID is: the same row yields the same level no
+/// matter which worker gets it, and the whole level assignment becomes a function of the
+/// table's contents and the pinned seed.  That is what lets the fingerprint gate -- and
+/// with it the acceptance test that `workers = 0` is bit-identical -- apply to a parallel
+/// build at all.
+///
+/// Distinct TIDs must give independent draws, so the seed is mixed with a hash of the TID
+/// rather than merely offset by it: sequential TIDs are adjacent numbers, and feeding
+/// those straight into a generator would correlate the levels of neighbouring rows.
+pub fn level_for_tid(seed: u64, ml: f32, max_level: u8, tid: (u32, u16)) -> u8 {
+    let mut rng = SmallRng::seed_from_u64(seed ^ fnv1a(tid));
+    random_level(ml, max_level, &mut rng)
+}
+
+/// FNV-1a over the TID's block and offset, mixed so that neighbouring TIDs land far
+/// apart in the generator's seed space.
+fn fnv1a((block, offset): (u32, u16)) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in block
+        .to_le_bytes()
+        .into_iter()
+        .chain(offset.to_le_bytes())
+    {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    // One avalanche round, so small TID differences do not leave small seed differences.
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +160,66 @@ mod tests {
         assert_eq!(t.level(0), t.levels[0]);
         assert_eq!(t.level(9), t.levels[9]);
         assert_eq!(t.level(10), 0, "an id nobody drew is level 0, not a panic");
+    }
+
+    #[test]
+    fn a_rows_level_does_not_depend_on_when_it_is_processed() {
+        // The property the parallel build rests on.  Two "workers" processing the same
+        // rows in different orders must assign the same level to each row -- which an
+        // ordinal-indexed table or a shared RNG stream cannot promise.
+        let (ml, max_level, seed) = (1.0 / 8f32.ln(), 7u8, 20240912u64);
+        let rows: Vec<(u32, u16)> = (1..=200u32).map(|i| (i / 8 + 1, (i % 8 + 1) as u16)).collect();
+
+        let in_order: Vec<u8> = rows
+            .iter()
+            .map(|&tid| level_for_tid(seed, ml, max_level, tid))
+            .collect();
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        let mut out_of_order: Vec<u8> = vec![0; rows.len()];
+        for &tid in &reversed {
+            let i = rows.iter().position(|&r| r == tid).unwrap();
+            out_of_order[i] = level_for_tid(seed, ml, max_level, tid);
+        }
+        assert_eq!(in_order, out_of_order, "processing order cannot change a level");
+
+        // A different seed is a different assignment (the seed is actually used).
+        let other: Vec<u8> = rows
+            .iter()
+            .map(|&tid| level_for_tid(seed + 1, ml, max_level, tid))
+            .collect();
+        assert_ne!(in_order, other);
+    }
+
+    #[test]
+    fn neighbouring_rows_do_not_get_correlated_levels() {
+        // Sequential TIDs must not produce a visibly patterned assignment: without the
+        // hash, adjacent seeds come from the same generator region and the levels drift
+        // together (all-zero runs, or long stretches at the cap).
+        let (ml, max_level) = (1.0 / 8f32.ln(), 7u8);
+        let levels: Vec<u8> = (1..=400u32)
+            .map(|i| level_for_tid(7, ml, max_level, (1, i as u16)))
+            .collect();
+        let zero = levels.iter().filter(|&&l| l == 0).count();
+        assert!(
+            zero > levels.len() * 3 / 4,
+            "the geometric shape must survive the hash: {} of {} are level 0",
+            zero,
+            levels.len()
+        );
+        assert!(levels.iter().any(|&l| l > 0), "some rows are above level 0");
+        // No long constant runs, which is what correlated seeds would show.
+        let longest = levels
+            .windows(2)
+            .fold((1usize, 1usize), |(best, run), w| {
+                if w[0] == w[1] {
+                    (best.max(run + 1), run + 1)
+                } else {
+                    (best, 1)
+                }
+            })
+            .0;
+        assert!(longest < 60, "longest constant run was {}", longest);
     }
 
     #[test]
