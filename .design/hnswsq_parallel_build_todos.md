@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 4d: shared cursors (`ArenaState`) | done | packed claim CAS, contiguous watermark, entry + rendezvous; 4 tests |
 | M3 step 4c: arena in a `shm_toc` segment | done | `SharedArena::allocate`/`attach` by key; `pg_test` round-trips a real dsm segment |
 | M3 step 4b: node locks as LWLocks | done | `NodeLocks` over `RwLock`s *or* a tranche we register at runtime; 2 `pg_test`s |
 | M3 step 4a: chunk over shared memory | done | `Chunk` owns a `Vec<u64>` *or* borrows a segment (`attach`); relocation asserted by test (§3j) |
@@ -848,6 +849,38 @@ the leader's.
 * `SharedArena::segment_bytes` gives the leader its payload estimate for
   `shm_toc_estimate_chunk`; it deliberately excludes the toc's own key/alignment
   overhead, which `shm_toc_estimate_keys` accounts for separately in the driver.
+
+### 3j.4 Shared cursors (`ArenaState`)
+
+The cursors a parallel build shares now live in their own toc region, separate from
+`ArenaHeader`: the header is written once by the leader and read by everyone, while
+these are touched by every worker for every node.  Fields: the claim cursor, the
+watermark, the entry point, the rendezvous counters, and a failure flag.
+
+Three decisions the tests pin down:
+
+* **One packed cursor, not two counters.**  `cursor` holds `(nodes << 32) | slabs` and
+  moves in a single CAS, so a claim can never reserve a node without its slabs (or
+  the reverse).  Two separate `fetch_add`s would leak one budget on every collision,
+  and `plan_capacity` sizes the segment tightly enough that a leak matters.  Refusal
+  is also side-effect free: the budgets are checked before the CAS, so an exhausted
+  arena is not slowly walked past.
+* **The watermark advances only over a contiguous prefix from zero.**  A worker that
+  finishes out of order cannot expose a node whose vector is half-written.  The unit
+  test sets flags 2,3,4 and asserts the watermark stays 0 -- i.e. contiguity is from
+  zero, not from the lowest published id -- then fills the gaps and watches it jump.
+* **Workers never initialize shared state.**  `attach` deliberately does not
+  re-initialize the cursors or the locks; the leader does both once, in `allocate`.
+  A worker that reset the claim cursor would hand out duplicate ids.
+
+The failure flag exists because a worker cannot longjmp into the leader: it sets
+`failed`, exits cleanly, and the leader re-raises the error itself.  That is the
+hook the driver's error path needs.
+
+Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
+its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
+documented concurrent-write view, since sibling workers write sibling bytes without a
+`&mut` borrow to share).
 
 Asserted by `a_shared_arena_round_trips_through_a_segment`: a real `dsm_create` +
 `shm_toc_create` segment, an arena allocated by key, then a second `attach` that sees

@@ -16,6 +16,7 @@
 
 use std::cell::Cell;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 thread_local! {
@@ -265,6 +266,177 @@ pub const HNSWSQ_TOC_MAGIC: u64 = 0x686e_7377_7371_0001; // "hnswsq" + 1
 pub const TOC_KEY_HEADER: u64 = 0x686e_7377_7371_0002;
 pub const TOC_KEY_CHUNK: u64 = 0x686e_7377_7371_0003;
 pub const TOC_KEY_LOCKS: u64 = 0x686e_7377_7371_0004;
+pub const TOC_KEY_STATE: u64 = 0x686e_7377_7371_0005;
+
+/// The cursors a parallel build shares, kept apart from [`ArenaHeader`] because they
+/// are *mutated*: the header is written once by the leader and read by everyone, while
+/// these are touched by every worker for every node.
+///
+/// Atomics rather than a lock around a cursor: the whole build would then serialize on
+/// one cache line.  Package-internal atomics on genuinely shared memory are what make
+/// the claim/publish protocol work across *processes*, not just threads.
+#[repr(C)]
+pub struct ArenaState {
+    /// Packed `(nodes claimed) << 32 | (slabs claimed)`, moved in one CAS so a claim
+    /// can never reserve a node without its slabs or vice versa -- which a pair of
+    /// separate counters would allow, leaking one budget on every collision.
+    cursor: AtomicU64,
+    /// Every id below this is published.  Advanced only over a *contiguous* run of
+    /// published flags, so a worker that finishes out of order cannot expose a node
+    /// whose data is still being written.
+    watermark: AtomicU64,
+    /// Entry point of the graph, or [`NO_ENTRY`] while the graph is empty.
+    entry: AtomicU32,
+    entry_level: AtomicU32,
+    /// Nodes that exist when the workers start -- the rendezvous point: a search may
+    /// only use ids below the watermark, and the watermark only reaches `start_nodes`
+    /// once the leader has stopped inserting.
+    start_nodes: AtomicU64,
+    /// Workers still running; the leader waits for this to reach zero.
+    active_workers: AtomicU32,
+    /// Set by any participant that has to abort; the leader re-raises it, because
+    /// PostgreSQL will not let a worker change the leader's control flow.
+    failed: AtomicU32,
+}
+
+/// `entry` when the graph has no entry point yet.
+pub const NO_ENTRY: u32 = u32::MAX;
+
+impl Default for ArenaState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArenaState {
+    pub const fn new() -> Self {
+        Self {
+            cursor: AtomicU64::new(0),
+            watermark: AtomicU64::new(0),
+            entry: AtomicU32::new(NO_ENTRY),
+            entry_level: AtomicU32::new(0),
+            start_nodes: AtomicU64::new(0),
+            active_workers: AtomicU32::new(0),
+            failed: AtomicU32::new(0),
+        }
+    }
+
+    /// Claim a node id and the `layers` slabs it needs, in one atomic step, or `None`
+    /// when either budget is exhausted.  Any worker may call this at any time.
+    #[inline]
+    pub fn claim(&self, layers: usize, max_nodes: usize, max_slabs: usize) -> Option<(u32, u32)> {
+        let layers = layers as u64;
+        let mut cur = self.cursor.load(Ordering::Acquire);
+        loop {
+            let (nodes, slabs) = (cur >> 32, cur & 0xffff_ffff);
+            // The budgets are per-arena and fixed, so a failed claim is final for
+            // everyone: the driver spills to disk rather than waiting for room.
+            if nodes + 1 > max_nodes as u64 || slabs + layers > max_slabs as u64 {
+                return None;
+            }
+            let next = ((nodes + 1) << 32) | (slabs + layers);
+            match self.cursor.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some((nodes as u32, slabs as u32)),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// `(nodes claimed, slabs claimed)` -- for stats and the exhaustion check.
+    #[inline]
+    pub fn claimed(&self) -> (usize, usize) {
+        let cur = self.cursor.load(Ordering::Acquire);
+        ((cur >> 32) as usize, (cur & 0xffff_ffff) as usize)
+    }
+
+    /// Advance the watermark over the contiguous published prefix, given a way to read
+    /// a node's published flag (in the arena, a byte of the chunk's `published`
+    /// region).  Call after setting your own node's flag.
+    ///
+    /// Returns the new watermark.  Concurrent callers are safe: the loop is monotone
+    /// and every participant re-reads the flags, so whoever finds the gap open moves
+    /// it, and a lost update only means someone else already moved it further.
+    #[inline]
+    pub fn advance_watermark(&self, published: impl Fn(usize) -> bool, limit: usize) -> usize {
+        let mut w = self.watermark.load(Ordering::Acquire) as usize;
+        while w < limit && published(w) {
+            w += 1;
+        }
+        // A plain store is enough: `w` only grows, and any larger value another
+        // worker stored first is at least as good as ours.
+        if w > self.watermark.load(Ordering::Acquire) as usize {
+            self.watermark.store(w as u64, Ordering::Release);
+        }
+        w
+    }
+
+    #[inline]
+    pub fn watermark(&self) -> usize {
+        self.watermark.load(Ordering::Acquire) as usize
+    }
+
+    /// The graph's entry point, or [`NO_ENTRY`].
+    #[inline]
+    pub fn entry(&self) -> u32 {
+        self.entry.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn entry_level(&self) -> usize {
+        self.entry_level.load(Ordering::Acquire) as usize
+    }
+
+    /// Set the entry point.  The leader does this under its own serialization, so a
+    /// plain store is enough; the level must be published with it, hence the order.
+    #[inline]
+    pub fn set_entry(&self, id: u32, level: usize) {
+        self.entry_level.store(level as u32, Ordering::Release);
+        self.entry.store(id, Ordering::Release);
+    }
+
+    /// Rendezvous: record how many nodes exist when the workers start scanning.
+    #[inline]
+    pub fn set_start_nodes(&self, nodes: usize) {
+        self.start_nodes.store(nodes as u64, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn start_nodes(&self) -> usize {
+        self.start_nodes.load(Ordering::Acquire) as usize
+    }
+
+    #[inline]
+    pub fn worker_started(&self) {
+        self.active_workers.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[inline]
+    pub fn worker_finished(&self) {
+        self.active_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    #[inline]
+    pub fn active_workers(&self) -> u32 {
+        self.active_workers.load(Ordering::Acquire)
+    }
+
+    /// Record a failure.  Workers cannot longjmp into the leader, so they set this and
+    /// exit cleanly; the leader checks it and raises the error itself.
+    #[inline]
+    pub fn set_failed(&self) {
+        self.failed.store(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire) != 0
+    }
+}
 
 /// Everything a participant needs to find and size the arena: the region map, the
 /// capacities, and the tranche the node locks were initialized with.
@@ -292,6 +464,7 @@ pub struct ArenaHeader {
 /// leader re-reading its own segment) attaches them by key.
 pub struct SharedArena {
     header: *mut ArenaHeader,
+    state: *mut ArenaState,
     chunk: Chunk,
     locks: NodeLocks,
 }
@@ -308,6 +481,7 @@ impl SharedArena {
     pub fn segment_bytes(stride: usize, cap: usize, nodes: usize, slabs: usize) -> usize {
         let layout = arena_layout(stride, cap, nodes, slabs);
         std::mem::size_of::<ArenaHeader>()
+            + std::mem::size_of::<ArenaState>()
             + layout.total_bytes
             // Packed, not `LWLockPadded`: correctness first, and the padded variant is
             // a false-sharing question the worker sweep can answer with data.
@@ -336,6 +510,9 @@ impl SharedArena {
             std::mem::size_of::<ArenaHeader>(),
         )
         .cast::<ArenaHeader>();
+        let state =
+            pgrx::pg_sys::shm_toc_allocate(toc, std::mem::size_of::<ArenaState>())
+                .cast::<ArenaState>();
         let words = pgrx::pg_sys::shm_toc_allocate(toc, layout.total_bytes).cast::<u64>();
         let lock_mem = pgrx::pg_sys::shm_toc_allocate(
             toc,
@@ -352,12 +529,17 @@ impl SharedArena {
             tranche,
             reserved: 0,
         });
+        // The cursors start empty here, not in the caller: a worker must never
+        // re-initialize state a peer may already be mutating.
+        state.write(ArenaState::new());
         pgrx::pg_sys::shm_toc_insert(toc, TOC_KEY_HEADER, header.cast());
+        pgrx::pg_sys::shm_toc_insert(toc, TOC_KEY_STATE, state.cast());
         pgrx::pg_sys::shm_toc_insert(toc, TOC_KEY_CHUNK, words.cast());
         pgrx::pg_sys::shm_toc_insert(toc, TOC_KEY_LOCKS, lock_mem.cast());
 
         Self {
             header,
+            state,
             chunk: Chunk::attach(words, layout),
             locks: init_shared_locks(lock_mem, nodes, tranche),
         }
@@ -374,14 +556,17 @@ impl SharedArena {
             pgrx::pg_sys::shm_toc_lookup(toc, TOC_KEY_HEADER, false).cast::<ArenaHeader>();
         let max_nodes = (*header).max_nodes;
         let layout = (*header).layout;
+        let state =
+            pgrx::pg_sys::shm_toc_lookup(toc, TOC_KEY_STATE, false).cast::<ArenaState>();
         let words = pgrx::pg_sys::shm_toc_lookup(toc, TOC_KEY_CHUNK, false).cast::<u64>();
         let lock_mem =
             pgrx::pg_sys::shm_toc_lookup(toc, TOC_KEY_LOCKS, false).cast::<pgrx::pg_sys::LWLock>();
         Self {
             header,
+            state,
             chunk: Chunk::attach(words, layout),
-            // No init: the leader already did it, and re-initializing would reset
-            // locks a peer may be holding.
+            // No init for either: the leader already did it, and re-initializing
+            // would reset locks or cursors a peer may be holding or mutating.
             locks: shared_locks_in_segment(lock_mem, max_nodes),
         }
     }
@@ -390,6 +575,12 @@ impl SharedArena {
     pub fn header(&self) -> ArenaHeader {
         // SAFETY: `header` points into the mapped segment for this handle's lifetime.
         unsafe { *self.header }
+    }
+
+    /// The shared cursors (claim/watermark/entry/rendezvous).
+    pub fn state(&self) -> &ArenaState {
+        // SAFETY: `state` points into the mapped segment for this handle's lifetime.
+        unsafe { &*self.state }
     }
 
     pub fn chunk(&self) -> &Chunk {
@@ -974,6 +1165,15 @@ mod tests {
         assert!(view.locks().is_shared());
         assert_eq!(view.locks().len(), nodes);
 
+        // The cursors are shared too, and `attach` must not have reset them.
+        assert_eq!(view.state().claimed(), (0, 0), "a fresh arena claims nothing");
+        assert_eq!(leader.state().claim(1, nodes, slabs), Some((0, 0)));
+        assert_eq!(view.state().claimed(), (1, 1), "the worker sees the claim");
+        assert_eq!(view.state().claim(1, nodes, slabs), Some((1, 1)));
+        assert_eq!(leader.state().claimed(), (2, 2));
+        leader.state().set_entry(1, 0);
+        assert_eq!(view.state().entry(), 1, "and the entry point");
+
         // Both handles share one lock array, so re-acquiring after a guard drops
         // would hang rather than fail if a release were missing.
         {
@@ -1001,6 +1201,87 @@ mod tests {
         // SAFETY: as above.
         let mut arena = unsafe { init_shared_locks(base, 1, tranche) };
         arena.grow_to(2);
+    }
+
+    #[test]
+    fn claim_moves_node_and_slab_cursors_together() {
+        let st = ArenaState::new();
+        // A level-2 node takes three slabs; the packed cursor makes that one step, so
+        // a claim can never reserve a node without its slabs.
+        assert_eq!(st.claim(3, 10, 30), Some((0, 0)));
+        assert_eq!(st.claim(1, 10, 30), Some((1, 3)));
+        assert_eq!(st.claimed(), (2, 4));
+        assert_eq!((st.watermark(), st.entry()), (0, NO_ENTRY));
+
+        // Budgets are checked before anything moves: a refused claim changes nothing.
+        assert_eq!(st.claim(1, 2, 30), None, "node budget exhausted");
+        assert_eq!(st.claim(1, 10, 4), None, "slab budget exhausted");
+        assert_eq!(st.claimed(), (2, 4));
+    }
+
+    #[test]
+    fn parallel_claims_are_unique_and_contiguous() {
+        // Several threads on one state is the closest a unit test gets to workers in
+        // different processes: the CAS protocol is the same one.
+        use std::sync::Arc;
+        let st = Arc::new(ArenaState::new());
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let st = Arc::clone(&st);
+            handles.push(std::thread::spawn(move || {
+                let mut ids = Vec::new();
+                while let Some((id, _slab)) = st.claim(1, 1000, 1000) {
+                    ids.push(id);
+                }
+                ids
+            }));
+        }
+        let mut all: Vec<u32> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let total = all.len();
+        assert_eq!(total, 1000, "every id in the budget was handed out exactly once");
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 1000, "no id was handed out twice");
+        assert_eq!(st.claimed(), (1000, 1000));
+    }
+
+    #[test]
+    fn the_watermark_stops_at_the_first_gap() {
+        let st = ArenaState::new();
+        let mut flags = [false; 5];
+        // Out-of-order publication must not expose an unpublished node: id 1 is still
+        // missing, so a published 2,3,4 leaves the watermark at 0.
+        flags[2] = true;
+        flags[3] = true;
+        flags[4] = true;
+        assert_eq!(st.advance_watermark(|i| flags[i], 5), 0);
+        // Publishing the gap at 1 opens 0..4 -- but 0 is still unpublished, so it
+        // stops there: contiguity is from zero, not from the lowest published above.
+        flags[1] = true;
+        assert_eq!(st.advance_watermark(|i| flags[i], 5), 0);
+        flags[0] = true;
+        assert_eq!(st.advance_watermark(|i| flags[i], 5), 5);
+        assert_eq!(st.watermark(), 5);
+        // The limit bounds the scan even if every flag below it is set.
+        assert_eq!(st.advance_watermark(|_| true, 5), 5);
+    }
+
+    #[test]
+    fn entry_and_rendezvous_state_round_trip() {
+        let st = ArenaState::new();
+        assert_eq!(st.entry(), NO_ENTRY, "an empty graph has no entry");
+        st.set_entry(7, 2);
+        assert_eq!((st.entry(), st.entry_level()), (7, 2));
+
+        st.set_start_nodes(1234);
+        assert_eq!(st.start_nodes(), 1234);
+        st.worker_started();
+        st.worker_started();
+        st.worker_finished();
+        assert_eq!(st.active_workers(), 1, "the leader waits for zero");
+        assert!(!st.failed());
+        st.set_failed();
+        assert!(st.failed(), "a worker's failure is visible to the leader");
     }
 
     #[test]
