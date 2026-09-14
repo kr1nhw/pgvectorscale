@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M4 step: per-worker reporting | **done** | 4 workers: rows sum to 100000, nodes==rows, load spread 0.6% |
 | **M5 step: fall back instead of refusing** | **done** | small memory now warns and builds on the spilling path |
 | **M4 step: worker-failure path** | **done** | leader refuses to write out; index untouched; verified both ways |
 | **M3 step 5x: 1M re-run without the seed** | **done** | identical to the seeded run; mixed vs single-builder, equal by ef 80 |
@@ -1986,6 +1987,30 @@ because the parallel path refuses rather than spills when memory is short -- whi
 fallback above, now covering the common case -- but the help text should be updated to match, and
 "auto" (a sensible N from the machine's CPU count) is a reasonable follow-up once the path has more
 mileage.
+
+### 3j.39 Per-worker reporting, and the remote hosts are down
+
+**Per-worker reporting** (under `hnswsq.build_stats`) fills a gap the leader's aggregate summary
+cannot: the phase split belongs to the worker that did the work, and it is what says whether the
+workers are balanced.  On `t100k` with 4 workers:
+
+```
+pid=57467 rows=24975 nodes=24975 search_ms=1133 backlink_ms=425
+pid=57464 rows=25150 nodes=25150 search_ms=1134 backlink_ms=427
+pid=57466 rows=25050 nodes=25050 search_ms=1136 backlink_ms=426
+pid=57465 rows=24825 nodes=24825 search_ms=1126 backlink_ms=436
+```
+
+The counts sum to exactly 100000 with `nodes == rows` in every worker, a spread of 0.6%, and phase
+splits agreeing to a few milliseconds.  That is three separate claims checked at once: the shared
+scan divides the heap evenly, every row a worker reads becomes a node (no silent skips), and the
+work is not skewed by the block-range hand-out.
+
+**The BIGANN sweep remains blocked on infrastructure.**  All four EC2 hosts in the ssh config
+(`ec2-54-89-21-232`, `ec2-100-27-185-17`, `ec2-18-234-126-161`, `ec2-3-80-43-192`) time out on port
+22 this round, so the 128-dimensional comparison -- the one dataset that would discriminate the two
+graphs properly -- cannot be run.  Nothing in the code is waiting on it; the acceptance numbers that
+exist are all local, and the 1M comparison has been done on the local synthetic table.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
