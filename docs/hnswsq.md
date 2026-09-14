@@ -153,12 +153,14 @@ out of the box (standard callbacks, no reloption tuning required).
 - Single `vector` column only (no label filtering, no multi-column indexes).
 - No `amgetbitmap`; no iterative scan for WHERE-filtered queries (a pgvector
   0.8 feature) — `ef_search` bounds the candidate set.
-- Builds are single-backend: the in-memory phase is sequential.
-  `hnswsq.build_workers` exists but currently has no effect — the batched
-  plan/apply parallel design was implemented, measured and rejected (it costs
-  connectivity, hence recall), and the working design needs search-time
-  visibility of in-flight inserts; see `.design/hnswsq_perf_analysis.md`
-  ("Parallel build — attempted, measured, rejected").
+- Builds are single-backend by default.  `hnswsq.build_workers = N` runs the
+  in-memory build on N worker processes instead (see §11); the older batched
+  plan/apply parallel design remains rejected — it cost connectivity and recall
+  because a searching node must see in-flight inserts.
+- The parallel path has no mid-build spill, so it needs
+  `maintenance_work_mem` to hold the whole graph: too little and the build
+  either falls back to the single-builder path (when the row count is known) or
+  fails with a message saying so.  The single-builder path spills instead.
 - `ieeefp8`'s accuracy assumes in-range data (±448); out-of-range components
   clamp (cosine-normalized data is unaffected).
 - As with any approximate index, crash windows are transactional: a crash
@@ -253,9 +255,71 @@ For calibration: the same 100k build took 36.3 s before the decode-once buffer
 and 439 s in a debug build.  **Always benchmark a release build**: `cargo pgrx
 test` installs a debug build of the extension over the release one, which makes
 every build roughly 25x slower (`local_cycle.sh`/`cycle.sh` now refuse to run
-against a debug `.so`).  Builds are single-backend (the in-memory phase is
-sequential, and `hnswsq.build_workers` is reserved but unused); the remaining
-cost is graph traversal (`search`) plus the entries that cannot take the O(1)
-backlink fast path, which is what a parallel build would attack next.
+against a debug `.so`).  The remaining single-builder cost is graph traversal
+(`search`) plus the entries that cannot take the O(1) backlink fast path — which
+is what the parallel build (§11) attacks.
 `.design/neon/bench/RESULTS-HNSWSQ.md` has the cross-engine comparisons
 (recall parity within ±1%, index size parity within +4%).
+
+## 11. Parallel builds
+
+`hnswsq.build_workers = N` (N > 0) builds the in-memory graph on N worker
+processes.  Workers scan disjoint block ranges of the heap into one shared
+arena; each insert searches the shared graph and takes the target node's lock to
+add a backlink, so a searching node sees in-flight inserts.  The leader seeds
+nothing, writes the graph out with the same writer the single-builder path uses,
+and promotes the entry point after the workers stop.
+
+```sql
+SET maintenance_work_mem = '2GB';   -- must hold the whole graph: no mid-build spill
+SET hnswsq.build_workers = 4;
+CREATE INDEX ON items USING hnswsq (embedding vector_l2_ops)
+    WITH (storage_layout = 'plain', m = 16, ef_construction = 64);
+```
+
+Measured on 1M rows, dim 16, `m=16`, `ef_construction=64`, fresh index for every
+point, on a 12-core machine (release build):
+
+| workers requested | launched | wall | vs 1 worker |
+|---|---|---|---|
+| 1 | 1 | 109.5 s | 1.00x |
+| 2 | 2 | 53.8 s | 2.03x |
+| 4 | 4 | 27.4-35.3 s | 3.1-4.0x |
+| 8 | 7 | 23.4 s | 4.68x |
+
+Scaling flattens after about four workers: the insert path has a serial component
+(the claim cursor, the published watermark, and the node locks) and these builds
+are short enough that start-up and the writeout are a visible fraction.  Note
+that "workers requested" is not "workers launched" — PostgreSQL's worker pool has
+other consumers (`max_worker_processes`), so read the timing with the count the
+build reports.
+
+Recall is not affected by the worker count.  Against the single-builder build on
+the same data and ground truth (200 queries, recall@10):
+
+| `ef_search` | 1 worker | 4 workers | 7 workers |
+|---|---|---|---|
+| 10 | 0.400 | 0.600 | 0.600 |
+| 20 | 0.400 | 0.800 | 0.800 |
+| 40 | 1.000 | 0.800 | 0.800 |
+| 80 | 1.000 | 1.000 | 1.000 |
+| 160 | 1.000 | 1.000 | 1.000 |
+
+The graphs differ — concurrent insertion places edges differently, and neither is
+uniformly better — but recall does not degrade as workers are added.  What *does*
+grow with the worker count is the number of nodes with no incoming edge (0 at 1
+worker, 353 at 2, 1572 at 4, 3344 at 7, i.e. 0.33% at 7): that is a race-based
+effect and worth watching, but it has not shown up in recall.
+
+Constraints worth knowing:
+
+- Not used for `CREATE INDEX CONCURRENTLY`: live inserters would race the bulk
+  writeout, exactly as they do on the single-builder path, so concurrent builds
+  stay on the disk path.
+- No mid-build spill (see §7): size `maintenance_work_mem` for the whole graph,
+  or let the build fall back.
+- A worker that fails, or an arena that fills, fails the build rather than
+  writing a partial graph.
+- `workers = 0` (the default) is the single-builder path and is unaffected by any
+  of this; it produces a bit-identical graph to builds from before the parallel
+  work.
