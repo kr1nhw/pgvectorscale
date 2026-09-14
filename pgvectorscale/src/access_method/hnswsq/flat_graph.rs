@@ -377,6 +377,102 @@ pub fn plan_capacity(
     }
 }
 
+/// Structural checks on a build graph.  This is the gate the parallel plan applies
+/// at every worker count: a concurrent insert may not leave a node unreachable or a
+/// list malformed, and the connectivity number is exactly what exposed the rejected
+/// batched design (up to 45% of nodes with no incoming edge, recall 0.955 -> 0.58).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListChecks {
+    /// Nodes claimed (including any still unpublished).
+    pub nodes: usize,
+    /// Nodes readable by a search (the watermark).
+    pub published: usize,
+    pub max_list_len: usize,
+    pub self_links: usize,
+    pub duplicate_links: usize,
+    /// Published nodes that no list points at: invisible to every search.
+    pub nodes_without_incoming: usize,
+    /// Published nodes reachable from the entry point over layer-0 lists.
+    pub reachable_from_entry: usize,
+}
+
+impl ListChecks {
+    /// `cap` is the slab capacity the graph was built with.
+    pub fn is_healthy(&self, cap: usize) -> bool {
+        self.self_links == 0
+            && self.duplicate_links == 0
+            && self.max_list_len <= cap
+            && self.nodes_without_incoming == 0
+            && self.reachable_from_entry == self.published
+    }
+
+    /// One-line summary for a test failure message.
+    pub fn summary(&self, cap: usize) -> String {
+        format!(
+            "nodes={} published={} max_list_len={}/{} self_links={} duplicates={} \
+             no_incoming={} reachable={} healthy={}",
+            self.nodes,
+            self.published,
+            self.max_list_len,
+            cap,
+            self.self_links,
+            self.duplicate_links,
+            self.nodes_without_incoming,
+            self.reachable_from_entry,
+            self.is_healthy(cap),
+        )
+    }
+}
+
+/// Walk every layer-0 list of every published node and report the structural checks.
+pub fn check_lists(g: &FlatGraph, cap: usize) -> ListChecks {
+    let published = g.watermark();
+    let mut incoming = vec![0usize; published];
+    let mut checks = ListChecks {
+        nodes: g.len(),
+        published,
+        ..Default::default()
+    };
+
+    for node in 0..published as u32 {
+        let list = g.neighbors(node, 0);
+        checks.max_list_len = checks.max_list_len.max(list.len());
+        for (i, &nb) in list.iter().enumerate() {
+            if nb == node {
+                checks.self_links += 1;
+            }
+            if list[..i].contains(&nb) {
+                checks.duplicate_links += 1;
+            }
+            if (nb as usize) < published {
+                incoming[nb as usize] += 1;
+            }
+        }
+    }
+    checks.nodes_without_incoming = incoming.iter().filter(|&&c| c == 0).count();
+
+    // Reachability over layer-0 lists from the entry point (a BFS, bounded by the
+    // published prefix so a claimed-but-unwritten node can never be walked into).
+    if let Some(entry) = g.entry().filter(|&e| (e as usize) < published) {
+        let mut seen = vec![false; published];
+        let mut stack = vec![entry];
+        seen[entry as usize] = true;
+        let mut reached = 1usize;
+        while let Some(node) = stack.pop() {
+            for &nb in g.neighbors(node, 0) {
+                let ni = nb as usize;
+                if ni < published && !seen[ni] {
+                    seen[ni] = true;
+                    reached += 1;
+                    stack.push(nb);
+                }
+            }
+        }
+        checks.reachable_from_entry = reached;
+    }
+    checks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +589,61 @@ mod tests {
         }
         assert!(g.is_full());
         assert!(!g.try_push_node(0, tid(1), false, &[0u8; 8]));
+    }
+
+    #[test]
+    fn checks_accept_a_well_formed_graph() {
+        // Mutual links: every node has an incoming edge and the entry reaches all.
+        let mut g = FlatGraph::new(4, 4);
+        for (i, p) in [[0.0f32, 0.0], [1.0, 0.0], [2.0, 0.0]].iter().enumerate() {
+            g.push_node(0, tid(i as u32 + 1), false, &[0u8; 4]);
+            let _ = p;
+        }
+        g.set_list(0, 0, &[1]);
+        g.set_list(1, 0, &[0, 2]);
+        g.set_list(2, 0, &[1]);
+        assert!(g.promote_entry(0));
+
+        let c = check_lists(&g, 4);
+        assert_eq!(c.nodes_without_incoming, 0);
+        assert_eq!(c.reachable_from_entry, 3);
+        assert!(c.is_healthy(4), "{}", c.summary(4));
+    }
+
+    #[test]
+    fn checks_catch_a_disconnected_node_and_bad_links() {
+        let mut g = FlatGraph::new(4, 4);
+        for i in 0..4u32 {
+            g.push_node(0, tid(i + 1), false, &[0u8; 4]);
+        }
+        g.set_list(0, 0, &[0, 1, 1]); // self-link plus a duplicate
+        g.set_list(1, 0, &[0]);
+        // node 2 is isolated; node 3 is reachable from nothing either
+        assert!(g.promote_entry(0));
+
+        let c = check_lists(&g, 4);
+        assert_eq!(c.self_links, 1, "{}", c.summary(4));
+        assert_eq!(c.duplicate_links, 1, "{}", c.summary(4));
+        assert_eq!(c.nodes_without_incoming, 2, "{}", c.summary(4));
+        assert_eq!(c.reachable_from_entry, 2, "{}", c.summary(4));
+        assert!(!c.is_healthy(4), "an unhealthy graph must be reported");
+    }
+
+    #[test]
+    fn checks_bound_reachability_by_the_watermark() {
+        // A claimed-but-unwritten node must not be walked into, and must not count
+        // as reachable.
+        let mut g = FlatGraph::new(4, 4);
+        g.push_node(0, tid(1), false, &[0u8; 4]);
+        let claimed = g.claim_slot(0).expect("room");
+        g.set_list(0, 0, &[claimed]);
+        assert!(g.promote_entry(0));
+
+        let c = check_lists(&g, 4);
+        assert_eq!(c.nodes, 2);
+        assert_eq!(c.published, 1);
+        assert_eq!(c.reachable_from_entry, 1, "{}", c.summary(4));
+        assert!(!c.is_healthy(4), "an unpublished reachable id is not healthy");
     }
 
     #[test]
