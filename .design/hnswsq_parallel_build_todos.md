@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M6/BIGANN: no speedup at dim 128, and 2x slower than single-builder** | **open** | 1 worker 369.6 s = 4 workers 374.7 s vs baseline 179.5 s; scales 3.4x at dim 16 |
 | **M6/BIGANN: parallel is 2.1x SLOWER than single-builder** | **open** | 374.7 s vs 179.5 s at 4 workers, while recall is *better* (0.775 vs 0.742 at ef=10) |
 | **M3 step 6a: full hnswsq suite green after the parallel work** | **done** | 122 passed, 0 failed (356 s) |
 | M3 step 5z: recall at 7 workers | **done** | identical to 4 workers (0.6/0.8/0.8/1.0/1.0) with `no_incoming` doubled |
@@ -2151,6 +2152,51 @@ The decisive next measurement is the worker-count scan already launched on the s
 workers, same definition): if cost grows with the worker count it is contention; if one worker is
 already slower than the single-builder baseline, it is the infrastructure (arena placement or the
 per-insert lock discipline) rather than concurrency.
+
+### 3j.44 The decisive datapoint: no speedup at dim 128, while dim 16 scales 3.4x
+
+The worker-count scan answers the question 3j.43 left open, and the answer is worse than "contention":
+
+| 1M dim-128, same definition | wall |
+|---|---|
+| single-builder, 1 worker (baseline) | 179.5 s |
+| parallel, **1** worker | 369.6 s |
+| parallel, 4 workers | 374.7 s |
+
+**Four workers buy nothing at dim 128** (369.6 -> 374.7 s), while the same code at dim 16 on `t100k`
+scales the way it should:
+
+| `t100k` dim-16, same definition | wall |
+|---|---|
+| parallel, 1 worker | 7.08 s |
+| parallel, 4 workers | 2.10 s |
+
+So there are two effects, and separating them is the whole of the remaining problem:
+
+1. **A fixed cost in the parallel path**, visible even at one worker: 369.6 s against the
+   single-builder 179.5 s, i.e. ~2x, and at dim 16 the same comparison looks similar in kind
+   (7.08 s at one parallel worker against a low-single-digit single-builder build).  Nothing about
+   concurrency explains it, because a single worker has no contention.
+2. **No scaling with workers at dim 128**, when dim 16 scales 3.4x.  That one *is* concurrency-shaped:
+   something serializes once the per-insert work gets large.
+
+The two plausible mechanisms, and they are different problems:
+
+* **Lock hold time.**  Backlinks take a node write lock, O(`ef_construction`) per insert.  Uncontended
+  locks are cheap, which is why one worker is not much slower *because of locks* -- but the hold time
+  scales with the vector length (the target list is re-measured under the lock), so at dim 128 four
+  workers hold locks long enough to queue where at dim 16 they do not.
+* **Memory placement and bandwidth.**  The arena is a dsm segment in `/dev/shm`; the single-builder
+  graph is private anonymous memory.  Distances at dim 128 read 512 B per node against 64 B, so the
+  search is far more memory-hungry, and tmpfs-backed pages can behave differently from private pages
+  in both NUMA placement and faulting.  A single worker would already pay this (effect 1), and four
+  would not help (effect 2).
+
+Which one it is decides the fix -- coarser or lock-free backlinks, versus where the arena lives -- and
+it is a measurement, not a preference: `perf` on the host with one worker, and a variant that runs the
+same build with the arena in private memory (the single-builder path, as a control), would separate
+them.  Neither this nor the recall result changes the *plan's* wording: the target was set from dim-16
+synthetic builds, and on the acceptance dataset it is not met.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
