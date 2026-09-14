@@ -361,6 +361,38 @@ fn hnswsq2_dump(index: PgRelation) -> String {
                 if (*tup).type_ == ELEMENT_TUPLE_TYPE {
                     let hb = ip_block(&(*tup).heaptid);
                     let ho = ip_offset(&(*tup).heaptid);
+                    // Version/count check status (the scan's guard).
+                    {
+                        let mut vt = init_element_from_block(blkno, off);
+                        load_element_from_tuple(
+                            &mut *vt,
+                            tup,
+                            false,
+                            false,
+                            support.codec.vector_bytes(),
+                        );
+                        let nbuf = pg_sys::ReadBuffer(index_rel, (*vt).neighbor_page);
+                        pg_sys::LockBuffer(nbuf, pg_sys::BUFFER_LOCK_SHARE as i32);
+                        let npage = pg_sys::BufferGetPage(nbuf);
+                        let nitem = PageGetItem(
+                            npage,
+                            PageGetItemId(npage, (*vt).neighbor_offno),
+                        )
+                        .cast::<NeighborTupleData>();
+                        if (*nitem).version != (*vt).version
+                            || (*nitem).count as usize
+                                != ((*vt).level as usize + 2) * m
+                        {
+                            out.push_str(&format!(
+                                "  VERSION/COUNT MISMATCH: elem_v={} ntup_v={} ntup_count={} expect={}\n",
+                                (*vt).version,
+                                (*nitem).version,
+                                (*nitem).count,
+                                ((*vt).level as usize + 2) * m
+                            ));
+                        }
+                        pg_sys::UnlockReleaseBuffer(nbuf);
+                    }
                     // Read the neighbor tuple's layer-0 section.
                     let mut elem = init_element_from_block(blkno, off);
                     load_element_from_tuple(&mut *elem, tup, true, true, support.codec.vector_bytes());
