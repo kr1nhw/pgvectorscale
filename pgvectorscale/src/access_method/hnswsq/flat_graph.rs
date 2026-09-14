@@ -30,6 +30,8 @@
 //! would.
 
 use crate::access_method::hnswsq::arena::{arena_layout, ArenaLayout, Chunk};
+use super::arena::ArenaState;
+use super::arena::SharedArena;
 use crate::util::ItemPointer;
 
 /// Flat memory graph: parallel slabs, fixed capacity, no per-node allocation.
@@ -79,6 +81,11 @@ pub struct FlatGraph {
     max_slabs: usize,
     /// Per node: has its level/tid/clamped/vector been written yet?
     published_flags: Vec<bool>,
+    /// When set, the cursors (claim, slabs, watermark, entry) live in this shared
+    /// state instead of the fields below -- a parallel build shares them across
+    /// workers, so `len`/`claim_slot`/`publish` must not keep private copies that
+    /// would drift.  The `Vec`s stay the single-builder path.
+    state: Option<*mut ArenaState>,
     /// Every id below this watermark is published.  In the parallel build a worker
     /// claims an id from the shared counter and only then writes the node, so a
     /// peer that observes the id must skip it: readers bound-check against this
@@ -101,6 +108,7 @@ impl FlatGraph {
             vectors: Vec::new(),
             chunk: None,
             layout: arena_layout(0, 0, 0, 0),
+            state: None,
             slab_off: Vec::new(),
             ids: Vec::new(),
             lens: Vec::new(),
@@ -135,12 +143,59 @@ impl FlatGraph {
         g
     }
 
+    /// A graph over a shared arena: the same storage discipline as
+    /// [`FlatGraph::with_limits`], but the cursors come from the segment's
+    /// [`ArenaState`], so every worker that attaches sees one claim counter, one
+    /// watermark and one entry point.  The caller guarantees single-threaded access
+    /// to *this handle* -- concurrent workers each build their own, and the arena's
+    /// node locks are what make that safe.
+    pub fn in_arena(arena: &SharedArena) -> Self {
+        let header = arena.header();
+        let mut g = Self::new(header.stride, header.cap);
+        g.max_nodes = header.max_nodes;
+        g.max_slabs = header.max_slabs;
+        g.layout = header.layout;
+        // SAFETY: the arena's chunk lives in the segment for as long as the arena
+        // handle; this graph is a second view of the same bytes.
+        g.chunk = Some(unsafe { Chunk::attach(arena.chunk().base_ptr(), header.layout) });
+        g.state = Some(arena.state() as *const ArenaState as *mut ArenaState);
+        g
+    }
+
+    /// The cursors, whichever backing holds them.
+    #[inline]
+    fn nodes_used(&self) -> usize {
+        match self.state {
+            // SAFETY: the state lives in the segment for the arena's lifetime.
+            Some(state) => unsafe { &*state }.claimed().0,
+            None => self.nodes_used,
+        }
+    }
+
+    #[inline]
+    fn slabs_used(&self) -> usize {
+        match self.state {
+            // SAFETY: as above.
+            Some(state) => unsafe { &*state }.claimed().1,
+            None => self.slabs_used,
+        }
+    }
+
+    #[inline]
+    fn shared_state(&self) -> Option<&ArenaState> {
+        // SAFETY: the state lives in the segment for the arena's lifetime.
+        self.state.map(|s| unsafe { &*s })
+    }
+
     /// Number of nodes every part of whose data is written.  Equal to `len()` in
     /// the single-threaded prototype and the legacy path; smaller while workers
     /// hold claimed-but-unwritten slots in the arena.
     #[inline]
     pub fn watermark(&self) -> usize {
-        self.watermark
+        match self.shared_state() {
+            Some(state) => state.watermark(),
+            None => self.watermark,
+        }
     }
 
     /// Reserve a node id and its slabs without writing any data.  The slot stays
@@ -149,11 +204,22 @@ impl FlatGraph {
     /// exhausted — the driver then spills, exactly as for `try_push_node`.
     pub fn claim_slot(&mut self, level: u8) -> Option<u32> {
         let layers = level as usize + 1;
-        if self.len() >= self.max_nodes || self.slabs_used + layers > self.max_slabs {
-            return None;
-        }
-        let id = self.nodes_used as u32;
-        self.nodes_used += 1;
+        let (id, base) = match self.shared_state() {
+            // Shared: one CAS reserves the id *and* its slabs, so two workers can
+            // never be handed the same slab range.
+            Some(state) => {
+                let (id, slab) = state.claim(layers, self.max_nodes, self.max_slabs)?;
+                (id, slab)
+            }
+            None => {
+                if self.len() >= self.max_nodes || self.slabs_used + layers > self.max_slabs {
+                    return None;
+                }
+                let id = self.nodes_used as u32;
+                self.nodes_used += 1;
+                (id, self.slabs_used as u32)
+            }
+        };
         match self.chunk.as_mut() {
             Some(chunk) => chunk.region_bytes_mut(self.layout.levels)[id as usize] = level,
             None => self.levels.push(level),
@@ -181,18 +247,19 @@ impl FlatGraph {
         if self.chunk.is_none() {
             self.vectors.resize(self.vectors.len() + self.stride, 0);
         }
-        let base = self.slabs_used as u32;
         match self.chunk.as_mut() {
             Some(chunk) => chunk.region_u32_mut(self.layout.slab_off)[i] = base,
             None => self.slab_off.push(base),
         }
-        self.slabs_used += layers;
+        if self.state.is_none() {
+            self.slabs_used += layers;
+        }
         if self.chunk.is_none() {
             // Grow mode only: `lens`/`ids` are the storage.  They are kept in
             // lockstep with the cursor, filled with zero lengths exactly like the
             // chunk's zeroed region, so a claimed-but-unwritten slab reads empty.
-            self.lens.resize(self.slabs_used, 0);
-            self.ids.resize(self.slabs_used * self.cap, 0);
+            self.lens.resize(self.slabs_used(), 0);
+            self.ids.resize(self.slabs_used() * self.cap, 0);
         }
         Some(id)
     }
@@ -225,8 +292,17 @@ impl FlatGraph {
             Some(chunk) => chunk.region_bytes_mut(self.layout.published)[i] = 1,
             None => self.published_flags[i] = true,
         }
-        while self.watermark < self.nodes_used && self.is_published(self.watermark) {
-            self.watermark += 1;
+        match self.shared_state() {
+            // Shared: whoever closes the gap moves the watermark, and the contiguity
+            // rule is the state's, not this handle's.
+            Some(state) => {
+                state.advance_watermark(|i| self.is_published(i), self.nodes_used());
+            }
+            None => {
+                while self.watermark < self.nodes_used && self.is_published(self.watermark) {
+                    self.watermark += 1;
+                }
+            }
         }
     }
 
@@ -242,7 +318,11 @@ impl FlatGraph {
         encoded: &[u8],
     ) -> bool {
         let layers = level as usize + 1;
-        if self.len() >= self.max_nodes || self.slabs_used + layers > self.max_slabs {
+        // Through the cursor methods: with a shared state the fields are 0, and a
+        // pre-check that reads them would report "room" right up to the point where
+        // `push_node`'s claim panics on exhaustion -- `false` is the driver's spill
+        // signal, so it has to be the real answer.
+        if self.len() >= self.max_nodes || self.slabs_used() + layers > self.max_slabs {
             return false;
         }
         self.push_node(level, tid, clamped, encoded);
@@ -251,12 +331,12 @@ impl FlatGraph {
 
     /// Whether either budget is exhausted (always `false` in grow mode).
     pub fn is_full(&self) -> bool {
-        self.len() >= self.max_nodes || self.slabs_used >= self.max_slabs
+        self.len() >= self.max_nodes || self.slabs_used() >= self.max_slabs
     }
 
     /// `(slabs used, slab budget)`.
     pub fn slab_usage(&self) -> (usize, usize) {
-        (self.slabs_used, self.max_slabs)
+        (self.slabs_used(), self.max_slabs)
     }
 
     /// `(nodes used, node budget)`.
@@ -266,7 +346,7 @@ impl FlatGraph {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.nodes_used
+        self.nodes_used()
     }
 
     #[inline]
@@ -441,7 +521,7 @@ impl FlatGraph {
         // Bound by `nodes_used`, not by the array length: in chunk mode the region is
         // `max_nodes` long, so a length check would accept unclaimed ids and hand out
         // slabs for nodes that do not exist yet.
-        if id as usize >= self.nodes_used {
+        if id as usize >= self.nodes_used() {
             return None;
         }
         let base = match &self.chunk {
@@ -450,7 +530,7 @@ impl FlatGraph {
         } as usize;
         // A node with `level + 1` layers must own that many slabs.
         let layers = self.level(id) as usize + 1;
-        (base + layers <= self.slabs_used).then_some(base)
+        (base + layers <= self.slabs_used()).then_some(base)
     }
 }
 
@@ -600,7 +680,12 @@ pub fn check_lists(g: &FlatGraph, cap: usize) -> ListChecks {
     checks
 }
 
-#[cfg(test)]
+// `any(test, feature = "pg_test")` + `#[pgrx::pg_schema]`, not just `cfg(test)`: the
+// build script emits the SQL for `#[pg_test]` functions and compiles the crate
+// *without* `cfg(test)`, so a `cfg(test)`-only module would register the Rust test
+// but never create its `tests.<name>()` function.
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod tests {
     use super::*;
     use crate::access_method::distance::{distance_l2, DistanceType};
@@ -918,6 +1003,62 @@ mod tests {
         assert_eq!(g.neighbors(1, 0), &[0, 0]);
         let owner_byte = moved[layout.levels.offset / 8];
         assert!(owner_byte != 0, "and the owner sees them in the moved segment");
+    }
+
+    #[pgrx::pg_test]
+    fn a_graph_over_a_shared_arena_shares_its_cursors() {
+        let size = 1usize << 20;
+        // SAFETY: a fresh backend-owned segment, detached before the test returns.
+        let seg = unsafe { pgrx::pg_sys::dsm_create(size, 0) };
+        let toc = unsafe {
+            pgrx::pg_sys::shm_toc_create(
+                super::super::arena::HNSWSQ_TOC_MAGIC,
+                pgrx::pg_sys::dsm_segment_address(seg),
+                size,
+            )
+        };
+        let tranche = super::super::arena::register_tranche(c"hnswsq_shared_graph_test");
+        let (stride, cap, nodes, slabs) = (8usize, 4usize, 8usize, 9usize);
+        let arena = unsafe { super::super::arena::SharedArena::allocate(toc, stride, cap, nodes, slabs, tranche) };
+
+        // Two handles, the way two workers would each build their own.
+        let mut a = FlatGraph::in_arena(&arena);
+        let peer_arena = unsafe { super::super::arena::SharedArena::attach(toc) };
+        let mut b = FlatGraph::in_arena(&peer_arena);
+
+        assert_eq!(a.len(), 0);
+        assert_eq!(a.slab_usage(), (0, slabs), "capacities come from the header");
+        assert!(a.chunk.is_some() && a.levels.is_empty(), "storage is the segment's");
+
+        // Claim and publish through one handle, observe through the other.
+        let id0 = a.claim_slot(0).expect("room");
+        assert_eq!(id0, 0);
+        assert_eq!(b.len(), 1, "the claim cursor is shared");
+        assert_eq!(a.watermark(), 0, "claimed but unpublished is not visible");
+        a.publish(id0, crate::util::ItemPointer::new_invalid(), false, &[9u8; 8]);
+        assert_eq!(b.watermark(), 1, "publishing advances the shared watermark");
+        assert_eq!(b.vector(0), &[9u8; 8], "and the peer sees the data");
+
+        // A gap left by an out-of-order publisher is the same for both handles.
+        let id1 = a.claim_slot(1).expect("room for a 2-layer node");
+        let id2 = b.claim_slot(0).expect("room");
+        assert_eq!((id1, id2), (1, 2), "ids stay unique across handles");
+        b.publish(id2, crate::util::ItemPointer::new_invalid(), false, &[7u8; 8]);
+        assert_eq!(a.watermark(), 1, "id 1 is still unwritten");
+        a.publish(id1, crate::util::ItemPointer::new_invalid(), true, &[8u8; 8]);
+        assert_eq!(a.watermark(), 3, "closing the gap moves it past both");
+
+        assert_eq!(a.level(1), 1);
+        assert_eq!(a.clamped(1), true);
+        assert_eq!(a.slab_base(2), Some(3), "slab ranges come from the shared CAS");
+        assert_eq!(a.slab_usage(), (4, slabs), "1 + 2 + 1 slabs, no double booking");
+
+        drop(b);
+        drop(peer_arena);
+        drop(a);
+        drop(arena);
+        // SAFETY: no handle references the mapping any more.
+        unsafe { pgrx::pg_sys::dsm_detach(seg) };
     }
 
     #[test]

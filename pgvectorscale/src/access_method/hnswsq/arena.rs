@@ -771,6 +771,34 @@ impl Chunk {
         matches!(self.backing, Backing::Owned(_))
     }
 
+    /// The chunk's base address, for handing the same storage to another handle (a
+    /// worker builds a `Chunk::attach` from it).
+    pub fn base_ptr(&self) -> *mut u64 {
+        self.backing.ptr().cast::<u64>()
+    }
+
+    /// Byte view for **concurrent** writers.
+    ///
+    /// In a parallel build several workers write different nodes of the same chunk
+    /// at the same time, so there is no `&mut Chunk` to hand around and the usual
+    /// borrow discipline cannot apply.  The division of labour is what makes this
+    /// sound: a node's own bytes (vector, flags, tid, its slabs' ids and lens) are
+    /// written only by the worker that claimed the node, and readers of that node
+    /// hold its node lock.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that no two participants write the same byte
+    /// through the returned slice, and that no reader of those bytes runs without
+    /// the relevant node lock.
+    pub unsafe fn region_bytes_concurrent(&self, r: Region) -> &mut [u8] {
+        assert!(r.end() <= self.layout.total_bytes, "region outside the chunk");
+        let base = self.backing.ptr();
+        // SAFETY: the allocation covers `[r.offset, r.end())` (checked), and the
+        // caller accepts the aliasing rule above.
+        std::slice::from_raw_parts_mut(base.add(r.offset), r.len)
+    }
+
     /// The whole chunk as bytes -- what a `shm_toc` allocation copies, and what the
     /// relocation test moves to another address.
     pub fn as_bytes(&self) -> &[u8] {

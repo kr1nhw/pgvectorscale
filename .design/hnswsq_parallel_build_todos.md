@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 4e: `FlatGraph` over a shared arena | done | cursors read the segment (`in_arena`); 2 latent cursor bugs surfaced by the shared path |
 | M3 step 4d: shared cursors (`ArenaState`) | done | packed claim CAS, contiguous watermark, entry + rendezvous; 4 tests |
 | M3 step 4c: arena in a `shm_toc` segment | done | `SharedArena::allocate`/`attach` by key; `pg_test` round-trips a real dsm segment |
 | M3 step 4b: node locks as LWLocks | done | `NodeLocks` over `RwLock`s *or* a tranche we register at runtime; 2 `pg_test`s |
@@ -876,6 +877,38 @@ Three decisions the tests pin down:
 The failure flag exists because a worker cannot longjmp into the leader: it sets
 `failed`, exits cleanly, and the leader re-raises the error itself.  That is the
 hook the driver's error path needs.
+
+### 3j.5 `FlatGraph` over a shared arena
+
+`FlatGraph::in_arena(&SharedArena)` builds a graph whose storage and cursors both come
+from the segment: `len`/`slab_usage`/`is_full`/`watermark`/`claim_slot`/`publish` go
+through `ArenaState` (packed claim CAS, shared watermark), and every per-node region is
+addressed in the shared chunk.  The `Vec` fields remain the single-builder path, and
+`Chunk::region_bytes_concurrent` is the documented escape hatch the parallel write path
+needs: several workers write sibling bytes of one chunk at a time, so there is no
+`&mut Chunk` to share, and the soundness argument is the division of labour (a node's
+bytes are written only by the worker that claimed it, and readers hold its node lock).
+
+**Two latent bugs the shared path surfaced immediately**, both of the same kind -- a
+cursor with two homes (the field and the segment):
+
+* `slab_base` bounded `id` by the *field* `nodes_used`, which is 0 once the cursors
+  live in the segment, so every lookup returned `None` (unreachable slabs rather than
+  wrong ones -- the safe direction, but wrong);
+* `try_push_node`'s budget pre-check read the field too, so it would report "room"
+  until `push_node`'s claim panicked on exhaustion.  `false` is the driver's spill
+  signal, so that had to become the real answer.
+
+Both are fixed by reading through the cursor methods, and the audit for *every*
+remaining raw field read is in the diff: the only ones left are in the local arms of
+the two `match`es and behind `state.is_none()` guards.
+
+**A third bug was mine, not the design's:** the same patch dropped
+`self.push_node(...)` from `try_push_node` entirely, so it returned `true` without
+pushing.  Two pre-existing tests (`fixed_capacity_reports_full_instead_of_growing`,
+`planned_capacity_admits_more_nodes_than_its_estimate`) failed on it immediately --
+which is the argument for keeping them: a "true means it worked" path with no
+assertion of its own would have shipped that silently.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
