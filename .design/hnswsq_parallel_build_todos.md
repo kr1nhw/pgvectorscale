@@ -24,6 +24,7 @@ pinned seed, release, same host, unless stated):
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
 | **M6/BIGANN: no speedup at dim 128, and 2x slower than single-builder** | **open** | 1/2/4 workers = 369.6 / 355.0 / 374.7 s vs baseline 179.5 s |
+| M6: `BuildParams.backfill` was dead | **fixed** | the knob reaches workers via the GUC; the field misled |
 | M6/BIGANN: lock elision for a lone worker | **candidate fix, measurement running** | sound (one writer needs no exclusion), compile-verified | 1 worker 369.6 s = 4 workers 374.7 s vs baseline 179.5 s; scales 3.4x at dim 16 |
 | **M6/BIGANN: parallel is 2.1x SLOWER than single-builder** | **open** | 374.7 s vs 179.5 s at 4 workers, while recall is *better* (0.775 vs 0.742 at ef=10) |
 | **M3 step 6a: full hnswsq suite green after the parallel work** | **done** | 122 passed, 0 failed (356 s) |
@@ -2223,6 +2224,32 @@ the arena in a dsm segment against the single-builder's private heap.
 Measured on the host as this was written; the result lands in the next round.  The change is committed
 *sound but unmeasured* -- unlike the earlier speculative fixes, it needs no behavioural assumption: one
 writer cannot race itself.
+
+### 3j.46 The backfill knob: audit result, and a dead field removed
+
+Raised as a possible regression ("did the build fall back to `build_backfill = 1`?").  Audited rather
+than recalled, and the answer is no:
+
+* the GUC default has been `0` since the knob landed (`GucSetting::<i32>::new(0)`, `options.rs:163`);
+* the value is read per insert at `build.rs:334`, inside `flat_insert_at_level` -- the shared insert
+  body for both the single-builder path and parallel workers -- so both honour the session's setting
+  and default to off;
+* no benchmark script, local or on host 121, sets it;
+* the measurements corroborate it: the BIGANN baseline was 179.5 s, matching the *recorded bf=0* flat
+  BIGANN build (178 s), where bf=1 measured +47-51% on the same shape (so a bf=1 baseline would be
+  ~265 s or more).
+
+**But the audit found a real defect in the same place.**  `BuildParams` carried a `backfill: u8` field
+that was hardcoded to `0` and read by nobody -- grepping `.backfill` across `build.rs`, `driver.rs` and
+`flat_engine.rs` found no consumer, because the worker reads the GUC instead.  That field made the
+parallel path *look* like it forced backfill off (or, read the other way, like setting it would change
+anything).  It is removed.
+
+Worth stating why the GUC route is the one that works, since it is not obvious: PostgreSQL propagates
+session GUCs into parallel workers, and this project has already proven it -- the per-worker stats
+lines added in 3j.39 only print when `hnswsq.build_stats` is on *in the worker*, and they appeared.
+So a GUC-based knob reaches workers, and a parameter that duplicates it is worse than redundant: it is
+a lie about which one is in charge.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

@@ -195,7 +195,6 @@ pub struct BuildParams {
     /// `DistanceType` and precision as integers; those enums are not ours to send.
     pub dist_type: u8,
     pub precision: u8,
-    pub backfill: u8,
     /// Backlink admission policy.  Not cosmetic: a worker on a different policy builds a
     /// different graph, and the fingerprint gate would report an unexplained mismatch rather
     /// than "the worker disagreed about the policy".
@@ -471,7 +470,6 @@ pub(crate) fn build_index_parallel(
             max_level: meta.get_max_level(),
             dist_type: dist_type as u8,
             precision: precision as u8,
-            backfill: 0,
             backlink_mode: 0,
             tranche,
             single_writer: workers <= 1,
@@ -762,7 +760,6 @@ mod tests {
                 max_level: 7,
                 dist_type: 0,
                 precision: 0, // Plain, matching the index's storage_layout
-                backfill: 0,
                 backlink_mode: 0,
                 tranche,
                 single_writer: false,
@@ -859,7 +856,6 @@ mod tests {
             max_level: 7,
             dist_type: 0,
             precision: HnswPrecision::Plain as u8,
-            backfill: 0,
             backlink_mode: 0,
             tranche,
         };
@@ -1001,7 +997,6 @@ mod tests {
                 max_level: 7,
                 dist_type: 0,
                 precision: 0,
-                backfill: 0,
                 backlink_mode: 0,
                 tranche: 0,
             };
