@@ -1705,6 +1705,43 @@ pub unsafe extern "C-unwind" fn ambuild(
     };
 
     // ---- Pass 2 (or the only pass): stream rows into the builder. ----
+    // ---- Parallel build (M3) ------------------------------------------------------------
+    // When asked for, and when the build is not concurrent (live inserters would race the page
+    // plan exactly as they do for the bulk writeout), workers build into a shared arena and the
+    // leader writes it out; the sequential scan below is then skipped entirely.  The meta page is
+    // already written above, which is what a worker needs to seed its state (`ml`, `max_level`) --
+    // see 3j.19; that ordering is why this sits after it.
+    let parallel_workers = crate::access_method::hnswsq::options::HNSWSQ_BUILD_WORKERS.get();
+    if parallel_workers > 0 && !is_concurrent {
+        let outcome = crate::access_method::hnswsq::driver::build_index_parallel(
+            unsafe { (*heap).rd_id },
+            unsafe { (*index).rd_id },
+            parallel_workers,
+            num_dimensions as u32,
+            distance_type as u32,
+            budget_bytes >> 20,
+            true,
+        );
+        if state.stats.enabled {
+            pgrx::warning!(
+                "hnswsq parallel build: {}",
+                outcome.summary
+            );
+        }
+        // The graph is already in the index (the writeout is inside `build_index_parallel`, by the
+        // same bridge and writer the sequential path uses), so all this owes PostgreSQL is the
+        // result: rows read, and tuples indexed.
+        let result = unsafe {
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexBuildResult>())
+                as *mut pg_sys::IndexBuildResult
+        };
+        unsafe {
+            (*result).heap_tuples = outcome.published as f64;
+            (*result).index_tuples = outcome.written as f64;
+        }
+        return result;
+    }
+
     unsafe {
         pg_sys::IndexBuildHeapScan(
             heap_rel.as_ptr(),

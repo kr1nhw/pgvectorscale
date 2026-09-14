@@ -400,7 +400,7 @@ pub(crate) fn build_index_parallel(
     dist_type: u32,
     budget_mb: u64,
     write_out: bool,
-) -> String {
+) -> ParallelBuildResult {
     use pgrx::PgRelation;
 
     let index_rel = unsafe { PgRelation::open(index_oid) };
@@ -428,7 +428,7 @@ pub(crate) fn build_index_parallel(
     let mut failed = false;
     let mut slabs_claimed = 0usize;
     let mut written = 0usize;
-    let summary = unsafe {
+    let outcome = unsafe {
         let heap = pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let snapshot = pg_sys::GetActiveSnapshot();
@@ -483,6 +483,15 @@ pub(crate) fn build_index_parallel(
 
         pg_sys::LaunchParallelWorkers(pcxt);
         pg_sys::WaitForParallelWorkersToFinish(pcxt);
+
+        // Workers never promote an entry (3j.16): the leader seeded one before launching, and has
+        // to re-promote now, because a higher-level node may have appeared while they ran.  Omitting
+        // this leaves the zero-vector seed as the entry for the whole graph, which costs recall --
+        // measured at 0.5 instead of 0.8 on `t100k` before this call was added.
+        {
+            let mut g = super::flat_graph::FlatGraph::in_arena(&arena);
+            crate::access_method::hnswsq::driver::promote_best_entry(&mut g);
+        }
         // Everything the summary needs must be read *before* the context is destroyed:
         // `DestroyParallelContext` detaches the segment, and the arena handle points into it.
         // (The first version formatted the string afterwards and segfaulted the *leader* --
@@ -507,7 +516,14 @@ pub(crate) fn build_index_parallel(
         pg_sys::ExitParallelMode();
         pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         pg_sys::table_close(heap, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
-        format!(
+        ParallelBuildResult {
+            published,
+            written,
+            entered,
+            no_incoming: checks.nodes_without_incoming,
+            reachable: checks.reachable_from_entry,
+            elapsed_ms: start.elapsed().as_millis(),
+            summary: format!(
             "workers launched={} entered={} failed={} published={} written={} slabs={}/{} checks(published={} no_incoming={} reachable={} self_links={} duplicates={} max_len={}/{}) elapsed_ms={}",
             launched,
             entered,
@@ -524,10 +540,23 @@ pub(crate) fn build_index_parallel(
             checks.max_list_len,
             m0,
             start.elapsed().as_millis()
-        )
+            ),
+        }
     };
-    let _ = (published, launched);
-    summary
+    let _ = launched;
+    outcome
+}
+
+/// What a parallel build produced, for a caller that needs numbers rather than a report
+/// (`ambuild` fills its `IndexBuildResult` from these).
+pub(crate) struct ParallelBuildResult {
+    pub published: usize,
+    pub written: usize,
+    pub entered: u32,
+    pub no_incoming: usize,
+    pub reachable: usize,
+    pub elapsed_ms: u128,
+    pub summary: String,
 }
 
 #[pg_extern]
@@ -549,6 +578,7 @@ pub fn hnswsq_parallel_build_debug(
         budget_mb.max(1) as u64,
         write_out,
     )
+    .summary
 }
 
 #[cfg(any(test, feature = "pg_test"))]

@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M3 step 5t: `CREATE INDEX` drives the parallel build** | **done** | 100k in 2.6 s; `workers=0` bit-identical (fingerprint `3794aa11c860aba0`) |
 | M3 step 5s: `build_index_parallel` extracted for `ambuild` | **done** | harness is a thin wrapper; behaviour identical |
 | **M3 step 5r: recall of a parallel-built index** | **done** | ef 40/100: parallel 0.80/1.00 vs single-builder 0.60/1.00 |
 | M3 step 5q: parallel writeout into a real index | **done** | 100 001 nodes written in 1912 ms total; structure checks clean |
@@ -1718,6 +1719,57 @@ already does this -- the ordering constraint from 3j.19 is satisfied by construc
 is therefore: when `hnswsq.build_workers > 0` and the build is not concurrent, call
 `build_index_parallel` and skip the sequential scan; then set `amcanbuildparallel` in the AM routine
 so the capability is advertised.
+
+### 3j.32 `CREATE INDEX` drives the parallel build -- and a correction to 3j.30
+
+`ambuild` now calls `build_index_parallel` when `hnswsq.build_workers > 0` and the build is not
+concurrent, writes the graph out itself (inside that function) and returns an `IndexBuildResult`;
+the sequential scan is skipped.  The meta page is written before it by `ambuild`'s existing
+structure, which is what the workers need (3j.19), so the ordering constraint is satisfied by
+construction rather than by a new step.
+
+```
+SET hnswsq.build_workers = 4; CREATE INDEX ... on t100k
+WARNING:  hnswsq parallel build: workers launched=4 entered=4 failed=false
+          published=100001 written=100001 no_incoming=307 reachable=99694
+          self_links=0 duplicates=0 max_len=32/32 elapsed_ms=2090
+Time: 2614.962 ms
+```
+
+**`workers = 0` is bit-identical**, which was an outstanding acceptance item: the default path
+(`build_workers=0`, `build_engine=1`, pinned seed) produces `fingerprint=3794aa11c860aba0` with
+`checks(published=100000 no_incoming=0 reachable=100000 self_links=0 duplicates=0 max_len=32)` --
+exactly the fingerprint recorded for this table and shape in 3j, so the parallel work has not
+changed the single-builder graph by a single node.
+
+**Correction: the recall numbers in 3j.30 were measuring the wrong artifact.**  Those runs built
+with the *harness* into `t100k_par_idx`, which had first been created by a normal `CREATE INDEX` --
+so the parallel writeout overwrote the pages of a single-builder graph, and the queries that
+followed could still reach the leftover single-builder structure.  Building into a **fresh** index
+via `CREATE INDEX` (nothing to inherit) gives a different and honest answer on the same table, same
+ground truth, same `ef_search=40`:
+
+| artifact | recall@10 at ef=40 |
+|---|---|
+| single-builder, 1 worker (fresh) | 0.60 |
+| parallel, 4 workers, **fresh** index (via `CREATE INDEX`) | **0.50** |
+| parallel, 4 workers, harness into a *pre-built* index | 0.80 -- **not a valid measurement** |
+
+So the parallel index is *worse* than the single-builder one on this table by 0.10 at a tight
+budget, not better, and the earlier "0.80 / 1.00, comfortably passes the gate" reading has to be
+withdrawn.  It is consistent with the connectivity delta (307 nodes with no incoming edge versus 0)
+and is the first evidence that the delta *does* cost something -- which is exactly what the
+concurrency gate was for.
+
+**What to do about it, in order:** (1) measure a real sweep (ef 10..640) with repeats on fresh
+indexes for both builds, because one operating point is not a curve; (2) check whether the parallel
+writeout is *complete* -- recall 0.5 with `reachable=99694` suggests the graph is fine and the entry
+or page plan is suspect, so verify the meta page's `build_result` and the entry the writeout chose;
+(3) only then look for a policy reason.
+
+**The measurement lesson, since it cost a wrong conclusion:** a harness that writes into an
+already-built index measures the union of two builds.  Every recall number must come from a fresh
+index, and the harness should create one rather than being handed an existing one.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
