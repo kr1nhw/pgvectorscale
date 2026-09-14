@@ -40,6 +40,36 @@ pinned seed, release, same host, unless stated):
 5. **M7**: settle the surviving policy (append/shrink only, or also exact) with the 1M
    measurement, then delete the legacy engine, the adapter and `build_engine`.
 
+## 3f. Backfill decision measured at 1M (local, dim 16) -- keep it OFF
+
+Same harness, 1M rows (the local `t1000000` dataset), pinned seed, release, flat engine
+(`build_engine = 1`), the two backfill settings back to back:
+
+| `build_backfill` | build | plan (search) | apply (backlinks) | `no_incoming` | `reachable` | recall@10 ef 40 / 160 |
+|---|---|---|---|---|---|---|
+| **0 (decided policy)** | **97.8 s** | 73.4 s | **19.4 s** | **1** | 999 999 | **1.0000** / 1.0000 |
+| 1 (closest-pruned backfill) | 143.7 s | 79.5 s | 60.6 s | 0 | 1 000 000 | 0.8000 / 1.0000 |
+
+Three conclusions, and they settle the question for the default:
+
+1. **Backfill is not needed for connectivity.**  At 1M the decided policy leaves *one*
+   node without an incoming edge out of 1M (999 999 reachable) — the 519-node figure was
+   a 100k artifact of short young lists, not a property that persists at scale.  So the
+   candidate fix (2) (`always_admit`) has no case at all, and the relative gate from §3e
+   is the right shape.
+2. **It costs a lot:** +47% build time (97.8 -> 143.7 s), concentrated in the apply half
+   (19.4 -> 60.6 s, 3.1x), because every backlink then lands on a saturated target and
+   pays the full re-measure plus occlusion walk instead of an O(1) append.
+3. **Its recall effect is dataset-dependent and can be negative:** at 1M dim-16 it *hurts*
+   at ef 40 (0.8000 vs 1.0000) because filling lists with occluded, non-diverse
+   candidates degrades the layer-0 neighbourhood at low search width; on the 100k dim-128
+   dataset (§3d) it helped (0.2000 -> 0.2945 at ef 40).  Two datasets, opposite signs,
+   with the easy one at the operating point where recall is already saturated.
+
+Decision: **`hnswsq.build_backfill` stays 0.**  The knob is kept (it is one GUC, useful
+for the BIGANN operating-point check when host 121 is reachable again), with the
+dataset-dependence documented rather than generalised from a single measurement.
+
 **Blocked step, recorded so the next session does not re-discover it:** the 1M BIGANN
 `build_backfill` 0-vs-1 decision run (item 1 above) could not be started — host
 121.37.117.106 was unreachable over SSH for two consecutive attempts (connection

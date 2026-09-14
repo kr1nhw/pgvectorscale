@@ -50,6 +50,9 @@ BUILD_SEED="${HNSWSQ_BUILD_SEED_BENCH:-20240912}"
 BACKLINK_MODE="${HNSWSQ_BACKLINK_MODE_BENCH:-1}"
 # Build engine: 0 = legacy MemGraph (default), 1 = new flat engine.
 ENGINE="${HNSWSQ_ENGINE_BENCH:-0}"
+# Own-list backfill knob (flat engine only): 0 = heuristic only (decided policy),
+# 1 = closest-pruned backfill.  See .design/hnswsq_parallel_build_todos.md §3d/§0.
+BACKFILL="${HNSWSQ_BACKFILL_BENCH:-0}"
 EF_SWEEP="${HNSWSQ_EF_SWEEP:-10 40 160 640}"
 OUT_CSV="${OUT_CSV:-/tmp/hnswsq_local_cycle.csv}"
 LOG="${LOG:-/tmp/hnswsq_local_$(date +%Y%m%d_%H%M%S)_${LABEL}.log}"
@@ -99,12 +102,13 @@ fi
 
 # ---- 2. drop + rebuild, timed, with stats on -------------------------------
 q -c "DROP INDEX IF EXISTS $IDX;" >>"$LOG" 2>&1
-log "building $IDX (layout=$LAYOUT m=$M efc=$EFC maintenance_work_mem=$MAINT_MEM build_seed=$BUILD_SEED backlink_mode=$BACKLINK_MODE engine=$ENGINE)"
+log "building $IDX (layout=$LAYOUT m=$M efc=$EFC maintenance_work_mem=$MAINT_MEM build_seed=$BUILD_SEED backlink_mode=$BACKLINK_MODE engine=$ENGINE backfill=$BACKFILL)"
 BUILD_START=$(date +%s.%N)
 q -c "SET maintenance_work_mem = '$MAINT_MEM'; SET hnswsq.build_stats = on;
       SET hnswsq.build_seed = $BUILD_SEED;
       SET hnswsq.build_backlink_mode = $BACKLINK_MODE;
       SET hnswsq.build_engine = $ENGINE;
+      SET hnswsq.build_backfill = $BACKFILL;
       CREATE INDEX $IDX ON $TABLE USING hnswsq (embedding vector_l2_ops)
       WITH (storage_layout = '$LAYOUT', m = $M, ef_construction = $EFC);" >>"$LOG" 2>&1
 BUILD_RC=$?
