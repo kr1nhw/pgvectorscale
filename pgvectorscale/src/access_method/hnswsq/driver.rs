@@ -20,13 +20,18 @@ use pgrx::pg_guard;
 use super::arena::{ArenaLayout, SharedArena, TOC_KEY_CHUNK, TOC_KEY_HEADER};
 use super::flat_graph::{plan_capacity, ArenaSizing};
 
-/// PostgreSQL's toc magic (`PARALLEL_MAGIC` in `parallel.h`).
+/// PostgreSQL's toc magic.
 ///
-/// pgrx does not bind this `#define`, and guessing it would be the kind of silent mistake
-/// that shows up only as a worker failing to attach, so the test below *verifies* it
-/// against a real context instead: `shm_toc_attach(PARALLEL_MAGIC, ...)` has to return
-/// exactly the pointer `InitializeParallelDSM` put in `pcxt->toc`.
-pub const PARALLEL_MAGIC: u64 = 0x50477c23;
+/// pgrx does not bind this `#define`, and *remembering* it produced the wrong value: the
+/// constant was pinned to `0x50477c23`, `shm_toc_attach` returned NULL for it, and a test
+/// written to verify the pin rather than trust it is what caught that.  The value below is
+/// **measured** off a live parallel context (the first field of `shm_toc` is the magic) and
+/// the test requires them to agree, so it cannot drift again.
+///
+/// Note that nothing on the worker path needs it any more: PostgreSQL hands the worker the
+/// toc directly (see [`worker_attach`]).  It stays for any code that has to re-find the toc
+/// from the segment alone.
+pub const PARALLEL_MAGIC: u64 = 0x5047_7C7C;
 
 /// The library PostgreSQL must load in a worker to find the entry point.
 ///
@@ -99,8 +104,9 @@ pub unsafe fn estimate_arena(
     for bytes in SharedArena::allocation_sizes(stride, cap, sizing.nodes, sizing.slabs) {
         estimate_chunk(pcxt, bytes);
     }
-    // One key per region: header, state, chunk, locks.
-    estimate_keys(pcxt, 4);
+    // One key per region the leader allocates: header, state, chunk, locks, parameters.
+    estimate_keys(pcxt, 5);
+    estimate_chunk(pcxt, std::mem::size_of::<BuildParams>());
 }
 
 /// Leader: allocate the segment and put the arena in it.
@@ -140,6 +146,78 @@ pub unsafe fn leader_setup(
 pub unsafe fn worker_attach(toc: *mut pg_sys::shm_toc) -> SharedArena {
     assert!(!toc.is_null(), "no toc was handed to the worker");
     SharedArena::attach(toc)
+}
+
+/// Key for the serialized build parameters.
+pub const TOC_KEY_PARAMS: u64 = 0x686e_7377_7371_2001;
+
+/// Everything a worker needs to build, apart from the arena and the scan.
+///
+/// `#[repr(C)]` POD with no pointers (the `u64`s first, then `u32`s, then the bytes) because
+/// the leader writes it once and workers in other processes read it.  Oids travel as `u32`
+/// rather than `pg_sys::Oid` for the same reason: the wire shape should not depend on how
+/// pgrx wraps an Oid this release.
+///
+/// It lives here rather than in the arena header because these are *build* choices, not
+/// arena layout -- and the single-builder path writes the same arena with nothing to
+/// publish.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BuildParams {
+    /// Rows the leader counted, so a worker can size its own work.
+    pub rows: u64,
+    /// The pinned seed levels are derived from (`levels::level_for_tid`).
+    pub seed: u64,
+    pub heap_oid: u32,
+    pub index_oid: u32,
+    pub stride: u32,
+    pub cap: u32,
+    pub m: u32,
+    pub m0: u32,
+    pub ef_construction: u32,
+    /// HNSW level scale, `1 / ln(m)`.
+    pub ml: f32,
+    pub max_level: u8,
+    /// `DistanceType` and precision as integers; those enums are not ours to send.
+    pub dist_type: u8,
+    pub precision: u8,
+    pub backfill: u8,
+    /// The LWLock tranche the arena's node locks were initialized with.
+    pub tranche: i32,
+}
+
+impl BuildParams {
+    /// Leader: publish the parameters into the toc.
+    ///
+    /// Publishing twice overwrites in place rather than allocating again: the estimator
+    /// reserved room for exactly one copy, and a second allocation would fail against an
+    /// estimate that is already tight.
+    ///
+    /// # Safety
+    ///
+    /// `toc` must be the parallel context's toc, live for as long as the build.
+    pub unsafe fn publish(&self, toc: *mut pg_sys::shm_toc) {
+        let existing = pg_sys::shm_toc_lookup(toc, TOC_KEY_PARAMS, true);
+        if !existing.is_null() {
+            existing.cast::<BuildParams>().write(*self);
+            return;
+        }
+        let region = pg_sys::shm_toc_allocate(toc, std::mem::size_of::<BuildParams>())
+            .cast::<BuildParams>();
+        region.write(*self);
+        pg_sys::shm_toc_insert(toc, TOC_KEY_PARAMS, region.cast());
+    }
+
+    /// Worker: the parameters the leader published.
+    ///
+    /// # Safety
+    ///
+    /// `toc` must hold parameters published by [`BuildParams::publish`].
+    pub unsafe fn read_from(toc: *mut pg_sys::shm_toc) -> BuildParams {
+        let region = pg_sys::shm_toc_lookup(toc, TOC_KEY_PARAMS, false).cast::<BuildParams>();
+        assert!(!region.is_null(), "the leader published no build parameters");
+        *region
+    }
 }
 
 /// The entry point PostgreSQL calls in each parallel worker.
@@ -248,8 +326,8 @@ mod tests {
         // inside this test.
         unsafe {
             let library = LIBRARY.as_ptr().cast_mut().cast::<std::os::raw::c_char>();
-            // The entry point does not exist yet.  PostgreSQL resolves it when a worker
-            // starts, which is why this test runs without launching any.
+            // The same entry point the cross-process test launches; no worker is started
+            // here, which is what keeps this test leader-only.
             let entry = c"hnswsq_parallel_build_main".as_ptr().cast_mut();
             let pcxt = pg_sys::CreateParallelContext(library, entry, 2);
             assert!(!pcxt.is_null(), "CreateParallelContext failed");
@@ -265,6 +343,57 @@ mod tests {
             assert_eq!(arena.chunk().total_bytes(), layout.total_bytes);
             assert!(layout.total_bytes > 0);
 
+            // pgx does not bind `PARALLEL_MAGIC`, and memory of it was wrong (the pinned
+            // value made `shm_toc_attach` return NULL, which is how this assertion earned
+            // its place).  So read it off the toc PostgreSQL actually built -- the first
+            // field of `shm_toc` is the magic -- and require the pinned constant to match
+            // it.  From here on the constant is verified, not remembered.
+            let measured = *((*pcxt).toc as *const u64);
+            assert_eq!(
+                measured, PARALLEL_MAGIC,
+                "the pinned toc magic must match the one PostgreSQL uses"
+            );
+            let attached =
+                pg_sys::shm_toc_attach(measured, pg_sys::dsm_segment_address((*pcxt).seg));
+            assert_eq!(attached, (*pcxt).toc, "the magic re-finds the toc");
+
+            // Every region is reachable by key through it, which is a worker's whole
+            // attachment story.
+            assert!(!pg_sys::shm_toc_lookup(attached, TOC_KEY_HEADER, false).is_null());
+            assert!(!pg_sys::shm_toc_lookup(attached, TOC_KEY_CHUNK, false).is_null());
+            let worker_view = SharedArena::attach(attached);
+            assert_eq!(worker_view.header().max_nodes, sizing.nodes);
+            assert_eq!(worker_view.chunk().total_bytes(), layout.total_bytes);
+
+            // ... and the build parameters round-trip, which is the contract the worker
+            // loop will read.
+            let params = BuildParams {
+                rows: 1234,
+                seed: 20240912,
+                heap_oid: 1,
+                index_oid: 2,
+                stride: stride as u32,
+                cap: cap as u32,
+                m: 8,
+                m0: 16,
+                ef_construction: 64,
+                ml: 1.0 / 8f32.ln(),
+                max_level: 7,
+                dist_type: 0,
+                precision: 0,
+                backfill: 0,
+                tranche: 0,
+            };
+            params.publish((*pcxt).toc);
+            assert_eq!(BuildParams::read_from(attached), params, "parameters survive");
+            params.publish((*pcxt).toc);
+            assert_eq!(
+                BuildParams::read_from(attached),
+                params,
+                "republishing overwrites instead of allocating again"
+            );
+
+            drop(worker_view);
             drop(arena);
             pg_sys::DestroyParallelContext(pcxt);
         }

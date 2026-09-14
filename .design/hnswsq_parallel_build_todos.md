@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5b: build parameters + verified toc magic | done | `BuildParams` round-trips; `PARALLEL_MAGIC` is measured, not remembered |
 | M3 step 5: parallel worker entry, cross-process verified | done | workers load the library, attach the leader's arena, touch the shared cursors |
 | M3 step 4i: deterministic level table | done | `levels.rs`; levels drawn up front so worker scheduling cannot change the graph |
 | M3 step 4h: two threads build one shared graph | done | `SharedGraph`; entry-cursor bug found; the whole engine runs concurrently |
@@ -1141,6 +1142,38 @@ That is the whole shared-arena stack exercised across processes: `dsm` segment, 
 `ArenaState` cursors, and the library load path.  What a worker still does *not* do is build:
 the entry point attaches, counts itself and returns.  The scan and the insert loop are next,
 and with them the first real measurement of the 1/2/4/8-worker sweep.
+
+### 3j.14 The build parameters, and a toc magic that had to be measured
+
+`BuildParams` is the contract the worker loop will read: rows, seed, heap/index oids, stride,
+cap, `m`/`m0`/`ef_construction`, `ml`/`max_level`, distance type, precision, backfill and the
+lock tranche, as `#[repr(C)]` POD with the `u64`s first and Oids as `u32` (the wire shape
+should not depend on how pgrx wraps an Oid this release).  `publish` overwrites in place on a
+second call rather than allocating again -- the estimate reserves room for exactly one copy.
+
+Two corrections came out of writing the verification for it, and both are the kind that only
+a *test* finds:
+
+* **the pinned toc magic was wrong.**  `PARALLEL_MAGIC` was remembered as `0x50477c23`;
+  `shm_toc_attach` returned NULL for it, and nothing else would have noticed, because the
+  worker path no longer needs the magic at all (PostgreSQL hands the worker the toc).  The
+  test now reads the magic off the live toc and requires the constant to match it, so it is
+  `0x50477C7C` by measurement, and the value is verified on every run rather than recalled.
+* **verification had quietly drifted away.**  An earlier round's "remove the duplicate test"
+  step deleted the only assertions checking the magic and the by-key lookups, while the doc
+  and the round report went on claiming they were verified.  Restoring them is why the wrong
+  magic surfaced now instead of at the first worker sweep.
+
+**Next: the scan**, and it is now scoped precisely.  `table_index_build_scan` is *not* bound
+because it is `static inline` in `tableam.h`, and the same is true of
+`table_parallelscan_estimate`/`initialize`, so the worker loop has to call the table AM
+directly:
+`relation->rd_tableam->parallelscan_estimate/initialize` and
+`...->index_build_range_scan(table_rel, index_rel, index_info, allow_sync, anynulls,
+is_validate, blockNum, callback, callback_state, scan)`.  `table_beginscan_parallel(Relation,
+ParallelTableScanDesc)` *is* bound, and `IndexBuildCallback`'s signature is
+`extern "C-unwind" fn(index, tid, values, isnull, tupleIsAlive, state)`.  The shared scan
+descriptor has to be allocated in the toc so every worker sees the same one.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
