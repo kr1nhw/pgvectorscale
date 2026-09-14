@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5y: 8-worker point, sweep complete | **done** | 7 of 8 launched, 23.4 s vs 35.3 s at 4; `no_incoming` 3375 (0.34%) |
 | M4 step: per-worker reporting | **done** | 4 workers: rows sum to 100000, nodes==rows, load spread 0.6% |
 | **M5 step: fall back instead of refusing** | **done** | small memory now warns and builds on the spilling path |
 | **M4 step: worker-failure path** | **done** | leader refuses to write out; index untouched; verified both ways |
@@ -2011,6 +2012,37 @@ work is not skewed by the block-range hand-out.
 22 this round, so the 128-dimensional comparison -- the one dataset that would discriminate the two
 graphs properly -- cannot be run.  Nothing in the code is waiting on it; the acceptance numbers that
 exist are all local, and the 1M comparison has been done on the local synthetic table.
+
+### 3j.40 The worker sweep, completed (1 / 2 / 4 / 8) -- and it flattens
+
+The plan asks for a 1/2/4/8-worker sweep.  All four points, 1M rows, this machine (12 cores), fresh
+index each time; the 4- and 7-worker points are both through `CREATE INDEX` so the comparison between
+them is like-for-like:
+
+| workers requested | launched | elapsed | speedup | `no_incoming` |
+|---|---|---|---|---|
+| 1 | 1 | 109.5 s (harness) | 1.00x | 0 |
+| 2 | 2 | 53.8 s (harness) | 2.03x | 353 |
+| 4 | 4 | 35.3 s (`CREATE INDEX`) | 3.10x | 1 572 |
+| 8 | **7** | 23.4 s (`CREATE INDEX`) | 4.68x | 3 375 |
+
+Two things worth naming.
+
+**Only 7 of 8 workers launched.**  PostgreSQL's worker pool has other consumers
+(`max_worker_processes`), so a request for N is a request, not a guarantee -- and the harness reports
+`launched` separately from the request for exactly this reason.  A user reading a timing should read
+the launched count with it.
+
+**Scaling flattens after 4 workers**: 4 -> 7 workers buys 1.51x on a 12-core box where the build is
+seconds long.  That is the expected shape (the insert path has a serial component -- the claim
+cursor, the watermark, and the arena's node locks -- and the runs are short enough that start-up and
+the writeout are a visible fraction), but it is the first measurement of it, and it bounds the
+"how many workers" question: past ~4 the returns are modest at this size.
+
+**`no_incoming` grows with the worker count** -- 0, 353, 1 572, 3 375 (0.34% at 7) -- roughly in
+proportion to it, which is what a race-based mechanism should look like.  Recall was measured at 4
+workers and did not suffer for it (3j.36); the 7-worker graph has not been checked, and given the
+trend that is the next thing to look at rather than assume.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
