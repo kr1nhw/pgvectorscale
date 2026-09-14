@@ -1,5 +1,50 @@
 # Parallel hnswsq build — TODO analysis
 
+## 0. Status (implementation log, newest last)
+
+**Implemented and measured** (all committed; numbers are 100k dim-128 uniform,
+pinned seed, release, same host, unless stated):
+
+| piece | state | evidence |
+|---|---|---|
+| legacy engine (exact re-prune) | unchanged, still the default | build 21.5 s, fingerprint `e4aaa8fa5d6b7f25`, `no_incoming=384` |
+| flat engine: flat slabs, ids only, policy-free | done | `flat_graph.rs`, 15 tests |
+| flat engine: search / select / plan / apply (append-shrink) | done | `flat_engine.rs`, 10 tests; build 20.9 s, fingerprint `30db11c54b7edd31`, `no_incoming=519` |
+| driver seam + temporary `hnswsq.build_engine` | done | both engines A/B in one binary; per-phase split + fingerprint in the stats line |
+| determinism | proven | each engine reproduces its fingerprint exactly across runs |
+| policy cost (append/shrink vs exact) | measured | apply +2.1 s, plan −1.35 s, net build ~0.6 s faster, recall identical here |
+| writeout bridge (flat → MemGraph → existing flush) | done, temporary | replaced by an arena-native writeout during the storage swap |
+| `arena.rs`: node locks + one-write-lock enforcement | done | 8 tests |
+| fixed capacity + spill hand-off | done | `with_limits`/`try_push_node`; end-to-end `disk_mode=false`, same fingerprint |
+| claim/publish + published watermark | done | 20 tests; readers bound-check the watermark |
+| capacity planned from the byte budget | done | `plan_capacity`; never under-counts (test) |
+| chunk layout + `Chunk` backing store | done | offset-addressed, single allocation, alignment asserted at the accessor |
+| structural gate (`check_lists`, both engines) | done | wired into the stats line; found the connectivity finding below |
+| connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
+| backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
+
+**Remaining, in order:**
+
+1. **M6 decision: `build_backfill` 0 vs 1 on 1M BIGANN** (recall sweep at ef 10..640,
+   build seconds, `no_incoming`, fingerprint).  The knob exists; the run is the work.
+2. **M3 storage swap**: point `FlatGraph`'s arrays at `Chunk` regions behind the same
+   accessors, allocate the chunk from `shm_toc`, replace `NodeLocks`'s `RwLock`s with
+   LWLock tranches.  No open design questions — `arena_layout`, `plan_capacity`,
+   `Chunk` and the watermark are all in place and tested.
+3. **M3 driver**: entry rendezvous (`initial_start_nodes_count` + the `ParallelShared`
+   condition variable), `table_index_build_scan` with a shared `ParallelTableScanDesc`,
+   `amcanbuildparallel` under `feature = "build_parallel"`, a pre-drawn level table for
+   determinism, then the worker sweep 1/2/4/8 with the relative gates above.
+4. **M4–M5**: arena-native writeout, exhaustion/error/cancel paths, per-worker stats,
+   worker-count sizing surface.
+5. **M7**: settle the surviving policy (append/shrink only, or also exact) with the 1M
+   measurement, then delete the legacy engine, the adapter and `build_engine`.
+
+**Two traps this work has already paid for**, both worth re-reading before touching the
+harness: `cargo pgrx test` installs a *debug* extension over the release one (the cycle
+scripts now refuse to run against it), and recall alone cannot see connectivity damage
+(0.52% invisible nodes looked exactly like 0.38% in every recall number).
+
 Scope: make the **in-memory** build phase of `hnswsq` use several workers, to
 close the last measured gap to pgvector hnsw.  Everything below is grounded in
 the same-host gap study (`.design/hnswsq_vs_pgvector_gap.md`), in the parallel
