@@ -312,6 +312,10 @@ fn flat_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) ->
         state.dist_fn,
     );
     let codec = &state.codec;
+    // Policy read once per insert, here rather than inside the engine: a GUC read
+    // needs a backend, and the engine is also exercised by unit tests.
+    let backfill =
+        unsafe { crate::access_method::hnswsq::options::HNSWSQ_BUILD_BACKFILL.get() } != 0;
     let FlatEngineState {
         graph,
         scratch,
@@ -328,7 +332,7 @@ fn flat_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) ->
     // append/shrink policy's cost lands.
     let t_plan = state.stats.enabled.then(std::time::Instant::now);
     let plan = plan_flat(
-        codec, dist_type, dist_fn, graph, scratch, buf, id, level, &subject, m, m0, efc,
+        codec, dist_type, dist_fn, graph, scratch, buf, id, level, &subject, m, m0, efc, backfill,
     );
     if let Some(t) = t_plan {
         state.stats.search_ns += t.elapsed().as_nanos() as u64;

@@ -221,6 +221,7 @@ pub fn select_neighbors_flat(
     buf: &mut FlatPairBuf,
     mut candidates: Vec<(f32, u32)>,
     cap: usize,
+    backfill: bool,
 ) -> Vec<u32> {
     candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     buf.clear();
@@ -229,10 +230,30 @@ pub fn select_neighbors_flat(
     }
     let dists: Vec<f32> = candidates.iter().map(|c| c.0).collect();
     let slots: Vec<usize> = (0..candidates.len()).collect();
-    occlusion_accepted(dist_fn, buf, &dists, &slots, cap)
-        .into_iter()
-        .map(|i| candidates[i].1)
-        .collect()
+    let accepted = occlusion_accepted(dist_fn, buf, &dists, &slots, cap);
+    let mut out: Vec<u32> = accepted.iter().map(|&i| candidates[i].1).collect();
+
+    // Optional closest-pruned backfill (`hnswsq.build_backfill`, default off): fill to
+    // `cap` with the pruned candidates in ascending distance order.  Measured at 100k
+    // dim-128 it costs +51% build time -- every backlink then lands on a saturated
+    // target and pays the full re-measure plus occlusion walk -- and buys +9.5 recall
+    // points at ef 40 on that dataset, plus 93 fewer invisible nodes, so the operating
+    // point on 1M BIGANN decides it rather than this dataset.
+    if backfill {
+        let mut is_accepted = vec![false; candidates.len()];
+        for &i in &accepted {
+            is_accepted[i] = true;
+        }
+        for (i, cand) in candidates.iter().enumerate() {
+            if out.len() >= cap {
+                break;
+            }
+            if !is_accepted[i] {
+                out.push(cand.1);
+            }
+        }
+    }
+    out
 }
 
 /// Selected neighbours for one layer, produced by [`plan_flat`] and consumed by
@@ -293,6 +314,7 @@ pub fn plan_flat(
     m: usize,
     m0: usize,
     ef_construction: usize,
+    backfill: bool,
 ) -> Vec<LayerPlanFlat> {
     let mut plan: Vec<LayerPlanFlat> = Vec::new();
     let Some(ep) = g.entry() else {
@@ -331,7 +353,7 @@ pub fn plan_flat(
         let cap = if layer == 0 { m0 } else { m };
         plan.push(LayerPlanFlat {
             layer,
-            ids: select_neighbors_flat(dist_fn, codec, g, buf, candidates, cap),
+            ids: select_neighbors_flat(dist_fn, codec, g, buf, candidates, cap, backfill),
         });
     }
     plan
@@ -647,7 +669,7 @@ mod tests {
             (distance_l2(&subject, &[3.0, 0.0]), 3),
         ];
         let mut buf = FlatPairBuf::new(2);
-        let selected = select_neighbors_flat(distance_l2, &codec, &g, &mut buf, cands, 4);
+        let selected = select_neighbors_flat(distance_l2, &codec, &g, &mut buf, cands, 4, false);
         assert_eq!(
             selected,
             vec![1],
@@ -673,7 +695,7 @@ mod tests {
             (distance_l2(&subject, &[0.0, 1.0]), 3),
         ];
         let mut buf = FlatPairBuf::new(2);
-        let selected = select_neighbors_flat(distance_l2, &codec, &g, &mut buf, cands, 4);
+        let selected = select_neighbors_flat(distance_l2, &codec, &g, &mut buf, cands, 4, false);
         assert_eq!(selected.len(), 3, "mutually distant candidates all survive");
         assert_eq!(selected[0], 1, "ascending by (distance, id)");
     }

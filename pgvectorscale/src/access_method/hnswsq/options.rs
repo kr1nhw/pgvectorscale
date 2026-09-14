@@ -149,6 +149,19 @@ pub static HNSWSQ_BACKLINK_MODE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>
 /// `.design/hnswsq_parallel_build_todos.md`).
 pub static HNSWSQ_BUILD_ENGINE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
 
+/// `hnswsq.build_backfill`: fill a node's own neighbour list to capacity with the
+/// closest *pruned* candidates (the legacy engine's behaviour) instead of keeping
+/// only the occlusion heuristic's output.
+///
+/// 0 (default) = heuristic only, which is the decided flat-engine policy; 1 = with
+/// backfill.  Measured at 100k dim-128: backfill costs +51% build time (apply 2.2x,
+/// because every backlink then lands on a saturated target and pays the full
+/// re-measure plus occlusion walk) and buys +9.5 recall points at ef 40 on that hard
+/// dataset, plus 93 fewer nodes without an incoming edge.  Temporary knob so the 1M
+/// BIGANN operating point can decide it without code churn; it goes away with the
+/// engine consolidation.
+pub static HNSWSQ_BUILD_BACKFILL: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
+
 /// `hnswsq.build_workers`: worker threads used for parallel backlink pruning
 /// during an in-memory build (0 = auto).  Purely in-process parallelism over
 /// the in-memory graph; the transactional insert path is unaffected.
@@ -235,6 +248,26 @@ pub unsafe fn init() {
             )
         },
         &HNSWSQ_BUILD_ENGINE,
+        0,
+        1,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_backfill".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Fill own neighbour lists with the closest pruned candidates (0 = heuristic only)".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Development knob: backfill trades build time for recall; measured at 100k dim-128 it costs ~51% build time and gains ~9.5 recall points at ef 40."
+                    .as_pg_cstr(),
+            )
+        },
+        &HNSWSQ_BUILD_BACKFILL,
         0,
         1,
         pgrx::GucContext::Userset,
