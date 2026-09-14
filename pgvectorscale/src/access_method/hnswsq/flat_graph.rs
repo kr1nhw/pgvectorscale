@@ -46,7 +46,7 @@ pub struct FlatGraph {
     vectors: Vec<u8>,
     /// When set, node storage lives in this chunk (the arena shape) instead of the
     /// `Vec`s, and `layout` describes its regions.  Being converted region by region:
-    /// `vectors` is the first (the hottest read path), the rest follow, at which point
+    /// `vectors`, `ids` and `lens` are in the chunk, the rest follow, at which point
     /// the `Vec` fields disappear.
     chunk: Option<Chunk>,
     layout: ArenaLayout,
@@ -57,6 +57,10 @@ pub struct FlatGraph {
     ids: Vec<u32>,
     /// One length per slab.
     lens: Vec<u16>,
+    /// Slabs handed out so far -- the authoritative cursor, in both modes.  It is
+    /// not `lens.len()`: with the lens region in the chunk the `Vec` is empty, and
+    /// even in grow mode the length store must not double as a cursor.
+    slabs_used: usize,
     entry: Option<u32>,
     entry_level: usize,
     /// Fixed budgets for the arena: `usize::MAX` means "grow like a `Vec`" (the
@@ -91,6 +95,7 @@ impl FlatGraph {
             slab_off: Vec::new(),
             ids: Vec::new(),
             lens: Vec::new(),
+            slabs_used: 0,
             entry: None,
             entry_level: 0,
             max_nodes: usize::MAX,
@@ -116,8 +121,9 @@ impl FlatGraph {
         g.tids.reserve_exact(max_nodes);
         g.clamped.reserve_exact(max_nodes);
         g.slab_off.reserve_exact(max_nodes);
-        g.lens.reserve_exact(max_slabs);
-        g.ids.reserve_exact(max_slabs * cap);
+        // `ids` and `lens` are chunk regions now, so no `Vec` capacity is reserved
+        // for them -- that was up to `max_slabs * cap * 4` bytes of dead allocation.
+        g.slabs_used = 0;
         g.published_flags.reserve_exact(max_nodes);
         g
     }
@@ -136,7 +142,7 @@ impl FlatGraph {
     /// exhausted — the driver then spills, exactly as for `try_push_node`.
     pub fn claim_slot(&mut self, level: u8) -> Option<u32> {
         let layers = level as usize + 1;
-        if self.len() >= self.max_nodes || self.lens.len() + layers > self.max_slabs {
+        if self.len() >= self.max_nodes || self.slabs_used + layers > self.max_slabs {
             return None;
         }
         let id = self.len() as u32;
@@ -146,10 +152,14 @@ impl FlatGraph {
         if self.chunk.is_none() {
             self.vectors.resize(self.vectors.len() + self.stride, 0);
         }
-        self.slab_off.push(self.lens.len() as u32);
-        self.lens.resize(self.lens.len() + layers, 0);
+        self.slab_off.push(self.slabs_used as u32);
+        self.slabs_used += layers;
         if self.chunk.is_none() {
-            self.ids.resize(self.lens.len() * self.cap, 0);
+            // Grow mode only: `lens`/`ids` are the storage.  They are kept in
+            // lockstep with the cursor, filled with zero lengths exactly like the
+            // chunk's zeroed region, so a claimed-but-unwritten slab reads empty.
+            self.lens.resize(self.slabs_used, 0);
+            self.ids.resize(self.slabs_used * self.cap, 0);
         }
         self.published_flags.push(false);
         Some(id)
@@ -191,7 +201,7 @@ impl FlatGraph {
         encoded: &[u8],
     ) -> bool {
         let layers = level as usize + 1;
-        if self.len() >= self.max_nodes || self.lens.len() + layers > self.max_slabs {
+        if self.len() >= self.max_nodes || self.slabs_used + layers > self.max_slabs {
             return false;
         }
         self.push_node(level, tid, clamped, encoded);
@@ -200,12 +210,12 @@ impl FlatGraph {
 
     /// Whether either budget is exhausted (always `false` in grow mode).
     pub fn is_full(&self) -> bool {
-        self.len() >= self.max_nodes || self.lens.len() >= self.max_slabs
+        self.len() >= self.max_nodes || self.slabs_used >= self.max_slabs
     }
 
     /// `(slabs used, slab budget)`.
     pub fn slab_usage(&self) -> (usize, usize) {
-        (self.lens.len(), self.max_slabs)
+        (self.slabs_used, self.max_slabs)
     }
 
     /// `(nodes used, node budget)`.
@@ -283,9 +293,10 @@ impl FlatGraph {
             }
             None => self.ids[base..base + n].copy_from_slice(ids),
         }
-        // `lens` is still the length store *and* the slab cursor (`slab_base` counts
-        // slabs through it), so it stays a `Vec` until its own region moves.
-        self.lens[slab] = n as u16;
+        match self.chunk.as_mut() {
+            Some(chunk) => chunk.region_u16_mut(self.layout.lens)[slab] = n as u16,
+            None => self.lens[slab] = n as u16,
+        }
     }
 
     /// Borrowed view of a node's layer-`layer` list (valid prefix only).
@@ -294,11 +305,14 @@ impl FlatGraph {
         match self.slab(id, layer) {
             Some(slab) => {
                 let base = slab * self.cap;
-                let n = self.lens[slab] as usize;
-                match &self.chunk {
-                    Some(chunk) => &chunk.region_u32(self.layout.ids)[base..base + n],
-                    None => &self.ids[base..base + n],
-                }
+                let (ids, n) = match &self.chunk {
+                    Some(chunk) => (
+                        chunk.region_u32(self.layout.ids),
+                        chunk.region_u16(self.layout.lens)[slab] as usize,
+                    ),
+                    None => (&self.ids[..], self.lens[slab] as usize),
+                };
+                &ids[base..base + n]
             }
             None => &[],
         }
@@ -368,7 +382,7 @@ impl FlatGraph {
         let base = *self.slab_off.get(id as usize)? as usize;
         // A node with `level + 1` layers must own that many slabs.
         let layers = self.levels[id as usize] as usize + 1;
-        (base + layers <= self.lens.len()).then_some(base)
+        (base + layers <= self.slabs_used).then_some(base)
     }
 }
 
@@ -706,26 +720,42 @@ mod tests {
         assert_eq!(g.vector(1), &b);
         assert!(g.vectors.is_empty(), "no Vec copy alongside the chunk");
 
-        // ... and a claimed-but-unpublished node reads as zeros from the chunk.
         // Slab storage: written and read back through the chunk's ids region.
         g.set_list(0, 0, &[7, 8, 9]);
         assert_eq!(g.neighbors(0, 0), &[7, 8, 9]);
-        assert!(g.ids.is_empty(), "no Vec copy of the slab storage either");
+        assert!(
+            g.ids.is_empty() && g.lens.is_empty(),
+            "no Vec copy of the ids or the lens either"
+        );
         g.set_list(0, 0, &[5]);
-        assert_eq!(g.neighbors(0, 0), &[5], "shortest list wins, still in the chunk");
+        assert_eq!(g.neighbors(0, 0), &[5], "a shorter list still reads back");
+        {
+            let chunk = g.chunk.as_ref().unwrap();
+            let lens = chunk.region_u16(g.layout.lens);
+            assert_eq!(lens[0], 1, "the length lives in the chunk's lens region");
+            assert_eq!(lens[1], 0, "a slab nothing was written into reads empty");
+        }
+        assert_eq!(g.slab_usage(), (2, 9), "one slab per level-0 push");
 
-        let claimed = g.claim_slot(0).expect("room");
+        // The cursor is `slabs_used`, not `lens.len()` -- which is now 0 here.
+        let claimed = g.claim_slot(2).expect("room for a 3-layer node");
+        assert_eq!(g.slab_usage(), (5, 9), "a 3-layer claim reserves 3 slabs");
+        assert_eq!(g.slab_base(claimed), Some(2));
+        // Claimed-but-unwritten storage reads as zeros from the zeroed chunk.
         assert_eq!(g.vector(claimed), &[0u8; 8]);
         g.publish(claimed, tid(3), false, &[3u8; 8]);
         assert_eq!(g.vector(claimed), &[3u8; 8]);
         assert_eq!(g.watermark(), 3);
 
-        // The grow-mode graph still uses its Vec.
+        // The grow-mode graph still uses its Vecs, with the same cursor semantics.
         let mut g = FlatGraph::new(stride, cap);
         assert!(g.chunk.is_none());
-        g.push_node(0, tid(1), false, &a);
+        g.push_node(1, tid(1), false, &a);
         assert_eq!(g.vector(0), &a);
         assert!(!g.vectors.is_empty());
+        assert_eq!(g.slab_usage(), (2, usize::MAX), "grow mode counts slabs too");
+        assert_eq!(g.lens.len(), 2, "and keeps the length store in lockstep");
+        assert_eq!(g.slab_base(0), Some(0));
     }
 
     #[test]

@@ -22,6 +22,8 @@ pinned seed, release, same host, unless stated):
 | structural gate (`check_lists`, both engines) | done | wired into the stats line; found the connectivity finding below |
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
+| M3 storage swap (region by region) | in progress | `vectors` ✓, `ids` ✓, `lens` ✓ + `slabs_used` cursor; fingerprint gate bit-identical after each (§3j) |
+| suite has 2 pre-existing red IVF tests | not ours | `ivf::options::tests::pg_test_ivf_options_{defaults,custom}`: no default opclass exists (§3j) |
 
 **Remaining, in order:**
 
@@ -701,6 +703,46 @@ routes were considered:
    `flat_graph.rs`);
 3. run `cargo pgrx test pg18 flat_` (25 tests) and the two fingerprint builds;
 4. only then allocate the chunk from `shm_toc` and swap `NodeLocks` for LWLock tranches.
+
+## 3j. Storage swap step 2, and two pre-existing red tests
+
+The chunk conversion goes in one region at a time, each step gated on the 26
+flat/arena unit tests plus the 100k in-memory fingerprint on `t100kd128u`
+(`30db11c54b7edd31`, `no_incoming=519`, `reachable=99477`; recipe in §3c).  After
+each step the fingerprint must be **bit-identical** -- the swap changes where the
+bytes live, never which graph is built.
+
+| step | region moved to `Chunk` | gate |
+|---|---|---|
+| 1 | `vectors` (encoded node vectors) | identical, 22.84 s |
+| 2 | `ids` (`slabs * cap` neighbour ids) | identical |
+| 3 | `lens` (slab lengths, + new `slabs_used` cursor) | identical |
+
+Two consequences worth naming:
+
+* `lens` could not simply move: it was both the length store *and* the slab
+  cursor that `slab_base` counted through, so `slab_usage`/`is_full`/`try_push_node`
+  all read a `Vec` length that is 0 in chunk mode.  A `slabs_used: usize` field is
+  now the single authority in both modes, with the `Vec` kept in lockstep only
+  while grow mode still owns the storage.  The `ids`/`lens` `Vec` reserves in
+  `with_limits` are gone, saving up to `max_slabs * cap * 4` bytes of dead
+  allocation.
+* the remaining `Vec` fields (`levels`, `tids`, `clamped`, `published_flags`,
+  `slab_off`) each need the same treatment, and `len()` is `levels.len()` today,
+  so `levels` introduces the `nodes_used` cursor alongside `slabs_used`.
+
+**Suite state:** `cargo pgrx test pg18` reports 247 passed, 10 ignored, and **2
+failures that are pre-existing and unrelated**:
+`access_method::ivf::options::tests::pg_test_ivf_options_defaults` and
+`..._custom`.  Both run `CREATE INDEX ... USING ivf(encoding)` with no operator
+class, which fails with `data type vector has no default operator class for
+access method "ivf"`; the extension declares `vector_{cosine,l2,ip}_ops` for
+`ivf` without `DEFAULT` (`src/access_method/ivf/mod.rs:133-147`) and no SQL
+script contains `USING ivf` at all.  They fail identically in isolation, on a
+file and opclass set this work never touches.  Until someone declares a default
+opclass or gives the tests an explicit one, hnswsq changes are judged by
+`cargo pgrx test pg18 access_method::hnswsq` plus the fingerprint gate, not by
+the suite's exit code.
 
 ## 4. Test plan and gates
 
