@@ -340,4 +340,251 @@ pub mod tests {
         .unwrap_or(0.0);
         assert!(recall >= 0.9, "dim-2 dense packing recall@10 = {}", recall);
     }
+
+    // ---------------- gate 4: vacuum lifecycle (raw client) ----------------
+
+    #[pg_test]
+    /// Mock to bring up the test database for the raw-client vacuum tests.
+    fn hnswsq2_vacuum_mock_fn() -> spi::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn vacuum_lifecycle_scaffold(layout: &str) {
+        // Raw-client test (VACUUM cannot run inside the pg_test transaction).
+        // Bring up the test database FIRST.
+        pgrx_tests::run_test(
+            "hnswsq2_vacuum_mock_fn",
+            None,
+            crate::pg_test::postgresql_conf_options(),
+        )
+        .unwrap();
+        // Session-scoped advisory lock on a dedicated connection (a key the
+        // old engine's suite does not use): serializes this scaffold against
+        // pg_test transactions across backends.
+        let (mut guard_client, _) = pgrx_tests::client().unwrap();
+        guard_client
+            .execute("SELECT pg_advisory_lock(5205217837881163778)", &[])
+            .unwrap();
+
+        let (rows, _q) = gen_clustered(12, 50, 16, 0.05, 9999);
+        let values: Vec<String> = rows
+            .iter()
+            .map(|v| format!("('{}')", vec_literal(v)))
+            .collect();
+
+        let (mut client, _) = pgrx_tests::client().unwrap();
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS hs_vac2 CASCADE;
+                 CREATE TABLE hs_vac2(id serial primary key, embedding vector(16));
+                 INSERT INTO hs_vac2(embedding) VALUES {};
+                 CREATE INDEX hs_vac2_idx ON hs_vac2 USING hnswsq2 (embedding vector_l2_ops)
+                   WITH (storage_layout = {});
+                 SET enable_seqscan = off;
+                 SET hnswsq2.ef_search = 500;",
+                values.join(","),
+                layout
+            ))
+            .unwrap();
+
+        // Sanity: the 300-row sweep works before any delete.
+        let probe = format!(
+            "WITH cte AS (SELECT id FROM hs_vac2 ORDER BY embedding <-> '{}' LIMIT 300)
+             SELECT count(*) FROM cte",
+            vec_literal(&rows[0])
+        );
+        let cnt: i64 = client.query_one(&probe, &[]).unwrap().get(0);
+        assert_eq!(cnt, 300, "initial 300-row sweep ({})", layout);
+
+        // Delete half the rows; deleted rows must stop appearing.
+        client
+            .execute("DELETE FROM hs_vac2 WHERE id % 2 = 0", &[])
+            .unwrap();
+        let top: i32 = client
+            .query_one(
+                &format!(
+                    "SELECT id FROM hs_vac2 ORDER BY embedding <-> '{}' LIMIT 1",
+                    vec_literal(&rows[1]) // row id 2 was deleted
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(top % 2, 1, "deleted row must not be returned");
+        client.close().unwrap();
+
+        // VACUUM (fresh connection; VACUUM cannot run in a txn block).
+        let (mut client, _) = pgrx_tests::client().unwrap();
+        client.execute("VACUUM hs_vac2", &[]).unwrap();
+        client.execute("SET enable_seqscan = off", &[]).unwrap();
+        client.execute("SET hnswsq2.ef_search = 500", &[]).unwrap();
+
+        let cnt: i64 = client
+            .query_one(
+                &format!(
+                    "WITH cte AS (SELECT id FROM hs_vac2 ORDER BY embedding <-> '{}' LIMIT 300)
+                     SELECT count(*) FROM cte",
+                    vec_literal(&rows[0])
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        let diag: String = client
+            .query_one("SELECT hnswsq2_diag('hs_vac2_idx')", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            cnt, 300,
+            "300 live rows after vacuum ({}) diag={}",
+            layout, diag
+        );
+        let relpages1: i32 = client
+            .query_one(
+                "SELECT relpages FROM pg_class WHERE relname = 'hs_vac2_idx'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+
+        // Reload the deleted half: tuples freed by vacuum must be reused, so
+        // the index size stays ~stable.
+        let values2: Vec<String> = rows
+            .iter()
+            .take(300)
+            .map(|v| format!("('{}')", vec_literal(v)))
+            .collect();
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO hs_vac2(embedding) VALUES {}",
+                    values2.join(",")
+                ),
+                &[],
+            )
+            .unwrap();
+        client.close().unwrap();
+
+        let (mut client, _) = pgrx_tests::client().unwrap();
+        client.execute("VACUUM hs_vac2", &[]).unwrap();
+        client.execute("SET enable_seqscan = off", &[]).unwrap();
+        client.execute("SET hnswsq2.ef_search = 500", &[]).unwrap();
+        let relpages2: i32 = client
+            .query_one(
+                "SELECT relpages FROM pg_class WHERE relname = 'hs_vac2_idx'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert!(
+            relpages2 <= relpages1 + 16,
+            "page reuse failed: relpages grew {} -> {} ({})",
+            relpages1,
+            relpages2,
+            layout
+        );
+        client.close().unwrap();
+        guard_client
+            .execute("SELECT pg_advisory_unlock(5205217837881163778)", &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn hnswsq2_vacuum_lifecycle_plain() {
+        vacuum_lifecycle_scaffold("plain");
+    }
+
+    #[test]
+    fn hnswsq2_vacuum_lifecycle_ieeefp8() {
+        vacuum_lifecycle_scaffold("ieeefp8");
+    }
+
+    #[cfg(test)]
+    fn full_delete_scaffold() {
+        // Delete EVERYTHING (the entry point included) and vacuum: the index
+        // must survive, answer empty, and accept new inserts afterwards.
+        pgrx_tests::run_test(
+            "hnswsq2_vacuum_mock_fn",
+            None,
+            crate::pg_test::postgresql_conf_options(),
+        )
+        .unwrap();
+        let (mut guard_client, _) = pgrx_tests::client().unwrap();
+        guard_client
+            .execute("SELECT pg_advisory_lock(5205217837881163778)", &[])
+            .unwrap();
+
+        let (rows, _q) = gen_clustered(4, 25, 16, 0.05, 5555);
+        let values: Vec<String> = rows
+            .iter()
+            .map(|v| format!("('{}')", vec_literal(v)))
+            .collect();
+        let (mut client, _) = pgrx_tests::client().unwrap();
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS hs_del CASCADE;
+                 CREATE TABLE hs_del(id serial primary key, embedding vector(16));
+                 INSERT INTO hs_del(embedding) VALUES {};
+                 CREATE INDEX hs_del_idx ON hs_del USING hnswsq2 (embedding vector_l2_ops);
+                 DELETE FROM hs_del;",
+                values.join(",")
+            ))
+            .unwrap();
+        client.close().unwrap();
+
+        let (mut client, _) = pgrx_tests::client().unwrap();
+        client.execute("VACUUM hs_del", &[]).unwrap();
+        client.execute("SET enable_seqscan = off", &[]).unwrap();
+        client.execute("SET hnswsq2.ef_search = 40", &[]).unwrap();
+        let cnt: i64 = client
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM (SELECT id FROM hs_del \
+                     ORDER BY embedding <-> '{}' LIMIT 40) t",
+                    vec_literal(&rows[0])
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(cnt, 0, "empty after full delete + vacuum");
+        // Re-insert and verify the index works again (fresh entry point).
+        let values2: Vec<String> = rows
+            .iter()
+            .map(|v| format!("('{}')", vec_literal(v)))
+            .collect();
+        client
+            .execute(
+                &format!("INSERT INTO hs_del(embedding) VALUES {}", values2.join(",")),
+                &[],
+            )
+            .unwrap();
+        let diag: String = client
+            .query_one("SELECT hnswsq2_diag('hs_del_idx')", &[])
+            .unwrap()
+            .get(0);
+        eprintln!("hnswsq2 full-delete diag after reload: {}", diag);
+        let got: i64 = client
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM (SELECT id FROM hs_del \
+                     ORDER BY embedding <-> '{}' LIMIT 1) t",
+                    vec_literal(&rows[0])
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(got, 1, "index serves after reload");
+        client.close().unwrap();
+        guard_client
+            .execute("SELECT pg_advisory_unlock(5205217837881163778)", &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn hnswsq2_full_delete_vacuum_reload() {
+        full_delete_scaffold();
+    }
 }
