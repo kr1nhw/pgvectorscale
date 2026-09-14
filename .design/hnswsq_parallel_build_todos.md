@@ -311,6 +311,36 @@ if the arena costs more than ~5% single-threaded, fix the layout before adding
 concurrency (the arena also removes the per-node `Vec` allocations that the gap
 study flagged as build CPU).
 
+## 3b. M1/M2 measurement record (100k dim-128 uniform, pinned seed, release)
+
+Both engines are selectable with `hnswsq.build_engine` and now report a per-phase
+split plus a stable graph fingerprint under `hnswsq.build_stats`, so the policy cost
+is attributable and determinism is checkable directly rather than by inference:
+
+| engine | run | build | plan (beam search + selection) | apply (own lists + backlinks) | fingerprint |
+|---|---|---|---|---|---|
+| legacy (0) | 1 | 21.50 s | 13 230 ms | 5 807 ms | `e4aaa8fa5d6b7f25` |
+| legacy (0) | 2 | 21.52 s | 13 244 ms | 5 816 ms | `e4aaa8fa5d6b7f25` |
+| flat (1) | 1 | 20.90 s | 11 879 ms | 7 897 ms | `30db11c54b7edd31` |
+| flat (1) | 2 | 20.83 s | 11 842 ms | 7 878 ms | `30db11c54b7edd31` |
+
+Reading:
+
+* **determinism proven directly** — each engine reproduces its fingerprint exactly
+  across runs; the two fingerprints differ, which is the point of the switch
+  (append/shrink vs exact re-prune);
+* **the policy cost is +2.1 s of apply time** (7.9 s vs 5.8 s): on a saturated list
+  the flat engine re-measures `d(target, member)` for every member instead of
+  reading cached `list_dists`/`list_masks`;
+* **the flat plan half is 1.35 s cheaper** (11.9 s vs 13.2 s): selection writes ids
+  only (no dists, no mask) and does not backfill, so lists are shorter while the
+  graph is young;
+* **net: flat is ~0.6 s faster** (20.9 s vs 21.5 s) at identical recall
+  (ef 10/40/160/640 = 0.0000 / 0.2000 / 0.2000 / 0.5000 on this dataset).
+
+Caveat for M6: this dataset is hard (recall 0.2-0.5), so it cannot separate the two
+policies' *quality*; the 1M BIGANN sweep is the gate for that.
+
 ## 4. Test plan and gates
 
 * **Unit:** arena allocation/exhaustion/margin, `Rel<T>` round-trip, lock-order
