@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5: parallel worker entry, cross-process verified | done | workers load the library, attach the leader's arena, touch the shared cursors |
 | M3 step 4i: deterministic level table | done | `levels.rs`; levels drawn up front so worker scheduling cannot change the graph |
 | M3 step 4h: two threads build one shared graph | done | `SharedGraph`; entry-cursor bug found; the whole engine runs concurrently |
 | M3 step 4g: engine runs behind `Locking` | done | `apply_flat` takes `Locking::{SoleWriter, Locks}`; same heuristic either way |
@@ -1111,6 +1112,35 @@ were mine:
 The lesson worth carrying to the rest of the driver: PostgreSQL's own accounting is only
 knowable by measuring against a real context, and when an estimate is involved, "it fits"
 should be an assertion rather than an arithmetic belief.
+
+### 3j.13 Cross-process: worker processes attach the leader's arena
+
+The question no thread-based test could answer -- does a worker in *another process*
+really see the leader's arena -- is now answered by a real parallel context:
+`CreateParallelContext` -> `estimate_arena` -> `leader_setup` -> `LaunchParallelWorkers` ->
+`WaitForParallelWorkersToFinish`, with two actual worker processes that load the extension,
+enter `hnswsq_parallel_build_main`, attach the arena through the toc and touch the shared
+cursors.  The assertions are the ones that matter: the leader's `workers_entered()` equals
+PostgreSQL's `nworkers_launched`, and `active_workers()` is back to zero afterwards.
+
+Two contract mistakes were found by running it, both of which guessing had gotten wrong:
+
+* **the entry point's signature is `(dsm_segment *seg, shm_toc *toc)`**, not `(Datum)`.
+  PostgreSQL attaches the segment itself and hands the worker both objects, so the first
+  version -- taking a `Datum` and calling `dsm_attach` on it -- was treating a pointer as a
+  handle and died with "could not attach the build segment".  A useful side effect: the
+  worker never needs `PARALLEL_MAGIC`, since it is *given* the toc.  The constant and its
+  verification stay for anything that has to re-find the toc (the writeout, say).
+* **the library name PostgreSQL loads is versioned.**  pgrx installs
+  `vectorscale-0.9.0.dylib`, which is what the extension's `module_pathname` points at, so
+  passing the bare name to `CreateParallelContext` launched workers that died with
+  `could not access file "vectorscale": No such file or directory`.  It is now derived
+  (`concat!("vectorscale-", env!("CARGO_PKG_VERSION"))`) rather than hardcoded.
+
+That is the whole shared-arena stack exercised across processes: `dsm` segment, toc by key,
+`ArenaState` cursors, and the library load path.  What a worker still does *not* do is build:
+the entry point attaches, counts itself and returns.  The scan and the insert loop are next,
+and with them the first real measurement of the 1/2/4/8-worker sweep.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

@@ -294,6 +294,9 @@ pub struct ArenaState {
     start_nodes: AtomicU64,
     /// Workers still running; the leader waits for this to reach zero.
     active_workers: AtomicU32,
+    /// Workers that have ever entered the build.  Monotonic, unlike `active_workers`, so
+    /// the leader can tell "two workers ran" from "two workers are running".
+    workers_entered: AtomicU32,
     /// Set by any participant that has to abort; the leader re-raises it, because
     /// PostgreSQL will not let a worker change the leader's control flow.
     failed: AtomicU32,
@@ -317,6 +320,7 @@ impl ArenaState {
             entry_level: AtomicU32::new(0),
             start_nodes: AtomicU64::new(0),
             active_workers: AtomicU32::new(0),
+            workers_entered: AtomicU32::new(0),
             failed: AtomicU32::new(0),
         }
     }
@@ -423,6 +427,17 @@ impl ArenaState {
     #[inline]
     pub fn active_workers(&self) -> u32 {
         self.active_workers.load(Ordering::Acquire)
+    }
+
+    /// Count a worker entering the build, and return how many have so far.
+    #[inline]
+    pub fn worker_entered(&self) -> u32 {
+        self.workers_entered.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    #[inline]
+    pub fn workers_entered(&self) -> u32 {
+        self.workers_entered.load(Ordering::Acquire)
     }
 
     /// Record a failure.  Workers cannot longjmp into the leader, so they set this and

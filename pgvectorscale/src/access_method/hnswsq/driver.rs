@@ -15,6 +15,7 @@
 //! Everything here is leader-side and therefore testable without launching a worker.
 
 use pgrx::pg_sys;
+use pgrx::pg_guard;
 
 use super::arena::{ArenaLayout, SharedArena, TOC_KEY_CHUNK, TOC_KEY_HEADER};
 use super::flat_graph::{plan_capacity, ArenaSizing};
@@ -26,6 +27,16 @@ use super::flat_graph::{plan_capacity, ArenaSizing};
 /// against a real context instead: `shm_toc_attach(PARALLEL_MAGIC, ...)` has to return
 /// exactly the pointer `InitializeParallelDSM` put in `pcxt->toc`.
 pub const PARALLEL_MAGIC: u64 = 0x50477c23;
+
+/// The library PostgreSQL must load in a worker to find the entry point.
+///
+/// Derived from the crate version rather than hardcoded: pgrx installs the shared library
+/// under a *versioned* name (`vectorscale-0.9.0.dylib`), which is also what the extension's
+/// `module_pathname` points at, so the unversioned name is not loadable.  The first
+/// cross-process test found this the direct way -- workers launched and died with
+/// `could not access file "vectorscale": No such file or directory` -- which is a good
+/// argument for deriving it.
+const LIBRARY: &str = concat!("vectorscale-", env!("CARGO_PKG_VERSION"), "\0");
 
 /// The arena shape a build with this byte budget will ask for, from the same
 /// `plan_capacity` the single-builder path uses -- so a parallel build cannot quietly run
@@ -113,20 +124,50 @@ pub unsafe fn leader_setup(
     (arena, layout)
 }
 
-/// Worker: find the arena in the segment PostgreSQL handed us.
+/// Worker: the arena, from the toc PostgreSQL hands the entry point.
+///
+/// The signature is the whole lesson here: PostgreSQL's `parallel_worker_main_type` is
+/// `(dsm_segment *seg, shm_toc *toc)`, i.e. the worker is given the segment **already
+/// attached** and the toc itself.  The first version of this took a `Datum` and called
+/// `dsm_attach` on it -- treating a pointer as a handle -- which failed in the worker with
+/// "could not attach the build segment"; reading the contract instead of guessing removed
+/// both the attach and the need to re-derive the toc's magic worker-side.
 ///
 /// # Safety
 ///
-/// `dsm_handle` must be the `main_arg` PostgreSQL passed to the extension's parallel entry
-/// point -- a handle to the leader's segment -- and that segment must hold an arena
-/// allocated by [`leader_setup`].
-pub unsafe fn worker_attach(dsm_handle: pg_sys::Datum) -> SharedArena {
-    // `main_arg` carries the handle as a `Datum`, i.e. as an integer.
-    let seg = pg_sys::dsm_attach(dsm_handle.value() as pg_sys::dsm_handle);
-    assert!(!seg.is_null(), "worker could not attach the build segment");
-    let toc = pg_sys::shm_toc_attach(PARALLEL_MAGIC, pg_sys::dsm_segment_address(seg));
-    assert!(!toc.is_null(), "no parallel toc in the build segment");
+/// `toc` must be the toc PostgreSQL passed to [`hnswsq_parallel_build_main`], holding an
+/// arena allocated by [`leader_setup`].
+pub unsafe fn worker_attach(toc: *mut pg_sys::shm_toc) -> SharedArena {
+    assert!(!toc.is_null(), "no toc was handed to the worker");
     SharedArena::attach(toc)
+}
+
+/// The entry point PostgreSQL calls in each parallel worker.
+///
+/// `ParallelWorkerMain` has already attached the segment, restored the GUCs and the
+/// transaction snapshot, and passes the dsm handle through, so all this has to do is find
+/// the arena and build into it.  It is `#[no_mangle]` because PostgreSQL resolves it by
+/// *name* out of the library -- the name the leader passed to `CreateParallelContext`.
+///
+/// # Safety
+///
+/// Called by PostgreSQL only, with the segment it already attached and the toc it built.
+#[pg_guard]
+#[no_mangle]
+pub unsafe extern "C-unwind" fn hnswsq_parallel_build_main(
+    _seg: *mut pg_sys::dsm_segment,
+    toc: *mut pg_sys::shm_toc,
+) {
+    let arena = worker_attach(toc);
+    arena.state().worker_entered();
+    arena.state().worker_started();
+
+    // The build loop goes here: a shared scan, `claim_slot`, search/plan/apply with
+    // `Locking::Locks`, then `publish`.  Until it lands, a worker's whole job is to prove
+    // it can reach the leader's arena from its own process -- which is the thing no
+    // thread-based test could establish.
+
+    arena.state().worker_finished();
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -150,6 +191,51 @@ mod tests {
     // small margin (`CHUNK_MARGIN`).  Both are over-reservations: shared memory reserved
     // and unused costs kilobytes, while an under-estimate is a hard error.
     #[pgrx::pg_test]
+    fn workers_attach_the_leader_arena_across_processes() {
+        // The end-to-end plumbing without the build loop: a real parallel context, real
+        // worker *processes*, each attaching the arena by key and touching the shared
+        // cursors.  Everything thread-based so far could only prove the protocol; this is
+        // where "does a worker in another process actually see the leader's arena" gets
+        // answered.
+        let (stride, cap) = (8usize, 4usize);
+        let sizing = plan(stride, cap, 1 << 20);
+        let nworkers = 2;
+        // SAFETY: leader-side; the context is launched, waited for and destroyed here.
+        unsafe {
+            let pcxt = pg_sys::CreateParallelContext(
+                LIBRARY.as_ptr().cast_mut().cast::<std::os::raw::c_char>(),
+                // Resolved by name in the worker: this is the first test that requires the
+                // entry point to exist.
+                c"hnswsq_parallel_build_main".as_ptr().cast_mut(),
+                nworkers,
+            );
+            estimate_arena(pcxt, stride, cap, sizing);
+            let (arena, _layout) = leader_setup(pcxt, stride, cap, sizing, 0);
+            assert_eq!(arena.state().workers_entered(), 0);
+
+            pg_sys::LaunchParallelWorkers(pcxt);
+            pg_sys::WaitForParallelWorkersToFinish(pcxt);
+
+            let launched = (*pcxt).nworkers_launched;
+            assert!(launched > 0, "PostgreSQL launched no workers");
+            assert_eq!(
+                arena.state().workers_entered(),
+                launched as u32,
+                "every launched worker reached the leader's arena in its own process"
+            );
+            assert_eq!(
+                arena.state().active_workers(),
+                0,
+                "and every one of them finished"
+            );
+            assert!(!arena.state().failed());
+
+            drop(arena);
+            pg_sys::DestroyParallelContext(pcxt);
+        }
+    }
+
+    #[pgrx::pg_test]
     fn the_leader_can_size_and_allocate_the_arena() {
         // The leader half of the driver without launching a worker:
         // estimate -> InitializeParallelDSM -> allocate the arena in the context's toc
@@ -161,7 +247,7 @@ mod tests {
         // SAFETY: leader-side and single-threaded; the context is created and destroyed
         // inside this test.
         unsafe {
-            let library = c"vectorscale".as_ptr().cast_mut();
+            let library = LIBRARY.as_ptr().cast_mut().cast::<std::os::raw::c_char>();
             // The entry point does not exist yet.  PostgreSQL resolves it when a worker
             // starts, which is why this test runs without launching any.
             let entry = c"hnswsq_parallel_build_main".as_ptr().cast_mut();
