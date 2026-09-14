@@ -300,6 +300,10 @@ pub struct ArenaState {
     /// Set by any participant that has to abort; the leader re-raises it, because
     /// PostgreSQL will not let a worker change the leader's control flow.
     failed: AtomicU32,
+    /// Rows the workers have scanned.  Not the count of nodes: the two differ exactly when the
+    /// arena ran out, which is the condition that must never pass silently (a worker cannot spill
+    /// the way the single-builder path does).
+    rows_scanned: AtomicU64,
 }
 
 /// `entry` when the graph has no entry point yet.
@@ -322,6 +326,7 @@ impl ArenaState {
             active_workers: AtomicU32::new(0),
             workers_entered: AtomicU32::new(0),
             failed: AtomicU32::new(0),
+            rows_scanned: AtomicU64::new(0),
         }
     }
 
@@ -450,6 +455,18 @@ impl ArenaState {
     #[inline]
     pub fn failed(&self) -> bool {
         self.failed.load(Ordering::Acquire) != 0
+    }
+
+    /// Add a worker's scan count.  Called once per worker, not once per row: a shared atomic
+    /// incremented per tuple would put every worker on one cache line.
+    #[inline]
+    pub fn add_rows_scanned(&self, rows: u64) {
+        self.rows_scanned.fetch_add(rows, Ordering::AcqRel);
+    }
+
+    #[inline]
+    pub fn rows_scanned(&self) -> u64 {
+        self.rows_scanned.load(Ordering::Acquire)
     }
 }
 

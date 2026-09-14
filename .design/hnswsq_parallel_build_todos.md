@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M3 step 5v: incomplete-build + reltuples bugs fixed** | **done** | small memory now errors instead of truncating; `heap_tuples` is rows scanned |
 | **M3 step 5u: recall sweep, both scales, fresh indexes** | **done** | 100k: -0.10 at ef 20-40; 1M: mixed, +/-0.2-0.4 both ways, equal by ef 80 |
 | **M3 step 5t: `CREATE INDEX` drives the parallel build** | **done** | 100k in 2.6 s; `workers=0` bit-identical (fingerprint `3794aa11c860aba0`) |
 | M3 step 5s: `build_index_parallel` extracted for `ambuild` | **done** | harness is a thin wrapper; behaviour identical |
@@ -1820,6 +1821,42 @@ plan-level decision, flagged rather than assumed -- and the BIGANN sweep on host
 ef=20 to 1.0 at ef=40 while the parallel one climbs 0.6, 0.8, 0.8.  Both are 200-query estimates, so
 each 0.005 is one query and these are 8-80 query differences -- real, not noise, and the shape
 suggests a few hard queries with different graph neighbourhoods rather than a systematic effect.
+
+### 3j.34 Two silent-corruption bugs in the new path, found by testing small memory
+
+The single-builder path spills to disk when `maintenance_work_mem` runs out, so it indexes every row
+whatever the budget.  A worker cannot spill, and the parallel path had no check -- so with 16 MB and
+100k rows:
+
+```
+WARNING:  hnswsq parallel build: ... published=75251 written=75251 ...
+reltuples(heap)=75251      <-- the *table's* row count, rewritten
+```
+
+That is two bugs, not one.  The build silently indexed 75 251 of 100 000 rows; and because
+`IndexBuildResult.heap_tuples` was set to the number of nodes produced, PostgreSQL recorded that
+truncated number as the table's `reltuples`.  A silently short index would merely cost recall; a
+rewritten `reltuples` corrupts the planner's view of the table for every query afterwards.
+
+Both are fixed and verified:
+
+* `ArenaState::rows_scanned` counts rows the workers actually read (per worker, published once, so
+  the shared counter is not touched per tuple), and the leader **errors** when fewer rows were
+  indexed than scanned, naming the budget and the two ways out.
+* `IndexBuildResult.heap_tuples` is the rows **scanned**, `index_tuples` the rows indexed.
+
+Re-run with 16 MB: `ERROR: hnswsq parallel build is incomplete: 100000 rows scanned but only 75233
+indexed (the arena is sized by maintenance_work_mem = 16 MB).  Raise maintenance_work_mem, or set
+hnswsq.build_workers = 0 ...`, with `reltuples(heap)` still 100000.  With 256 MB: success, and
+`reltuples(heap)=100000 / reltuples(index)=100001`.
+
+**Which exposes one more thing: the index has one entry more than the table has rows.**  The extra
+node is the leader's seed -- a **zero vector with a fabricated TID** (`ItemPointer::new(1, 1)`), and
+it is a real entry in the finished index, so a search can return that TID for a row whose stored
+vector is not the zero vector.  The single-builder path has no seed and no such entry
+(`published=100000`).  This is a correctness issue, not a cosmetic one, and it is the next thing to
+fix: the seed should be a **real row** (its own vector and its own TID), or the leader should let
+the first worker's insert establish the entry as the single-builder path does.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

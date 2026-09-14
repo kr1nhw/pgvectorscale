@@ -461,6 +461,9 @@ pub(crate) struct ParallelInsertCtx {
     state: BuildState,
     params: crate::access_method::hnswsq::driver::BuildParams,
     locks: *const crate::access_method::hnswsq::arena::NodeLocks,
+    /// Rows this worker has seen.  Counted locally and published once, so the shared counter is
+    /// touched once per worker rather than once per row.
+    rows: u64,
 }
 
 /// One row, from the table scan into the shared graph.
@@ -487,6 +490,7 @@ unsafe extern "C-unwind" fn parallel_insert_callback(
         return;
     }
     let ctx = unsafe { &mut *(state as *mut ParallelInsertCtx) };
+    ctx.rows += 1;
     let mut vec = unsafe { extract_vector(*values) };
     if stage == 6 {
         return;
@@ -561,6 +565,7 @@ pub(crate) unsafe fn parallel_worker_scan(
         state: worker_build_state(params, arena),
         params: *params,
         locks: arena.locks() as *const _,
+        rows: 0,
     };
     if stage == 4 {
         unsafe { pg_sys::table_endscan(scan) };
@@ -589,6 +594,8 @@ pub(crate) unsafe fn parallel_worker_scan(
             scan,
         );
     }
+
+    arena.state().add_rows_scanned(ctx.rows);
 
     // No `table_endscan` here: `index_build_range_scan` takes ownership of the scan and ends it
     // itself before returning.  Ending it a second time is a double free, and it is what
@@ -1736,7 +1743,10 @@ pub unsafe extern "C-unwind" fn ambuild(
                 as *mut pg_sys::IndexBuildResult
         };
         unsafe {
-            (*result).heap_tuples = outcome.published as f64;
+            // `heap_tuples` is what PostgreSQL records as the *table's* row count, so it has to
+            // be the rows actually scanned -- reporting the number indexed instead rewrote the
+            // table's statistics downwards when the arena filled up.
+            (*result).heap_tuples = outcome.scanned as f64;
             (*result).index_tuples = outcome.written as f64;
         }
         return result;

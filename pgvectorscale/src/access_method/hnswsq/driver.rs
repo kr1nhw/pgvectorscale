@@ -428,6 +428,7 @@ pub(crate) fn build_index_parallel(
     let mut failed = false;
     let mut slabs_claimed = 0usize;
     let mut written = 0usize;
+    let mut scanned = 0u64;
     let outcome = unsafe {
         let heap = pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
@@ -501,10 +502,30 @@ pub(crate) fn build_index_parallel(
         failed = arena.state().failed();
         entered = arena.state().workers_entered();
         slabs_claimed = arena.state().claimed().1;
+        scanned = arena.state().rows_scanned();
         let checks = super::flat_graph::check_lists(
             &super::flat_graph::FlatGraph::in_arena(&arena),
             m0 as usize,
         );
+        // An incomplete build must not pass silently.  The single-builder path spills to disk when
+        // `maintenance_work_mem` runs out and indexes every row regardless; a worker cannot spill,
+        // so if the arena filled up the index would simply be missing rows -- and, worse, the
+        // `IndexBuildResult` below would report the truncated count as the table's row count.
+        // (Measured before this check existed: 16 MB and 100k rows produced an index of 75 251
+        // entries and rewrote the heap's `reltuples` to match.)
+        let indexed = published.saturating_sub(1); // the seed is not a row
+        if (scanned as usize) > indexed {
+            pgrx::error!(
+                "hnswsq parallel build is incomplete: {} rows scanned but only {} indexed \
+                 (the arena is sized by maintenance_work_mem = {} MB).  Raise \
+                 maintenance_work_mem, or set hnswsq.build_workers = 0 to use the single-builder \
+                 path, which spills to disk and indexes every row.",
+                scanned,
+                indexed,
+                budget_mb
+            );
+        }
+
         // Before the context goes away (and the segment with it), the leader may write the
         // graph out: same bridge and same writer as the single-builder path.
         if write_out {
@@ -517,6 +538,7 @@ pub(crate) fn build_index_parallel(
         pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         pg_sys::table_close(heap, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         ParallelBuildResult {
+            scanned,
             published,
             written,
             entered,
@@ -550,6 +572,8 @@ pub(crate) fn build_index_parallel(
 /// What a parallel build produced, for a caller that needs numbers rather than a report
 /// (`ambuild` fills its `IndexBuildResult` from these).
 pub(crate) struct ParallelBuildResult {
+    /// Rows the workers scanned: what `IndexBuildResult.heap_tuples` must be.
+    pub scanned: u64,
     pub published: usize,
     pub written: usize,
     pub entered: u32,
