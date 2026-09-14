@@ -1723,7 +1723,42 @@ pub unsafe extern "C-unwind" fn ambuild(
     // already written above, which is what a worker needs to seed its state (`ml`, `max_level`) --
     // see 3j.19; that ordering is why this sits after it.
     let parallel_workers = crate::access_method::hnswsq::options::HNSWSQ_BUILD_WORKERS.get();
-    if parallel_workers > 0 && !is_concurrent {
+    // A worker cannot spill the way this path does, so if the arena cannot hold the table the
+    // parallel build would have to refuse it (it must never index fewer rows than the heap holds --
+    // 3j.34).  When the row count is known, falling back is better than refusing: the build then
+    // succeeds on the path that spills.  `reltuples` is an estimate and -1 for a table that has
+    // never been analyzed, in which case the parallel path runs and its own completeness check is
+    // the guarantee.
+    let planned = crate::access_method::hnswsq::driver::plan(
+        num_dimensions * precision.elem_bytes(),
+        m0,
+        budget_bytes as usize,
+    );
+    // `estimate_rel_size` is the honest way to ask: it uses the catalog's `reltuples` when it is
+    // usable and the relation's physical size when it is not (a table that has never been
+    // analyzed), so a hint is almost always available.
+    let rows_hint = unsafe {
+        let (mut pages, mut tuples, mut allvisfrac) =
+            (0 as pg_sys::BlockNumber, 0f64, 0f64);
+        pg_sys::estimate_rel_size(
+            heap,
+            std::ptr::null_mut(),
+            &mut pages,
+            &mut tuples,
+            &mut allvisfrac,
+        );
+        tuples
+    };
+    let room_for_table = rows_hint < 0.0 || planned.nodes as f64 > rows_hint + 1.0;
+    if parallel_workers > 0 && !is_concurrent && !room_for_table {
+        pgrx::warning!(
+            "hnswsq: skipping the parallel build: maintenance_work_mem = {} MB affords about {}              nodes and the table has about {:.0} rows.  The single-builder path is used instead,              which spills to disk and indexes every row.",
+            budget_bytes >> 20,
+            planned.nodes,
+            rows_hint
+        );
+    }
+    if parallel_workers > 0 && !is_concurrent && room_for_table {
         let outcome = crate::access_method::hnswsq::driver::build_index_parallel(
             unsafe { (*heap).rd_id },
             unsafe { (*index).rd_id },

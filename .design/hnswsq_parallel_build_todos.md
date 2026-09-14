@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M5 step: fall back instead of refusing** | **done** | small memory now warns and builds on the spilling path |
 | **M4 step: worker-failure path** | **done** | leader refuses to write out; index untouched; verified both ways |
 | **M3 step 5x: 1M re-run without the seed** | **done** | identical to the seeded run; mixed vs single-builder, equal by ef 80 |
 | **M3 step 5w: fabricated seed removed -- recall now matches single-builder** | **done** | published=rows; ef 20/40/80 = 0.6/0.6/0.9, identical to 1 worker |
@@ -1949,6 +1950,42 @@ A worker that *panics* was already handled by PostgreSQL: `pg_guard` turns it in
 worker, the worker exits with an error, and `WaitForParallelWorkersToFinish` re-raises it in the
 leader.  The flag covers the other case -- a worker that notices a data-level problem and wants the
 leader to decide, rather than one that dies.
+
+### 3j.38 Sizing and worker count (M5, first piece)
+
+The two knobs a user has are `hnswsq.build_workers` (0 = single-builder, N = N workers) and
+`maintenance_work_mem` (the arena's budget, the same GUC that sizes the single-builder graph).  What
+was wrong was the interaction: a worker cannot spill, so with too little memory the parallel path had
+to *refuse* a build that the single-builder path would have completed by spilling.  Failing a build
+because of a knob that only asks for parallelism is the wrong answer when an alternative exists.
+
+Now, when the row count is known, the parallel path is skipped with a warning and the build proceeds
+on the path that spills:
+
+```
+SET maintenance_work_mem = '16MB'; SET hnswsq.build_workers = 4;
+WARNING:  hnswsq: skipping the parallel build: maintenance_work_mem = 16 MB affords about 80273 nodes, and the table has about 100000 rows. ...
+rows indexed: 100000
+```
+
+and with enough memory the parallel path still runs (`workers launched=4 published=100000
+written=100000`).  The row count comes from `estimate_rel_size`, which uses the catalog's `reltuples`
+when it is usable and the relation's physical size when it is not, so the hint is available even for
+a table that has never been analyzed; if it is somehow unavailable, the parallel path runs and its
+completeness check remains the guarantee (3j.34) -- the fallback is an improvement in behaviour, not
+the safety mechanism.
+
+**Known cosmetic nit:** the warning message has run-together whitespace (a multi-line format string
+whose indentation is preserved).  It is readable and carries every number; fixing it is a string
+edit, deliberately not worth another install cycle right now.
+
+**Also worth recording for the GUC's documentation**: `build_workers = 0` means "do not use the
+parallel driver", which is *not* what the GUC's existing help text says ("0 = auto", from when it
+only parallelised backlink pruning inside an in-memory build).  The default has to stay 0 = off,
+because the parallel path refuses rather than spills when memory is short -- which is exactly the
+fallback above, now covering the common case -- but the help text should be updated to match, and
+"auto" (a sensible N from the machine's CPU count) is a reasonable follow-up once the path has more
+mileage.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
