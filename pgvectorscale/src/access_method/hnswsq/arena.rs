@@ -213,6 +213,51 @@ impl Chunk {
         self.layout.total_bytes
     }
 
+    /// Immutable byte view of a region.  The read-only twins exist because the
+    /// storage swap gives `FlatGraph` *borrowed* slices over these regions: its
+    /// accessors take `&self` for reads and `&mut self` for writes, and both go
+    /// through the chunk instead of a `Vec` field.
+    pub fn region_bytes(&self, r: Region) -> &[u8] {
+        assert!(r.end() <= self.layout.total_bytes, "region outside the chunk");
+        let base = self.words.as_ptr().cast::<u8>();
+        // SAFETY: the allocation covers `[r.offset, r.end())` (checked above), and the
+        // shared borrow of `self` prevents any aliasing write while the slice lives.
+        unsafe { std::slice::from_raw_parts(base.add(r.offset), r.len) }
+    }
+
+    /// Immutable `u32` view of a region.
+    pub fn region_u32(&self, r: Region) -> &[u32] {
+        assert_eq!(r.offset % 4, 0, "u32 region must be 4-byte aligned");
+        assert_eq!(r.len % 4, 0, "u32 region length must be a multiple of 4");
+        let base = self.region_bytes(r).as_ptr().cast::<u32>();
+        // SAFETY: 4-byte aligned with a length that is a multiple of 4, and `u32`
+        // accepts every bit pattern; the shared borrow of `self` is carried into the
+        // result.
+        unsafe { std::slice::from_raw_parts(base, r.len / 4) }
+    }
+
+    /// Immutable `u16` view of a region.
+    pub fn region_u16(&self, r: Region) -> &[u16] {
+        assert_eq!(r.offset % 2, 0, "u16 region must be 2-byte aligned");
+        assert_eq!(r.len % 2, 0, "u16 region length must be a multiple of 2");
+        let base = self.region_bytes(r).as_ptr().cast::<u16>();
+        // SAFETY: as for `region_u32`, with 2-byte alignment.
+        unsafe { std::slice::from_raw_parts(base, r.len / 2) }
+    }
+
+    /// Immutable view of a region as a slice of `T` (the read twin of
+    /// [`Chunk::region_slice_mut`]).
+    pub fn region_slice<T: Copy>(&self, r: Region) -> &[T] {
+        let size = std::mem::size_of::<T>();
+        assert!(size > 0, "zero-sized region element");
+        assert_eq!(r.offset % std::mem::align_of::<T>(), 0, "region misaligned for T");
+        assert_eq!(r.len % size, 0, "region length is not a multiple of size_of::<T>()");
+        let base = self.region_bytes(r).as_ptr().cast::<T>();
+        // SAFETY: alignment and length checked, and the borrow of `self` is carried
+        // into the result.  All uses are `Copy` POD (ItemPointer, u32, u16).
+        unsafe { std::slice::from_raw_parts(base, r.len / size) }
+    }
+
     /// Byte view of a region.  Every other accessor is built on this one.
     pub fn region_bytes_mut(&mut self, r: Region) -> &mut [u8] {
         assert!(r.end() <= self.layout.total_bytes, "region outside the chunk");
@@ -365,6 +410,24 @@ mod tests {
             c.region_slice_mut::<crate::util::ItemPointer>(layout.tids).len(),
             nodes
         );
+    }
+
+    #[test]
+    fn immutable_views_see_the_mutable_writes() {
+        let layout = arena_layout(8, 4, 8, 9);
+        let mut c = Chunk::new(layout);
+        c.region_u32_mut(layout.ids)[3] = 77;
+        c.region_u16_mut(layout.lens)[2] = 5;
+        c.region_bytes_mut(layout.levels)[1] = 9;
+
+        assert_eq!(c.region_u32(layout.ids)[3], 77, "same storage, read view");
+        assert_eq!(c.region_u16(layout.lens)[2], 5);
+        assert_eq!(c.region_bytes(layout.levels)[1], 9);
+        assert_eq!(c.region_slice::<u32>(layout.ids).len(), 9 * 4);
+        assert_eq!(c.region_slice::<u32>(layout.ids)[3], 77);
+        // The read views keep returning what the write views left behind.
+        assert_eq!(c.region_u32(layout.ids)[0], 0);
+        assert_eq!(c.region_bytes(layout.vectors).len(), 8 * 8);
     }
 
     #[test]
