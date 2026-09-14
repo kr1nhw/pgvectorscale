@@ -327,6 +327,56 @@ impl FlatGraph {
     }
 }
 
+/// Capacity chosen for a byte budget, before any worker starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArenaSizing {
+    /// Node slots the budget affords.
+    pub nodes: usize,
+    /// `(node, layer)` slabs those nodes need at the assumed layer count.
+    pub slabs: usize,
+    /// Bytes one node costs (its vector, its layer-0 slab, its bookkeeping).
+    pub bytes_per_node: usize,
+}
+
+/// Per-node bytes in the flat layout: vector bytes, `level`/`clamped` (1 each),
+/// the heap TID (8), `slab_off` (4), the published flag (1), and for every layer a
+/// slab of `cap` ids (4 each) plus its `u16` length (2).
+#[inline]
+pub fn bytes_per_node(stride: usize, cap: usize, layers: f64) -> usize {
+    let per_layer = cap * std::mem::size_of::<u32>() + std::mem::size_of::<u16>();
+    let fixed = stride + 1 + 8 + 1 + 4 + 1;
+    fixed + (per_layer as f64 * layers).ceil() as usize
+}
+
+/// Size the arena from a byte budget.
+///
+/// `layers_per_node` is the average number of layers a node carries (1.0 plus the
+/// fraction of nodes above layer 0, ≈1.07 for a 1M build at `m = 16`), and `margin`
+/// is the fraction of the budget the graph may use — the arena cannot grow, so the
+/// rest stays headroom for the transient copies the writeout makes.
+///
+/// A zero result means "this budget cannot host a parallel build"; the caller then
+/// keeps the single-backend path rather than starting workers that would spill
+/// immediately.
+pub fn plan_capacity(
+    stride: usize,
+    cap: usize,
+    budget_bytes: u64,
+    layers_per_node: f64,
+    margin: f64,
+) -> ArenaSizing {
+    let layers = layers_per_node.max(1.0);
+    let per_node = bytes_per_node(stride, cap, layers).max(1);
+    let usable = (budget_bytes as f64 * margin.clamp(0.0, 1.0)) as u64;
+    let nodes = (usable / per_node as u64) as usize;
+    let slabs = (nodes as f64 * layers).ceil() as usize;
+    ArenaSizing {
+        nodes,
+        slabs,
+        bytes_per_node: per_node,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +449,50 @@ mod tests {
         let mut g = FlatGraph::new(4, 2);
         g.push_node(0, tid(1), false, &[0u8; 4]);
         g.set_list(0, 1, &[1]);
+    }
+
+    #[test]
+    fn capacity_arithmetic_and_margin() {
+        // 512 B vector + 15 B bookkeeping + (32 ids * 4 + 2) B slab = 657 B/node.
+        assert_eq!(bytes_per_node(512, 32, 1.0), 512 + 15 + 130);
+        // Extra layers add their slabs.
+        assert_eq!(bytes_per_node(512, 32, 2.0), 512 + 15 + 260);
+
+        let one_gb = 1u64 << 30;
+        let full = plan_capacity(512, 32, one_gb, 1.0, 1.0);
+        assert_eq!(full.bytes_per_node, 657);
+        assert_eq!(full.nodes as u64, one_gb / 657);
+        assert_eq!(full.slabs, full.nodes);
+
+        // A margin only ever reduces the capacity, monotonically.
+        let tight = plan_capacity(512, 32, one_gb, 1.0, 0.5);
+        assert!(tight.nodes < full.nodes);
+        assert!((tight.nodes as f64 / full.nodes as f64 - 0.5).abs() < 0.01);
+
+        // More layers per node -> the same bytes buy fewer nodes, and slabs scale.
+        let layered = plan_capacity(512, 32, one_gb, 1.5, 1.0);
+        assert!(layered.nodes < full.nodes);
+        assert_eq!(layered.slabs, (layered.nodes as f64 * 1.5).ceil() as usize);
+
+        // A budget that cannot host even one node reports zero, so the caller
+        // falls back to the single-backend path instead of spilling immediately.
+        assert_eq!(plan_capacity(512, 32, 100, 1.0, 0.9).nodes, 0);
+        // ... and layers below 1.0 are clamped rather than shrinking the maths.
+        assert_eq!(plan_capacity(512, 32, one_gb, 0.0, 1.0), full);
+    }
+
+    #[test]
+    fn planned_capacity_admits_more_nodes_than_its_estimate() {
+        // The sizing must not under-count: a graph filled to the planned node
+        // count still accepts nodes.
+        let planned = plan_capacity(8, 4, 1 << 20, 1.0, 1.0);
+        assert!(planned.nodes > 100, "sanity: {}", planned.nodes);
+        let mut g = FlatGraph::with_limits(8, 4, planned.nodes, planned.slabs);
+        for i in 0..planned.nodes as u32 {
+            assert!(g.try_push_node(0, tid(i + 1), false, &[0u8; 8]), "node {}", i);
+        }
+        assert!(g.is_full());
+        assert!(!g.try_push_node(0, tid(1), false, &[0u8; 8]));
     }
 
     #[test]

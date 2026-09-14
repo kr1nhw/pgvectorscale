@@ -216,9 +216,25 @@ struct FlatEngineState {
 }
 
 impl FlatEngineState {
-    fn new(stride: usize, cap: usize, dim: usize) -> Self {
+    /// `budget_bytes` sizes the graph up front (`maintenance_work_mem`): the arena
+    /// this is a prototype for cannot grow, so the capacity is planned before the
+    /// first row and exhaustion is answered by spilling.  A budget that affords no
+    /// node at all falls back to grow mode, which the driver's own per-row budget
+    /// check still spills from.
+    fn new(stride: usize, cap: usize, dim: usize, budget_bytes: u64) -> Self {
+        // ≈1.07 layers per node for m = 16 at scale (layer 0 plus the 1/16 of nodes
+        // that also get layer 1); 0.7 margin leaves headroom for the writeout's
+        // transient copy.
+        let sizing = crate::access_method::hnswsq::flat_graph::plan_capacity(
+            stride, cap, budget_bytes, 1.07, 0.7,
+        );
+        let graph = if sizing.nodes > 0 {
+            FlatGraph::with_limits(stride, cap, sizing.nodes, sizing.slabs)
+        } else {
+            FlatGraph::new(stride, cap)
+        };
         Self {
-            graph: FlatGraph::new(stride, cap),
+            graph,
             scratch: SearchScratch::new(),
             buf: FlatPairBuf::new(dim),
         }
@@ -1284,7 +1300,12 @@ pub unsafe extern "C-unwind" fn ambuild(
         stats: BuildStats::new(),
         search_scratch: SearchScratch::new(),
         flat: if unsafe { crate::access_method::hnswsq::options::HNSWSQ_BUILD_ENGINE.get() } == 1 {
-            Some(FlatEngineState::new(flat_stride, m0, num_dimensions))
+            Some(FlatEngineState::new(
+                flat_stride,
+                m0,
+                num_dimensions,
+                budget_bytes,
+            ))
         } else {
             None
         },
