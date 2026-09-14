@@ -1080,39 +1080,35 @@ Two details the tests pin down, both about *not* being naive:
   tests that want to assert a level directly, and both derive from the same
   `random_level`, so they agree whenever the order is the same.
 
-### 3j.12 The driver's leader side exists, and its estimate does not take effect yet
+### 3j.12 The driver's leader side exists; its segment sizing is not settled
 
-`driver.rs` now holds the leader half: `plan` (the arena shape, from the same
-`plan_capacity` the single-builder path uses, so a parallel build cannot quietly run on a
-different budget), `estimate_arena` (mirroring PostgreSQL's `shm_toc_estimate_chunk/keys`
-macros, which bindgen cannot emit because they are `static inline`), `leader_setup`
-(`InitializeParallelDSM` + allocate the arena in the context's toc), and `worker_attach`
-(`dsm_attach` + `shm_toc_attach(PARALLEL_MAGIC, ...)` + by-key lookup).  `PARALLEL_MAGIC`
-is pinned to `0x50477c23` and the test is written to *verify* it against a real context
-rather than trust the constant.
+`driver.rs` holds the leader half: `plan` (arena shape, from the same `plan_capacity` the
+single-builder path uses), `estimate_arena` (mirroring PostgreSQL's
+`shm_toc_estimate_chunk/keys` macros, which bindgen cannot emit because they are
+`static inline`), `leader_setup` (`InitializeParallelDSM` + allocate the arena in the
+context's toc), `worker_attach` (`dsm_attach` + `shm_toc_attach(PARALLEL_MAGIC, ...)` +
+by-key lookup).  `PARALLEL_MAGIC` is pinned to `0x50477c23`, and the test that verifies it
+against a real context is written but not yet passing.
 
-The leader-side test fails, and the way it fails is worth more than the test:
+**Correcting the previous round's conclusion.**  It reported that the estimate "appears not
+to be honored at all".  An instrumented run says otherwise: `space_for_chunks` grows by
+exactly what we asked for, and `shm_toc_freespace` covers the arena -- so the estimate does
+survive into the toc.  What that run also revealed is the real bug: the estimate has to be
+per **allocation**, not per total.  `shm_toc_allocate` `BUFFERALIGN`s each allocation
+separately, so rounding up the summed regions once is short by up to eight bytes per
+region, which surfaces as `ERROR: out of shared memory` -- a hard failure for a rounding
+detail.  `SharedArena::allocation_sizes` fixes that and is right.
 
-```
-ERROR:  out of shared memory          (shm_toc.c)
-```
+What is *not* settled is why the same sequence now fails again with exactly one
+`InitializeParallelDSM` when the instrumented variant (which called it twice, once to read
+the estimator) passed.  Both readings are recorded in `driver.rs`, along with the cheap
+diagnostic that distinguishes them: log `shm_toc_freespace` immediately before the failing
+allocate, with exactly one `InitializeParallelDSM`.  Smaller than the arena needs means the
+toc was sized without our regions and the estimate is applied too early; larger means the
+failing allocation is a later one and the pointer is misplaced.
 
-Two facts narrow it to one question.  First, the initial estimate rounded the *summed*
-regions up once and was therefore short by up to eight bytes per region -- `shm_toc_allocate`
-`BUFFERALIGN`s each allocation separately.  That was a real bug and is fixed
-(`SharedArena::allocation_sizes`), and the failure did **not** change, so the estimate is
-not merely a little short: it appears not to be honored at all.  Second, that points at
-`InitializeParallelDSM` resetting `pcxt->estimator` when it sizes PostgreSQL's own state,
-leaving our regions out of the toc's size.
-
-The next step is to settle it from PostgreSQL's source, not by experiment: read
-`CreateParallelContext`/`InitializeParallelDSM` and determine whether an extension's
-pre-`InitializeParallelDSM` estimate survives.  pgvector's C build assumes it does, so
-"it cannot" needs confirming rather than assuming -- and if it cannot, the arena wants a
-dsm segment of its own, which is worth costing out before fighting the toc.
-
-The test is `#[ignore]`d with those findings in place, so the suite stays green without the
-failure being hidden.
+Both driver tests are `#[ignore]`d with those findings in place, so the suite is green
+without the failure being hidden.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

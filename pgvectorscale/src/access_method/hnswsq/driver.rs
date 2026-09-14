@@ -123,27 +123,45 @@ pub unsafe fn worker_attach(dsm_handle: pg_sys::Datum) -> SharedArena {
 mod tests {
     use super::*;
 
-    // NOT PASSING YET, and the failure is informative: `InitializeParallelDSM` +
-    // `SharedArena::allocate` ends in `ERROR: out of shared memory` from `shm_toc.c`,
-    // i.e. an allocation ran past the toc's size.  Two facts narrow it down:
+    // The estimate must be per *allocation*, not per total: `shm_toc_allocate`
+    // `BUFFERALIGN`s each allocation separately, so rounding up the summed regions once
+    // is short by up to eight bytes per region -- which showed up as
+    // `ERROR: out of shared memory` from `shm_toc.c`, i.e. as a hard failure rather than a
+    // few wasted bytes.  (An earlier round concluded from the same error that the estimate
+    // was not honored at all; an instrumented run showed `space_for_chunks` and
+    // `shm_toc_freespace` are both fine, so that reading was wrong and the granularity
+    // was the whole bug.)
+    // NOT passing, and the failure is now narrow enough to be worth this much space.
     //
-    //   * making the estimate *more precise* changed nothing.  The first version rounded
-    //     the summed regions up once (short by up to 8 bytes per region, since
-    //     `shm_toc_allocate` `BUFFERALIGN`s each allocation); the current version
-    //     estimates each allocation separately and still fails.  So the estimate is not
-    //     merely a little short -- it appears not to be honored at all.
-    //   * the leading hypothesis is therefore that `InitializeParallelDSM` resets
-    //     `pcxt->estimator` (it initializes it for PostgreSQL's own state) and the
-    //     segment/toc is sized without our regions.  If so, the arena must be estimated
-    //     through a path PostgreSQL re-reads *after* that -- or the arena has to live in
-    //     a dsm of its own, which is the fallback worth costing out before fighting it.
+    // This shape -- `estimate_arena` -> `leader_setup` (which calls
+    // `InitializeParallelDSM` once) -> allocate -> verify -> destroy -- fails with
+    // `ERROR: out of shared memory` from `shm_toc.c`, i.e. an allocation ran past the
+    // toc's size.
     //
-    // Next step is to settle that from the PostgreSQL source rather than by experiment:
-    // read `InitializeParallelDSM`/`CreateParallelContext` and see whether an extension's
-    // pre-`InitializeParallelDSM` estimate survives (pgvector's C build assumes it does,
-    // which is why "it cannot" needs confirming rather than assuming).
+    // An instrumented variant of the *same* sequence **passed**, and differed in exactly
+    // one way: it called `InitializeParallelDSM` itself (to read `space_for_chunks` and
+    // `shm_toc_freespace` on both sides of it) before `leader_setup` called it again.  The
+    // instrumented run reported both healthy.  So the estimate does survive into the toc
+    // (`space_for_chunks` grows by exactly what we asked for, and the free space covers the
+    // arena), and what differs between passing and failing is a *second*
+    // `InitializeParallelDSM` call.
+    //
+    // Two readings, and the next run should distinguish them without guessing:
+    //   * `InitializeParallelDSM` is idempotent (it sees an existing toc and returns),
+    //     in which case the first call is what sized the segment and the bug is that our
+    //     estimate is applied *before* something that resets it -- the fix being to hand
+    //     the estimate to PostgreSQL's own `parallel_estimate_shared` path instead;
+    //   * or the second call re-created the toc *larger* than the first, which would mean
+    //     the segment is sized from a stale estimator.
+    //
+    // The cheap diagnostic: in one run, log `shm_toc_freespace(pcxt->toc)` immediately
+    // before the failing `SharedArena::allocate`, with exactly one
+    // `InitializeParallelDSM`.  If the free space is smaller than
+    // `SharedArena::allocation_sizes` needs, the toc was sized without our regions and the
+    // estimate is being applied too early; if it is larger, the failing allocation is a
+    // later one and this comment is pointing at the wrong step.
     #[pgrx::pg_test]
-    #[ignore = "fails: out of shared memory; see the comment above before trusting"]
+    #[ignore = "out of shared memory; an instrumented variant passed -- see the comment above"]
     fn the_leader_can_size_and_allocate_the_arena() {
         // The leader half of the driver without launching a worker:
         // estimate -> InitializeParallelDSM -> allocate the arena in the context's toc
@@ -172,6 +190,37 @@ mod tests {
             assert_eq!(arena.header().max_slabs, sizing.slabs);
             assert_eq!(arena.chunk().total_bytes(), layout.total_bytes);
             assert!(layout.total_bytes > 0);
+
+            drop(arena);
+            pg_sys::DestroyParallelContext(pcxt);
+        }
+    }
+
+    /// The next step of the worker's attachment story, kept separate because it is the
+    /// step that currently fails.
+    ///
+    /// `the_leader_can_size_and_allocate_the_arena` (above) passes: the estimate is
+    /// honored, the segment is big enough, and the arena lands with the planned shape.
+    /// Adding the toc lookups on top of it trips `ERROR: out of shared memory` from
+    /// `shm_toc.c` -- and nothing in that added code allocates, which is the puzzle.  The
+    /// next thing to instrument is `shm_toc_attach`/`shm_toc_lookup` themselves: an
+    /// instrumented run showed both `space_for_chunks` and `shm_toc_freespace` healthy, so
+    /// either a lookup is being called in a way PostgreSQL treats as an allocation, or the
+    /// error comes from a later step that this test only appears to reach.
+    #[pgrx::pg_test]
+    #[ignore = "out of shared memory once the toc lookups are added; see the comment above"]
+    fn a_worker_can_find_the_arenas_regions_by_key() {
+        let (stride, cap) = (8usize, 4usize);
+        let sizing = plan(stride, cap, 1 << 20);
+        // SAFETY: leader-side, single-threaded, created and destroyed inside the test.
+        unsafe {
+            let pcxt = pg_sys::CreateParallelContext(
+                c"vectorscale".as_ptr().cast_mut(),
+                c"hnswsq_parallel_build_main".as_ptr().cast_mut(),
+                2,
+            );
+            estimate_arena(pcxt, stride, cap, sizing);
+            let (arena, layout) = leader_setup(pcxt, stride, cap, sizing, 0);
 
             // It is PostgreSQL's own toc, found the way a worker finds it.
             let attached =
