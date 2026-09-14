@@ -858,6 +858,7 @@ mod tests {
             precision: HnswPrecision::Plain as u8,
             backlink_mode: 0,
             tranche,
+            single_writer: false,
         };
 
         let state = build::worker_build_state(&params, &arena);
@@ -999,6 +1000,7 @@ mod tests {
                 precision: 0,
                 backlink_mode: 0,
                 tranche: 0,
+                single_writer: false,
             };
             params.publish((*pcxt).toc);
             assert_eq!(BuildParams::read_from(attached), params, "parameters survive");

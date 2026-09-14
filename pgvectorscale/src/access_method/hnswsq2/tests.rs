@@ -1,0 +1,343 @@
+//! hnswsq2 integration tests — gates 1 and 2.
+//!
+//! * AM existence, empty-index lifecycle (gate 1);
+//! * recall matrix across the four storage layouts and three distance types
+//!   against exact ground truth, incremental empty-start lifecycle, and
+//!   transaction rollback (gate 2: single-writer insert parity).
+//!
+//! Thresholds mirror the old engine's suite so the port must clear the same
+//! bar the retired engine did.
+
+use pgrx::prelude::*;
+
+#[pgrx::pg_schema]
+pub mod tests {
+    use super::*;
+
+    /// Small deterministic xorshift64* RNG (test data only).
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed.max(1))
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn next_f32(&mut self) -> f32 {
+            (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+        }
+    }
+
+    /// Clustered data: n_clusters × per_cluster rows around random centers,
+    /// one query per center (the old engine's generator).
+    fn gen_clustered(
+        n_clusters: usize,
+        per_cluster: usize,
+        dim: usize,
+        noise: f32,
+        seed: u64,
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let mut rng = Rng::new(seed);
+        let centers: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| (0..dim).map(|_| rng.next_f32() * 2.0 - 1.0).collect())
+            .collect();
+        let mut rows = Vec::with_capacity(n_clusters * per_cluster);
+        for c in &centers {
+            for _ in 0..per_cluster {
+                rows.push(
+                    c.iter()
+                        .map(|x| x + (rng.next_f32() - 0.5) * noise)
+                        .collect(),
+                );
+            }
+        }
+        let queries: Vec<Vec<f32>> = centers
+            .iter()
+            .map(|c| {
+                c.iter()
+                    .map(|x| x + (rng.next_f32() - 0.5) * noise * 0.2)
+                    .collect()
+            })
+            .collect();
+        (rows, queries)
+    }
+
+    fn vec_literal(v: &[f32]) -> String {
+        let parts: Vec<String> = v.iter().map(|x| format!("{:.6}", x)).collect();
+        format!("[{}]", parts.join(","))
+    }
+
+    fn insert_rows(table: &str, vecs: &[Vec<f32>]) -> spi::Result<()> {
+        for chunk in vecs.chunks(100) {
+            let values: Vec<String> = chunk
+                .iter()
+                .map(|v| format!("('{}')", vec_literal(v)))
+                .collect();
+            Spi::run(&format!(
+                "INSERT INTO {}(embedding) VALUES {}",
+                table,
+                values.join(",")
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Create `hs_t` (rows), `hs_q` (queries) and `hs_gt` (exact top-10 by
+    /// `op`) — all BEFORE the index exists, so the ground truth is a pure
+    /// sequential computation.
+    fn setup_case(
+        dim: usize,
+        rows: &[Vec<f32>],
+        queries: &[Vec<f32>],
+        op: &str,
+    ) -> spi::Result<()> {
+        Spi::run(&format!(
+            "CREATE TABLE hs_t(id serial primary key, embedding vector({}));
+             CREATE TABLE hs_q(qid serial primary key, embedding vector({}));",
+            dim, dim
+        ))?;
+        insert_rows("hs_t", rows)?;
+        insert_rows("hs_q", queries)?;
+        Spi::run(&format!(
+            "CREATE TABLE hs_gt AS
+             SELECT qid, tid FROM (
+               SELECT q.qid AS qid, t.id AS tid,
+                      row_number() OVER (PARTITION BY q.qid ORDER BY t.embedding {} q.embedding) AS rn
+               FROM hs_q q CROSS JOIN hs_t t) s
+             WHERE rn <= 10;",
+            op
+        ))?;
+        Ok(())
+    }
+
+    /// Build the index, run the ANN queries (one index rescan per query via
+    /// LATERAL), and return recall@10 against `hs_gt`.
+    fn measure_recall(opclass: &str, op: &str, with_opts: &str, ef: i32) -> spi::Result<f64> {
+        Spi::run(&format!(
+            "CREATE INDEX hs_idx ON hs_t USING hnswsq2 (embedding {}) WITH ({});
+             SET hnswsq2.ef_search = {};
+             SET enable_seqscan = off;
+             CREATE TABLE hs_ann AS
+             SELECT q.qid AS qid, t.id AS tid
+             FROM hs_q q CROSS JOIN LATERAL (
+               SELECT id FROM hs_t ORDER BY embedding {} q.embedding LIMIT 10) t;",
+            opclass, with_opts, ef, op
+        ))?;
+        let n: i64 = Spi::get_one::<i64>("SELECT count(*) FROM hs_ann")?.unwrap_or(0);
+        let nq: i64 = Spi::get_one::<i64>("SELECT count(*) FROM hs_q")?.unwrap_or(0);
+        assert_eq!(n, nq * 10, "every query must produce 10 candidates");
+        let recall = Spi::get_one::<f64>(
+            "SELECT count(*)::float8 / (SELECT count(*)::float8 FROM hs_gt)
+             FROM hs_gt g JOIN hs_ann a ON g.qid = a.qid AND g.tid = a.tid",
+        )?
+        .unwrap_or(0.0);
+        Ok(recall)
+    }
+
+    fn recall_case(opclass: &str, op: &str, with_opts: &str, threshold: f64) {
+        let (rows, queries) = gen_clustered(20, 50, 16, 0.05, 12345);
+        setup_case(16, &rows, &queries, op).unwrap();
+        // Pin the build RNG: recall is a property of the graph, so an
+        // entropy-seeded build makes this assertion a random sample.
+        Spi::run("SET hnswsq2.build_seed = 20240912;").unwrap();
+        let recall = measure_recall(opclass, op, with_opts, 100).unwrap();
+        assert!(
+            recall >= threshold,
+            "recall@10 {} below {} for {}",
+            recall,
+            threshold,
+            with_opts
+        );
+    }
+
+    // ---------------- gate 1: the AM exists ----------------
+
+    #[pg_test]
+    fn test_hnswsq2_create_drop_empty_index() {
+        Spi::run("CREATE TABLE hnswsq2_empty(id int, embedding vector(8))").unwrap();
+        Spi::run(
+            "CREATE INDEX hnswsq2_empty_idx ON hnswsq2_empty USING hnswsq2 (embedding vector_l2_ops)",
+        )
+        .unwrap();
+        // The empty index must answer queries without error.
+        let count: i64 = Spi::get_one(
+            "SELECT count(*) FROM (SELECT id FROM hnswsq2_empty \
+             ORDER BY embedding <-> '[1,2,3,4,5,6,7,8]'::vector LIMIT 1) t",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 0);
+        Spi::run("DROP INDEX hnswsq2_empty_idx").unwrap();
+        Spi::run("DROP TABLE hnswsq2_empty").unwrap();
+    }
+
+    // ---------------- gate 2: recall matrix ----------------
+
+    #[pg_test]
+    fn test_hnswsq2_recall_plain_l2() {
+        recall_case("vector_l2_ops", "<->", "storage_layout = plain", 0.9);
+    }
+
+    #[pg_test]
+    fn test_hnswsq2_recall_ieeefp16_l2() {
+        recall_case("vector_l2_ops", "<->", "storage_layout = ieeefp16", 0.9);
+    }
+
+    #[pg_test]
+    fn test_hnswsq2_recall_ieeefp8_l2() {
+        recall_case("vector_l2_ops", "<->", "storage_layout = ieeefp8", 0.75);
+    }
+
+    #[pg_test]
+    fn test_hnswsq2_recall_sq8_l2() {
+        recall_case("vector_l2_ops", "<->", "storage_layout = f8", 0.85);
+    }
+
+    #[pg_test]
+    fn test_hnswsq2_recall_plain_cosine() {
+        recall_case("vector_cosine_ops", "<=>", "storage_layout = plain", 0.9);
+    }
+
+    #[pg_test]
+    fn test_hnswsq2_recall_ieeefp16_ip() {
+        recall_case("vector_ip_ops", "<#>", "storage_layout = ieeefp16", 0.85);
+    }
+
+    #[pg_test]
+    fn test_hnswsq2_recall_sq8_alias_name() {
+        recall_case("vector_l2_ops", "<->", "storage_layout = sq8", 0.85);
+    }
+
+    // ---------------- gate 2: incremental empty-start ----------------
+
+    fn incremental_case(layout: &str) {
+        let dim = 16;
+        let (rows, _queries) = gen_clustered(10, 100, dim, 0.05, 4242);
+        Spi::run(&format!(
+            "CREATE TABLE hs_i(id serial primary key, embedding vector({}));
+             CREATE INDEX hs_i_idx ON hs_i USING hnswsq2 (embedding vector_l2_ops)
+               WITH (storage_layout = {});
+             SET enable_seqscan = off;
+             SET hnswsq2.ef_search = 500;
+             SET hnswsq2.build_seed = 20240912;",
+            dim, layout
+        ))
+        .unwrap();
+
+        // Staged inserts: after each batch, an exact-match probe for a row in
+        // that batch must return it (distance 0 survives every layout: the
+        // stored code of a vector always matches itself).
+        for batch in 0..5 {
+            let slice = &rows[batch * 200..(batch + 1) * 200];
+            insert_rows("hs_i", slice).unwrap();
+            let probe = batch * 200; // 0-based row → id = probe + 1
+            let got: i64 = Spi::get_one::<i64>(&format!(
+                "SELECT id FROM hs_i ORDER BY embedding <-> '{}' LIMIT 1",
+                vec_literal(&rows[probe])
+            ))
+            .unwrap()
+            .unwrap_or(-1);
+            assert_eq!(
+                got,
+                (probe + 1) as i64,
+                "batch {}: exact-match probe must find its row (layout {})",
+                batch,
+                layout
+            );
+        }
+    }
+
+    #[pg_test]
+    fn test_hnswsq2_incremental_empty_start_plain() {
+        incremental_case("plain");
+    }
+
+    #[pg_test]
+    fn test_hnswsq2_incremental_empty_start_ieeefp8() {
+        incremental_case("ieeefp8");
+    }
+
+    #[pg_test]
+    fn test_hnswsq2_incremental_empty_start_sq8() {
+        // Empty-start SQ8 gets a provisional [-1, 1] calibration; the probes
+        // are unit vectors so they stay in range.
+        incremental_case("f8");
+    }
+
+    // ---------------- gate 2: transaction rollback ----------------
+
+    #[pg_test]
+    fn test_hnswsq2_txn_rollback() {
+        let (rows, _q) = gen_clustered(4, 25, 16, 0.05, 99);
+        Spi::run(
+            "CREATE TABLE hs_r(id serial primary key, embedding vector(16));
+             CREATE INDEX hs_r_idx ON hs_r USING hnswsq2 (embedding vector_l2_ops);
+             SET enable_seqscan = off;",
+        )
+        .unwrap();
+        insert_rows("hs_r", &rows).unwrap();
+        let before: i64 = Spi::get_one::<i64>("SELECT count(*) FROM hs_r").unwrap().unwrap();
+        assert_eq!(before, 100);
+
+        // A subtransaction that inserts and aborts: the rows must be
+        // invisible afterwards, and the index must stay usable.
+        let extra = gen_clustered(1, 20, 16, 0.05, 555).0;
+        let values: Vec<String> = extra
+            .iter()
+            .map(|v| format!("('{}')", vec_literal(v)))
+            .collect();
+        Spi::run(&format!(
+            "DO $$ BEGIN
+               INSERT INTO hs_r(embedding) VALUES {};
+               RAISE EXCEPTION 'rollback test';
+             EXCEPTION WHEN OTHERS THEN NULL;
+             END $$;",
+            values.join(",")
+        ))
+        .unwrap();
+
+        let after: i64 = Spi::get_one::<i64>("SELECT count(*) FROM hs_r").unwrap().unwrap();
+        assert_eq!(after, before, "rolled-back inserts must not persist");
+        let got: i64 = Spi::get_one::<i64>(&format!(
+            "SELECT id FROM hs_r ORDER BY embedding <-> '{}' LIMIT 1",
+            vec_literal(&rows[0])
+        ))
+        .unwrap()
+        .unwrap_or(-1);
+        assert_eq!(got, 1, "index still serves queries after the aborted txn");
+    }
+
+    // ---------------- gate 2: page packing ----------------
+
+    #[pg_test]
+    fn test_hnswsq2_many_nodes_per_page() {
+        // dim 2: dozens of element tuples per page; the packing (and the
+        // element/neighbor tuple split) is exercised at full density.
+        let (rows, queries) = gen_clustered(10, 100, 2, 0.1, 777);
+        setup_case(2, &rows, &queries, "<->").unwrap();
+        Spi::run("SET hnswsq2.build_seed = 11;").unwrap();
+        Spi::run(
+            "CREATE INDEX hs_idx ON hs_t USING hnswsq2 (embedding vector_l2_ops)",
+        )
+        .unwrap();
+        Spi::run("SET hnswsq2.ef_search = 100; SET enable_seqscan = off;").unwrap();
+        Spi::run(
+            "CREATE TABLE hs_ann AS
+             SELECT q.qid AS qid, t.id AS tid
+             FROM hs_q q CROSS JOIN LATERAL (
+               SELECT id FROM hs_t ORDER BY embedding <-> q.embedding LIMIT 10) t",
+        )
+        .unwrap();
+        let recall = Spi::get_one::<f64>(
+            "SELECT count(*)::float8 / (SELECT count(*)::float8 FROM hs_gt)
+             FROM hs_gt g JOIN hs_ann a ON g.qid = a.qid AND g.tid = a.tid",
+        )
+        .unwrap()
+        .unwrap_or(0.0);
+        assert!(recall >= 0.9, "dim-2 dense packing recall@10 = {}", recall);
+    }
+}
