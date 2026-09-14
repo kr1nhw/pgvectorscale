@@ -162,9 +162,15 @@ pub static HNSWSQ_BUILD_ENGINE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>:
 /// engine consolidation.
 pub static HNSWSQ_BUILD_BACKFILL: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
 
-/// `hnswsq.build_workers`: worker threads used for parallel backlink pruning
-/// during an in-memory build (0 = auto).  Purely in-process parallelism over
-/// the in-memory graph; the transactional insert path is unaffected.
+/// `hnswsq.build_workers`: parallel workers for an in-memory build.
+///
+/// `0` (the default) means the single-builder path, which is the safe choice today: the parallel
+/// path refuses a build whose rows do not fit the arena (`maintenance_work_mem`, the same GUC that
+/// sizes the single-builder graph) rather than spilling mid-build the way the single-builder path
+/// does -- though `ambuild` skips the parallel build up front when the row count is known to be too
+/// large, so most such builds simply fall back.  `N > 0` asks for N workers.
+///
+/// Purely a build-time choice: the transactional insert and query paths are unaffected.
 pub static HNSWSQ_BUILD_WORKERS: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
 
 /// `hnswsq.parallel_stage`: **debug only** -- stop a parallel worker after this many steps, so
@@ -330,7 +336,7 @@ pub unsafe fn init() {
         unsafe { std::ffi::CStr::from_ptr("hnswsq.build_workers".as_pg_cstr()) },
         unsafe {
             std::ffi::CStr::from_ptr(
-                "Worker threads for in-memory build backlink pruning (0 = auto)".as_pg_cstr(),
+                "Parallel workers for an in-memory build. 0 = single-builder path (the safe default); N > 0 asks for N workers. The parallel path refuses a build whose rows do not fit the arena (maintenance_work_mem, which also sizes the single-builder graph) instead of spilling mid-build; ambuild skips it up front when the row count is known to be too big. Build-time only: the transactional insert and query paths are unaffected.".as_pg_cstr(),
             )
         },
         unsafe {

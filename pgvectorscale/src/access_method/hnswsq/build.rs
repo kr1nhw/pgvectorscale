@@ -599,6 +599,18 @@ pub(crate) unsafe fn parallel_worker_scan(
         );
     }
 
+    // Per-worker reporting: the leader's summary has the aggregate, but the phase split is only
+    // known to the worker that did the work, and it is what says whether the workers are balanced.
+    if ctx.state.stats.enabled {
+        pgrx::log!(
+            "hnswsq parallel worker pid={} rows={} nodes={} search_ms={} backlink_ms={}",
+            std::process::id(),
+            ctx.rows,
+            ctx.state.stats.nodes,
+            ctx.state.stats.search_ns / 1_000_000,
+            ctx.state.stats.backlink_select_ns / 1_000_000
+        );
+    }
     arena.state().add_rows_scanned(ctx.rows);
 
     // No `table_endscan` here: `index_build_range_scan` takes ownership of the scan and ends it
