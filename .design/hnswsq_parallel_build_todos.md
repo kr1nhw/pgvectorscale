@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M3 step 5r: recall of a parallel-built index** | **done** | ef 40/100: parallel 0.80/1.00 vs single-builder 0.60/1.00 |
 | M3 step 5q: parallel writeout into a real index | **done** | 100 001 nodes written in 1912 ms total; structure checks clean |
 | **M3 step 5p: 1M sweep, acceptance met** | **done** | 1/2/4 workers = 109.5 / 53.8 / **27.4 s** (target: <=160 s at 4) |
 | M3 step 5o: the parallel build runs | done | 100k rows, 1 worker 6294 ms / 2 workers 2997 ms, graph well formed |
@@ -1667,6 +1668,35 @@ cost two attempts: `bench_queries_16` is not `(id, embedding)` -- check `\d benc
 before writing the query, or reuse the harness's own sweep function if it is present in the scratch
 database.  The comparison that matters is the parallel index against the single-builder index on
 the same table and the same ground truth, at the same `ef_search`.
+
+### 3j.30 Recall of a parallel-built index, against a same-policy single-builder one
+
+The outstanding question was whether the concurrency `no_incoming` delta costs recall.  Measured on
+`t100k` with `gt_100k` and `bench_queries_16` (200 queries, recall@10), the parallel index built by
+4 workers into a fresh index and then written out, against a single-builder flat-engine build of the
+same definition on the same table:
+
+| index | ef_search=40 | ef_search=100 |
+|---|---|---|
+| parallel, 4 workers (`no_incoming=338`) | **0.80** | 1.00 |
+| single-builder flat, 1 worker (`no_incoming=0`) | 0.60 | 1.00 |
+
+So the concurrency gate as the plan words it -- recall within 0.005 of the same-policy
+single-worker build -- is comfortably met here, and the parallel index is *better* at ef=40 by 0.20
+despite carrying 338 nodes with no incoming edge.
+
+**How much this proves, stated carefully.**  Two ef values on a 100k, dim-16 table that reaches
+recall 1.00 by ef=100 is a weak discriminator -- both builds saturate, and a 0.20 gap at one
+operating point is a data point rather than a result.  It answers "is the parallel artifact a
+usable index" (yes) and "does the connectivity delta visibly hurt recall here" (no).  It does not
+replace the plan's acceptance sweep (ef 10..640, 1M BIGANN, recall against the recorded
+single-builder numbers), which is where a real quality difference would show.
+
+Also note what these two runs establish about *shape*: both builds reach 1.00 at ef=100, and the
+parallel one is ahead at the tighter budget.  A plausible reading is that concurrent insertion
+leaves a graph with more, shorter-range edges (the same effect that raises `no_incoming`), which
+helps at small ef and washes out at large ef -- worth testing on the harder dataset, not asserting
+from two numbers.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
