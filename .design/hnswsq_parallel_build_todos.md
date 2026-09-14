@@ -23,7 +23,8 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
-| **M3 step 5o: the parallel build runs** | **done** | 100k rows, 1 worker 6294 ms / 2 workers 2997 ms, graph well formed |
+| **M3 step 5p: 1M sweep, acceptance met** | **done** | 1/2/4 workers = 109.5 / 53.8 / **27.4 s** (target: <=160 s at 4) |
+| M3 step 5o: the parallel build runs | done | 100k rows, 1 worker 6294 ms / 2 workers 2997 ms, graph well formed |
 | M3 step 5n: crash pinned to `index_build_range_scan` | **one call** | stages 1-4 clean with a worker running; 5-7 crash; the delta is the scan |
 | M3 step 5m: leader teardown fixed, crash now in the worker's inserts | **leader verified** | stage 9 clean with 2 workers; stage 0 dies in a worker after ~3 s |
 | M3 step 5l: crash bisect | **worker startup, not worker code** | a do-nothing worker crashes too; the same flow works in the pgrx test cluster |
@@ -1598,6 +1599,39 @@ the same-policy single-worker build) is what decides whether it is acceptable.
 The path is still driven by a debug SQL function rather than `CREATE INDEX`: `amcanbuildparallel`
 and the AM wiring remain, as does the leader's writeout of the arena.  The 1M / 4-worker target is
 therefore still unmet -- but it is now measurable.
+
+### 3j.28 The 1M sweep: the build-time acceptance target is met
+
+`hnswsq_parallel_build_debug` over `t1000000` (1M rows, dim 16, `m=16`, `ef_construction=64`, plain
+layout, 512 MB arena, seed node included, this machine):
+
+| workers | elapsed | speedup | `published` | `no_incoming` | `reachable` |
+|---|---|---|---|---|---|
+| 1 | 109 493 ms | 1.00x | 1 000 001 | 0 | 1 000 001 |
+| 2 | 53 831 ms | 2.03x | 1 000 001 | 353 | 999 648 |
+| 4 | **27 384 ms** | **4.00x** | 1 000 001 | 1 697 | 998 304 |
+
+`self_links=0`, `duplicates=0`, `max_len=32/32` at every worker count.
+
+**The build-time acceptance target -- 1M in <= 160 s at 4 workers -- is met at 27.4 s**, with a
+margin of 5.8x, and the scaling is essentially linear (2.03x at 2, 4.00x at 4).  For comparison,
+the recorded single-core flat-engine build of this shape was 97.8 s; the one-worker harness run is
+109.5 s, i.e. +12% for the node locks and the harness path, which is the price of the shared arena
+and is to be expected.
+
+**The connectivity delta is now the open question, and it scales with the worker count**:
+`no_incoming` is 0 at 1 worker, 353 at 2 and 1 697 at 4 (0.17% of nodes), with `reachable`
+falling by the same amount.  That is the phenomenon the concurrency gate was written for
+(`recall within 0.005` and `no_incoming`/`reachable` within tolerance of the same-policy
+single-worker build), and it is *not yet* judged: it needs a recall sweep, which needs the graph
+to be written out as an index.  A plausible cause worth testing rather than assuming: a node whose
+backlinks are all rejected while several workers race, which is the same mechanism that produces
+`no_incoming` in the single-builder flat engine (519/100k there, so this is not new -- but it does
+grow with concurrency, which the single-builder case cannot).
+
+**What this measurement is not:** the arena is built and validated, then discarded -- there is no
+writeout and no `CREATE INDEX`, so this is the *build* only.  Recall, and therefore whether the
+0.17% connectivity delta matters, is unmeasured until the leader can write the graph out.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
