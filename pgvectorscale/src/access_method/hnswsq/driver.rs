@@ -476,6 +476,17 @@ pub(crate) fn build_index_parallel(
         pg_sys::LaunchParallelWorkers(pcxt);
         pg_sys::WaitForParallelWorkersToFinish(pcxt);
 
+        // A worker cannot longjmp into the leader (PostgreSQL does not allow it), so a worker that
+        // hits a data-level problem sets `failed` and exits cleanly -- and the leader has to notice.
+        // Checked before anything is promoted or written, so a failed build leaves the index alone
+        // rather than writing a partial graph into pages the transaction then rolls back.
+        if arena.state().failed() {
+            pgrx::error!(
+                "hnswsq parallel build: a worker reported a failure; the server log has the \
+                 worker's own message"
+            );
+        }
+
         // Workers never promote an entry (3j.16): the leader seeded one before launching, and has
         // to re-promote now, because a higher-level node may have appeared while they ran.  Omitting
         // this leaves the zero-vector seed as the entry for the whole graph, which costs recall --

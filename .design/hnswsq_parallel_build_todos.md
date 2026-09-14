@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M4 step: worker-failure path** | **done** | leader refuses to write out; index untouched; verified both ways |
 | **M3 step 5x: 1M re-run without the seed** | **done** | identical to the seeded run; mixed vs single-builder, equal by ef 80 |
 | **M3 step 5w: fabricated seed removed -- recall now matches single-builder** | **done** | published=rows; ef 20/40/80 = 0.6/0.6/0.9, identical to 1 worker |
 | **M3 step 5v: incomplete-build + reltuples bugs fixed** | **done** | small memory now errors instead of truncating; `heap_tuples` is rows scanned |
@@ -1924,6 +1925,30 @@ builds that are better at some operating points than the reference.  The evidenc
 (b) a recall gate at a *declared* operating point.  For a default, the sensible operating point is
 where the reference reaches its target recall (here ef=80, where both are 1.0).  Flagged as a
 plan-level decision; the BIGANN sweep on host 121 is what would justify a particular choice.
+
+### 3j.37 The worker-failure path (M4, first piece)
+
+`ArenaState::failed` has existed since the shared cursors landed, documented as "a worker cannot
+longjmp into the leader, so the leader re-raises" -- and nothing ever read it.  Now the leader checks
+it immediately after the join, *before* promoting an entry or writing anything out, so a failed build
+leaves the index alone instead of writing a partial graph into pages that the aborting transaction
+would then roll back:
+
+```
+ERROR:  hnswsq parallel build: a worker reported a failure; the server log has the worker's own message
+```
+
+Verified both ways, using the debug stage that reports failure (`parallel_stage = 4`, which is also a
+bisect point -- the state is built first, then the failure is raised):
+
+* with a worker failing: the build errors, and the pre-existing index is unchanged
+  (`reltuples = 100000` from its own earlier build, i.e. the parallel attempt wrote nothing);
+* with `parallel_stage = 0`: `published=100000 written=100000` as before.
+
+A worker that *panics* was already handled by PostgreSQL: `pg_guard` turns it into an error in the
+worker, the worker exits with an error, and `WaitForParallelWorkersToFinish` re-raises it in the
+leader.  The flag covers the other case -- a worker that notices a data-level problem and wants the
+leader to decide, rather than one that dies.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

@@ -568,6 +568,10 @@ pub(crate) unsafe fn parallel_worker_scan(
         rows: 0,
     };
     if stage == 4 {
+        // Debug bisect point *and* the worker-failure exercise: the state is built (so the bisect
+        // still applies) and the build is then reported failed, which the leader must refuse to
+        // write out.
+        arena.state().set_failed();
         unsafe { pg_sys::table_endscan(scan) };
         unsafe { pg_sys::index_close(index, lockmode) };
         unsafe { pg_sys::table_close(heap, lockmode) };
