@@ -88,6 +88,40 @@ either the existing `MemGraph` or the arena.  *Why first:* the arena port must n
 touch the algorithms, or every later step becomes a mixed change.
 *Gate:* suite green, no behaviour change, 100k build time unchanged.
 
+**T0 design (interface shape decided; the mechanical rewiring is what remains).**
+Seven consumers reach into the graph today — `DistBuf::push` (build.rs:361),
+`select_neighbors_heuristic_mem` (:431), `search_layer_mem` (:592),
+`backlink_prune_mem` (:810), `mem_plan`/`mem_apply`, and `flush_mem_graph`
+(:1551) — all against concrete `MemGraph` fields.
+
+The trait must be implementable by *both* a `Vec`-backed single-threaded graph
+and a lock-guarded shared arena, and those two want opposite receivers: the arena
+mutates through `&self` (interior locks, because workers only ever hold a shared
+reference to the chunk), while `MemGraph`'s writes are plain `&mut self`.  Two
+consequences, both decided here so the rewiring is mechanical:
+
+1. **All trait methods take `&self`, including the write side** (`set_list`,
+   `set_entry`, and the per-target snapshot).  `MemGraph` implements them through
+   a small `RefCell`-scoped adapter (single-threaded; the borrow flag costs a
+   couple of instructions against a once-per-list write), the arena implements
+   them with its per-node locks.  Consumers take `&G` (or `&mut G` where they also
+   hold scratch) and never touch fields.
+2. **Reads copy into caller-owned buffers, not borrowed slices**:
+   `copy_neighbors(&self, id, layer, out: &mut Vec<u32>)`,
+   `copy_vector(&self, id, out: &mut Vec<u8>)`, `copy_list_meta(&self, id, layer,
+   &mut Vec<f32>, &mut [u64; 2])`.  A borrowed `&[u32]` cannot escape a method
+   that must hold a read guard for the duration of the borrow, and this is
+   already the shape the disk path settled on in P2 (`probe`/`expand`).  Cost in
+   the memory search: one ≤128 B copy per expansion, which the ±2 % build-time
+   gate covers.
+
+Work items for T0 itself: add `trait MemoryGraph` with `len/entry/entry_level/
+level/tid/clamped/copy_vector/copy_neighbors/copy_list_meta/set_list/set_entry`;
+implement it for `MemGraph` (plus the `RefCell` adapter); switch the seven
+consumers to it; keep `MemGraph`'s public field access private to the module.
+*Gate:* suite green (61), identical counters for the pinned seed, 100k dim-128
+local build within 2 % of 22.3 s.
+
 **T1 — Relative-pointer arena (L).**  `HnswArena` in one `shm_toc` chunk: header,
 node slots (level, tid, clamped, `vector_bytes` payload, per-layer list slabs),
 a free/bump cursor guarded by `allocatorLock`, and a reserved margin.  `Rel<T>`
