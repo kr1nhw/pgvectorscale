@@ -415,6 +415,75 @@ mod tests {
     }
 
     #[pgrx::pg_test]
+    fn a_worker_state_is_built_over_the_shared_arena() {
+        // `worker_build_state` against a real arena.  The state's own fields are private to
+        // `build.rs`, so what is asserted here is what this side can see: the construction
+        // succeeds against parameters shaped like a real index, and it leaves the arena
+        // alone -- a state that claimed or published anything while being built would be
+        // corrupting a graph the leader may already have seeded.  The finer assertions
+        // (budget, disk mode, the graph being the arena's) want accessors on `BuildState`
+        // that the driver will need anyway for the writeout; they come with that.
+        use super::super::build;
+        use super::super::quantize::HnswPrecision;
+
+        let size = 1usize << 20;
+        // SAFETY: a fresh backend-owned segment, detached before the test returns.
+        let seg = unsafe { pgrx::pg_sys::dsm_create(size, 0) };
+        let toc = unsafe {
+            pgrx::pg_sys::shm_toc_create(
+                super::super::arena::HNSWSQ_TOC_MAGIC,
+                pgrx::pg_sys::dsm_segment_address(seg),
+                size,
+            )
+        };
+        let tranche = super::super::arena::register_tranche(c"hnswsq_worker_state_test");
+        let (stride, cap, nodes, slabs) = (12u32, 4u32, 16u32, 32u32);
+        let arena = unsafe {
+            super::super::arena::SharedArena::allocate(
+                toc,
+                stride as usize,
+                cap as usize,
+                nodes as usize,
+                slabs as usize,
+                tranche,
+            )
+        };
+
+        let params = BuildParams {
+            rows: 0,
+            seed: 20240912,
+            heap_oid: 0,
+            index_oid: 0,
+            stride,
+            num_dimensions: 3,
+            cap,
+            m: 8,
+            m0: 16,
+            ef_construction: 32,
+            ml: 0.5,
+            max_level: 7,
+            dist_type: 0,
+            precision: HnswPrecision::Plain as u8,
+            backfill: 0,
+            backlink_mode: 0,
+            tranche,
+        };
+
+        let state = build::worker_build_state(&params, &arena);
+        assert_eq!(
+            arena.state().claimed(),
+            (0, 0),
+            "building a worker's state must not claim anything"
+        );
+        assert_eq!(arena.state().watermark(), 0);
+        assert!(!arena.state().failed());
+        drop(state);
+        drop(arena);
+        // SAFETY: no handle references the mapping any more.
+        unsafe { pgrx::pg_sys::dsm_detach(seg) };
+    }
+
+    #[pgrx::pg_test]
     fn the_leader_publishes_a_shared_scan_descriptor() {
         // A real table, a real snapshot and a descriptor every worker can read: this is the
         // object PostgreSQL's parallel scan hands block ranges out through, so all workers

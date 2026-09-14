@@ -36,7 +36,7 @@ use crate::access_method::hnswsq::node::{
     compute_max_level, item_fits, max_dim_for_page, probe_serialized_len, HnswNode,
 };
 use crate::access_method::hnswsq::options::{TSVHnswOptions, DEFAULT_SAMPLE_SIZE};
-use crate::access_method::hnswsq::quantize::{Codec, Sq8Calibration};
+use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision, Sq8Calibration};
 use crate::access_method::hnswsq::HNSWSQ_DISTANCE_TYPE_PROC;
 use crate::access_method::node::WriteableNode;
 use crate::access_method::pg_vector::PgVectorInternal;
@@ -297,7 +297,7 @@ impl FlatEngineState {
 /// on the disk path, exactly like the `maintenance_work_mem` transition.
 fn flat_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) -> bool {
     let level = random_level(state.ml, state.max_level, &mut state.rng);
-    flat_insert_at_level(state, heap_tid, vector, level)
+    flat_insert_at_level(state, heap_tid, vector, level, &Locking::SoleWriter)
 }
 
 /// The same insert with the level already decided.
@@ -312,6 +312,7 @@ fn flat_insert_at_level(
     heap_tid: ItemPointer,
     vector: &[f32],
     level: u8,
+    locking: &Locking,
 ) -> bool {
     if state.stats.enabled {
         state.stats.nodes += 1;
@@ -361,7 +362,7 @@ fn flat_insert_at_level(
         codec,
         dist_fn,
         graph,
-        &Locking::SoleWriter,
+        locking,
         buf,
         id,
         level,
@@ -450,7 +451,71 @@ fn writeout_graph(state: &mut BuildState) {
 }
 
 /// Pass-2 build state.
-struct BuildState {
+/// The state a parallel worker builds with, from the leader's published parameters and the
+/// shared arena -- i.e. the table in the design doc, in code.
+///
+/// Three things it deliberately does *not* do, each of which would otherwise be silently
+/// wrong:
+///
+/// * it does not read the index's reloptions or meta page.  Everything that shapes the graph
+///   (`m`, `m0`, `ef_construction`, `ml`, `max_level`, precision, distance type, the backlink
+///   policy) travels in `BuildParams`, so a worker cannot disagree with the leader about the
+///   graph it is co-building -- and that sidesteps the meta page, which exists only because
+///   the leader writes it.
+/// * it does not give itself a byte budget.  `budget_bytes = 0` means "go straight to disk" on
+///   the single-builder path, and a worker taking that branch would abandon the arena; the
+///   arena's capacity is the limit, and `claim_slot` returning `None` is the exhaustion
+///   signal.
+/// * it does not allocate a private graph.  `FlatEngineState::new` would, so the struct is
+///   built literally, around the arena's shared graph -- which is the whole point.
+pub(crate) fn worker_build_state(
+    params: &crate::access_method::hnswsq::driver::BuildParams,
+    arena: &crate::access_method::hnswsq::arena::SharedArena,
+) -> BuildState {
+    let dims = params.num_dimensions as usize;
+    let precision = HnswPrecision::from_u8(params.precision);
+    let codec = Codec::new(precision, dims);
+    let distance_type = DistanceType::from_u16(params.dist_type as u16);
+    let graph = FlatGraph::in_arena(arena);
+    let arena_bytes = arena.chunk().total_bytes() as u64;
+
+    BuildState {
+        codec,
+        dist_fn: distance_type.get_distance_function(),
+        distance_type,
+        m: params.m as usize,
+        m0: params.m0 as usize,
+        ef_construction: params.ef_construction as usize,
+        ml: params.ml,
+        max_level: params.max_level,
+        budget_bytes: arena_bytes,
+        mem_used: 0,
+        // Unused on the flat path, but the struct requires it.
+        graph: MemGraph::new(),
+        pair_buf: DistBuf::new(dims),
+        // Per worker: the driver merges statistics (M4), and nothing here is shared.
+        stats: BuildStats::new(),
+        search_scratch: SearchScratch::new(),
+        flat: Some(FlatEngineState {
+            graph,
+            scratch: SearchScratch::new(),
+            buf: FlatPairBuf::new(dims),
+        }),
+        reference_backlinks: false,
+        backlink_mode: match params.backlink_mode {
+            0 => BacklinkMode::Exact,
+            _ => BacklinkMode::Ranked,
+        },
+        disk_mode: false,
+        nrows: 0,
+        rng: SmallRng::seed_from_u64(params.seed),
+        level_seed: params.seed,
+    }
+}
+
+/// The driver holds these (one per worker), so the type is crate-visible even though its
+/// fields are not: the only way to act on a build state is through the functions here.
+pub(crate) struct BuildState {
     codec: Codec,
     dist_fn: DistanceFn,
     distance_type: DistanceType,

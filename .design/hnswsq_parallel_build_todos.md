@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5i: `worker_build_state` over the shared arena | done | from `BuildParams` + the arena; `BuildState` is crate-visible |
 | M3 step 5h: params carry the backlink policy | done | a worker cannot silently build on another policy |
 | M3 step 5g: params carry the dimension; meta-page ordering found | done | worker codec is derivable; leader must write meta before launching |
 | M3 step 5f: level from a raw `ItemPointerData` | done | block hi/lo decoding pinned, incl. blocks > 65535 |
@@ -1340,6 +1341,32 @@ Three traps found while deriving that, each now either fixed or recorded:
    the arena's shared graph (`FlatGraph::in_arena`), which means constructing the struct
    literally in `build.rs` (where it lives) rather than calling `FlatEngineState::new`, which
    would allocate a private graph and quietly build into it.
+
+### 3j.21 The worker's state exists (and the visibility that blocked testing it)
+
+`worker_build_state(params, arena)` builds a worker's `BuildState` from the parameters plus the
+arena -- the field table from §3j.20, in code.  It reads no reloptions and no meta page (the
+parameters carry the graph's shape, which is also what sidesteps the meta-page ordering
+constraint), gives itself no byte budget (`budget_bytes` is the arena's size, because 0 means
+"disk path" on the single-builder path), and constructs `FlatEngineState` literally so its graph
+is the arena's shared one rather than a private allocation.
+
+`flat_insert_at_level` now takes the `Locking` as a parameter, so the same insert body serves
+the single-builder path (`SoleWriter`) and a worker (`Locks(arena.locks())`) with no second
+copy of the policy.
+
+**A visibility problem worth recording**, because it shaped the test: `BuildState` was a private
+struct, so the driver could not name the type its own function returns -- and its fields are
+private to `build.rs`, so a test in `driver.rs` cannot read `budget_bytes`, `disk_mode` or the
+flat graph.  The type is now `pub(crate)` with private fields.  The test therefore asserts what
+this side can see (the construction succeeds against index-shaped parameters and leaves the
+arena untouched -- a state that claimed or published while being built would corrupt a graph the
+leader may already have seeded), and the finer assertions want accessors on `BuildState` that the
+driver needs anyway for the writeout; they come with it.
+
+Also worth noting from the attempt: moving that test into `build.rs` by appending it to the end
+of the file put it outside the test module and broke `mod mem_tests`'s gate -- the file's last
+`}` is not the module's.  Rewriting that way was reverted rather than patched.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
