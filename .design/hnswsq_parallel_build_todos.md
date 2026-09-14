@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 4f: shared-write + node-lock path | done | `set_list_concurrent`/`set_list_locked`; contention test (no torn lists) |
 | M3 step 4e: `FlatGraph` over a shared arena | done | cursors read the segment (`in_arena`); 2 latent cursor bugs surfaced by the shared path |
 | M3 step 4d: shared cursors (`ArenaState`) | done | packed claim CAS, contiguous watermark, entry + rendezvous; 4 tests |
 | M3 step 4c: arena in a `shm_toc` segment | done | `SharedArena::allocate`/`attach` by key; `pg_test` round-trips a real dsm segment |
@@ -909,6 +910,32 @@ pushing.  Two pre-existing tests (`fixed_capacity_reports_full_instead_of_growin
 `planned_capacity_admits_more_nodes_than_its_estimate`) failed on it immediately --
 which is the argument for keeping them: a "true means it worked" path with no
 assertion of its own would have shipped that silently.
+
+### 3j.6 The backlink write path, and what threads can and cannot test here
+
+The backlink step is the only place a worker writes a node it does not own, so it is
+the only place the node lock has to do real work.  It now has its own path:
+`FlatGraph::set_list_concurrent` (unsafe: the caller is the only writer of that slab)
+and `set_list_locked` (takes the node's write lock, then calls it).  Writes go through
+typed concurrent views of the chunk (`region_u32_concurrent`/`region_u16_concurrent`),
+and the length is written *after* the ids, so a reader can never see a length pointing
+at ids that were not written yet.
+
+**A thread test cannot use the arena's real locks.**  The first version of the
+contention test took `arena.locks()` -- LWLocks -- from two threads, and it failed: an
+LWLock is a *per-process* lock, so two threads in one backend do not contend for it the
+way two worker processes do (the second acquire looks like a recursive acquire by the
+same process).  The test now uses `NodeLocks::new` (thread-correct `RwLock`s) while
+still writing into the real dsm segment, which is what it can honestly check: the
+protocol and the concurrent write path.  **The cross-process case is only testable in
+the parallel build itself**, and that is now the second thing the worker sweep has to
+prove, after the speedup.
+
+`FlatGraph` deliberately has no blanket `Send`/`Sync` impl yet: a chunk-backed graph
+over a segment is shareable, but a grow-mode graph owns `Vec`s that would race, so the
+impl has to be attached to the shared construction (`in_arena`) rather than to the
+type.  Doing it as a blanket impl for a test's convenience would have made the
+grow-mode graph quietly unsound.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

@@ -799,6 +799,34 @@ impl Chunk {
         std::slice::from_raw_parts_mut(base.add(r.offset), r.len)
     }
 
+    /// `u32` view for concurrent writers (see [`Chunk::region_bytes_concurrent`]).
+    ///
+    /// # Safety
+    ///
+    /// As for `region_bytes_concurrent`, plus: `r` must be 4-byte aligned with a
+    /// length that is a multiple of 4, and no two participants may write the same
+    /// element.
+    pub unsafe fn region_u32_concurrent(&self, r: Region) -> &mut [u32] {
+        assert_eq!(r.offset % 4, 0, "u32 region must be 4-byte aligned");
+        assert_eq!(r.len % 4, 0, "u32 region length must be a multiple of 4");
+        let bytes = self.region_bytes_concurrent(r);
+        std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u32>(), r.len / 4)
+    }
+
+    /// `u16` view for concurrent writers (see [`Chunk::region_bytes_concurrent`]).
+    ///
+    /// # Safety
+    ///
+    /// As for `region_bytes_concurrent`, plus: `r` must be 2-byte aligned with a
+    /// length that is a multiple of 2, and no two participants may write the same
+    /// element.
+    pub unsafe fn region_u16_concurrent(&self, r: Region) -> &mut [u16] {
+        assert_eq!(r.offset % 2, 0, "u16 region must be 2-byte aligned");
+        assert_eq!(r.len % 2, 0, "u16 region length must be a multiple of 2");
+        let bytes = self.region_bytes_concurrent(r);
+        std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u16>(), r.len / 2)
+    }
+
     /// The whole chunk as bytes -- what a `shm_toc` allocation copies, and what the
     /// relocation test moves to another address.
     pub fn as_bytes(&self) -> &[u8] {
@@ -1148,6 +1176,94 @@ mod tests {
         let mut arena = arena;
         arena.grow_to(2); // no-op, exactly at capacity
         assert_eq!(arena.len(), 2);
+    }
+
+    #[pgrx::pg_test]
+    fn node_locks_serialize_concurrent_list_writes() {
+        // The backlink step's real contention: writers replacing one node's list while
+        // readers copy it.  Threads rather than processes, but the lock and the write
+        // path are the same ones workers use, and the assertion is the one that
+        // matters -- a reader holding the lock must never see a *mixture* of two
+        // writes, which is precisely what the lock exists to prevent.
+        let size = 1usize << 20;
+        // SAFETY: a fresh backend-owned segment, detached before the test returns.
+        let seg = unsafe { pgrx::pg_sys::dsm_create(size, 0) };
+        let toc = unsafe {
+            pgrx::pg_sys::shm_toc_create(
+                HNSWSQ_TOC_MAGIC,
+                pgrx::pg_sys::dsm_segment_address(seg),
+                size,
+            )
+        };
+        let tranche = register_tranche(c"hnswsq_contention_test");
+        let (stride, cap, nodes, slabs) = (8usize, 4usize, 8usize, 16usize);
+        let arena = unsafe { SharedArena::allocate(toc, stride, cap, nodes, slabs, tranche) };
+        let layout = arena.header().layout;
+        assert_eq!(
+            arena.state().claim(1, nodes, slabs),
+            Some((0, 0)),
+            "one node, one slab to contend on"
+        );
+
+        // `NodeLocks::new`, not the arena's LWLocks: an LWLock is a *per-process* lock,
+        // so two threads in one backend do not contend for it the way two worker
+        // processes do (the second acquire looks like a recursive acquire by the same
+        // process).  What this test can therefore check is the protocol and the
+        // concurrent write path over a segment; the cross-process case belongs to the
+        // parallel build, which is where it will actually run.
+        let locks = NodeLocks::new(nodes);
+
+        let rounds = 250;
+        std::thread::scope(|scope| {
+            for w in 0..2u32 {
+                let arena = &arena;
+                let locks = &locks;
+                scope.spawn(move || {
+                    let chunk = arena.chunk();
+                    let ids: [u32; 3] = if w == 0 { [1, 2, 3] } else { [3, 2, 1] };
+                    for _ in 0..rounds {
+                        let _guard = locks.write(0);
+                        // SAFETY: the write lock makes this thread the only writer of
+                        // node 0's slab.
+                        unsafe {
+                            chunk.region_u32_concurrent(layout.ids)[0..3].copy_from_slice(&ids);
+                            chunk.region_u16_concurrent(layout.lens)[0] = 3;
+                        }
+                    }
+                });
+            }
+            for _ in 0..2 {
+                let arena = &arena;
+                let locks = &locks;
+                scope.spawn(move || {
+                    let chunk = arena.chunk();
+                    for _ in 0..rounds {
+                        // The read lock excludes both writers, so this must be one
+                        // writer's list, never a torn one.
+                        let _guard = locks.read(0);
+                        let n = chunk.region_u16(layout.lens)[0] as usize;
+                        assert!(n <= cap, "length {} exceeds capacity {}", n, cap);
+                        let seen: Vec<u32> = chunk.region_u32(layout.ids)[0..n].to_vec();
+                        assert!(
+                            seen == [1, 2, 3] || seen == [3, 2, 1],
+                            "a reader saw a torn list: {:?}",
+                            seen
+                        );
+                    }
+                });
+            }
+        });
+
+        // The arena is still consistent afterwards, and the lock is free.
+        let final_list: Vec<u32> = arena.chunk().region_u32(layout.ids)[0..3].to_vec();
+        assert!(final_list == [1, 2, 3] || final_list == [3, 2, 1]);
+        {
+            let _w = locks.write(0);
+        }
+
+        drop(arena);
+        // SAFETY: no handle references the mapping any more.
+        unsafe { pgrx::pg_sys::dsm_detach(seg) };
     }
 
     #[pgrx::pg_test]

@@ -29,7 +29,7 @@
 //! on-disk node format uses, so a slab can never hold more than a node page item
 //! would.
 
-use crate::access_method::hnswsq::arena::{arena_layout, ArenaLayout, Chunk};
+use crate::access_method::hnswsq::arena::{arena_layout, ArenaLayout, Chunk, NodeLocks};
 use super::arena::ArenaState;
 use super::arena::SharedArena;
 use crate::util::ItemPointer;
@@ -418,6 +418,52 @@ impl FlatGraph {
             Some(chunk) => chunk.region_u16_mut(self.layout.lens)[slab] = n as u16,
             None => self.lens[slab] = n as u16,
         }
+    }
+
+    /// Write a node's list without a `&mut` borrow -- the parallel write path.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the only writer of `id`'s layer-`layer` slab: either the
+    /// worker that claimed `id` (its own list, before publishing), or a holder of
+    /// `id`'s node write lock.  Readers of the same node must hold its read lock.
+    /// Only valid for a chunk-backed graph -- a grow-mode `Vec` would have to
+    /// reallocate, which no reader could survive.
+    pub unsafe fn set_list_concurrent(&self, id: u32, layer: usize, ids: &[u32]) {
+        assert!(
+            ids.len() <= self.cap,
+            "neighbour list of {} exceeds slab capacity {}",
+            ids.len(),
+            self.cap
+        );
+        let chunk = self
+            .chunk
+            .as_ref()
+            .expect("concurrent writes need the chunk backing");
+        let slab = self.slab(id, layer).expect("layer beyond the node's level");
+        let base = slab * self.cap;
+        let n = ids.len();
+        {
+            // SAFETY: this caller is the only writer of this slab's ids (see above),
+            // and the region's alignment and length are checked by the accessor.
+            let view = unsafe { chunk.region_u32_concurrent(self.layout.ids) };
+            view[base..base + n].copy_from_slice(ids);
+        }
+        // SAFETY: as above, for the length that belongs to the same slab.  The write
+        // is last, so a concurrent reader can never see a length pointing at ids that
+        // have not been written yet.
+        unsafe { chunk.region_u16_concurrent(self.layout.lens)[slab] = n as u16 };
+    }
+
+    /// Write a *target* node's list under its node lock -- the backlink step, where
+    /// the writer does not own the node.  This is the only way a worker may touch a
+    /// list other than its own.
+    pub fn set_list_locked(&self, locks: &NodeLocks, id: u32, layer: usize, ids: &[u32]) {
+        // The node write lock excludes every other writer of this node's storage, and
+        // every reader of it holds the read lock.
+        let _guard = locks.write(id);
+        // SAFETY: as above -- the write lock is what makes this the only writer.
+        unsafe { self.set_list_concurrent(id, layer, ids) };
     }
 
     /// Borrowed view of a node's layer-`layer` list (valid prefix only).
@@ -1056,6 +1102,54 @@ mod tests {
         drop(b);
         drop(peer_arena);
         drop(a);
+        drop(arena);
+        // SAFETY: no handle references the mapping any more.
+        unsafe { pgrx::pg_sys::dsm_detach(seg) };
+    }
+
+    #[pgrx::pg_test]
+    fn a_locked_write_reaches_a_peer_handle() {
+        // `set_list_locked` is the backlink path: writing a node the caller does not
+        // own, under that node's lock, through the shared chunk rather than a `&mut`.
+        // Contention itself is covered at the arena level (see arena.rs), where the
+        // send/sync argument is already made.
+        let size = 1usize << 20;
+        // SAFETY: a fresh backend-owned segment, detached before the test returns.
+        let seg = unsafe { pgrx::pg_sys::dsm_create(size, 0) };
+        let toc = unsafe {
+            pgrx::pg_sys::shm_toc_create(
+                super::super::arena::HNSWSQ_TOC_MAGIC,
+                pgrx::pg_sys::dsm_segment_address(seg),
+                size,
+            )
+        };
+        let tranche = super::super::arena::register_tranche(c"hnswsq_locked_write_test");
+        let (stride, cap, nodes, slabs) = (8usize, 4usize, 8usize, 16usize);
+        let arena =
+            unsafe { super::super::arena::SharedArena::allocate(toc, stride, cap, nodes, slabs, tranche) };
+        let mut writer = FlatGraph::in_arena(&arena);
+        for i in 0..3u32 {
+            let id = writer.claim_slot(0).expect("room");
+            writer.publish(id, tid(i + 1), false, &[i as u8; 8]);
+        }
+        let peer_arena = unsafe { super::super::arena::SharedArena::attach(toc) };
+        let peer = FlatGraph::in_arena(&peer_arena);
+
+        writer.set_list_locked(arena.locks(), 1, 0, &[2, 0]);
+        assert_eq!(peer.neighbors(1, 0), &[2, 0], "the peer sees the locked write");
+        writer.set_list(1, 0, &[]);
+        assert_eq!(peer.neighbors(1, 0), &[] as &[u32], "and an empty list too");
+
+        // The write path checks capacity rather than overrunning the slab.
+        let too_long = [0u32; 5];
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.set_list_locked(arena.locks(), 1, 0, &too_long);
+        }));
+        assert!(caught.is_err(), "over-capacity lists are a programming error");
+
+        drop(peer);
+        drop(peer_arena);
+        drop(writer);
         drop(arena);
         // SAFETY: no handle references the mapping any more.
         unsafe { pgrx::pg_sys::dsm_detach(seg) };
