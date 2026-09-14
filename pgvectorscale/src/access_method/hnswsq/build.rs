@@ -547,7 +547,10 @@ pub(crate) unsafe fn parallel_worker_scan(
 
     let pscan = unsafe { crate::access_method::hnswsq::driver::scan_descriptor(toc) };
     let scan = unsafe { pg_sys::table_beginscan_parallel(heap, pscan.cast()) };
+
     if stage == 3 {
+        // `table_endscan` is safe here only because the scan never ran: `index_build_range_scan`
+        // is what takes ownership, and it has not been called.
         unsafe { pg_sys::table_endscan(scan) };
         unsafe { pg_sys::index_close(index, lockmode) };
         unsafe { pg_sys::table_close(heap, lockmode) };
@@ -587,8 +590,10 @@ pub(crate) unsafe fn parallel_worker_scan(
         );
     }
 
+    // No `table_endscan` here: `index_build_range_scan` takes ownership of the scan and ends it
+    // itself before returning.  Ending it a second time is a double free, and it is what
+    // segfaulted the worker -- the scan had *completed* and the crash came 8 ms later.
     unsafe {
-        pg_sys::table_endscan(scan);
         pg_sys::index_close(index, lockmode);
         pg_sys::table_close(heap, lockmode);
     }

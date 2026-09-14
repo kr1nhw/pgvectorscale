@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M3 step 5o: the parallel build runs** | **done** | 100k rows, 1 worker 6294 ms / 2 workers 2997 ms, graph well formed |
 | M3 step 5n: crash pinned to `index_build_range_scan` | **one call** | stages 1-4 clean with a worker running; 5-7 crash; the delta is the scan |
 | M3 step 5m: leader teardown fixed, crash now in the worker's inserts | **leader verified** | stage 9 clean with 2 workers; stage 0 dies in a worker after ~3 s |
 | M3 step 5l: crash bisect | **worker startup, not worker code** | a do-nothing worker crashes too; the same flow works in the pgrx test cluster |
@@ -1554,6 +1555,49 @@ means the leader-side setup is wrong (the snapshot has to be registered/exportab
 copied into a descriptor that another process will read).  If it looks right, the next suspect is
 `index_info`, which each worker builds with `BuildIndexInfo` -- palloc'd in the worker, which the
 scan may then expect to have been prepared (`ii_ExpressionsState`) by the leader.
+
+### 3j.27 The parallel build runs
+
+The crash was a **double free of the scan descriptor**: `index_build_range_scan` takes ownership
+of the scan it is given and ends it itself, so the `table_endscan` that followed it freed an
+already-freed descriptor.  The markers that proved it are worth recording as the technique --
+each logged *before* the call it guards:
+
+```
+hnswsq parallel scan: pscan=0x1171e4300 scan=0x82d40c650 rs_parallel=0x1171e4300
+                      rs_rd=0x82bc69270 rs_snapshot=0x82d40db70 heap=0x82bc69270
+hnswsq parallel scan: callback reached      (x3)
+hnswsq parallel scan: index_build_range_scan returned
+hnswsq parallel scan: ending scan
+<segfault>
+```
+
+So the descriptor was right (`rs_parallel` matched, `rs_rd` was the heap, the snapshot was
+non-null), the scan **completed**, the callbacks ran, and the crash came in the teardown eight
+milliseconds later.  Two hypotheses died on that log line (the snapshot not being serialized, and
+anything in the callback) before the real one, which is the argument for instrumenting rather than
+reasoning when the failure is a segfault.
+
+**First measurements**, `hnswsq_parallel_build_debug` on `t100k` (100k rows, dim 16, `m=16`,
+`ef_construction=64`, plain layout, 64 MB arena, seed node included):
+
+| workers | published | structure | elapsed |
+|---|---|---|---|
+| 1 | 100 001 | `no_incoming=0 reachable=100001 self_links=0 duplicates=0 max_len=32/32` | **6294 ms** |
+| 2 | 100 001 | `no_incoming=40 reachable=99961 self_links=0 duplicates=0 max_len=32/32` | **2997 ms** |
+
+Three things to note.  Every row became a node (`100001` = 100k + the seed) and the graph passes
+the structural gate.  Two workers are **2.1x** one worker on this shape -- the first real
+concurrency result, though on a small table where the build is only seconds long, so it says
+"scales" rather than "scales to 4 workers on 1M".  And the connectivity delta between 1 and 2
+workers is exactly what the concurrency gate was written for: `no_incoming` goes 0 -> 40 and
+`reachable` 100001 -> 99961, i.e. 0.04% of nodes.  That is small, but it is not zero, and the
+acceptance criterion (`recall within 0.005` and `no_incoming`/`reachable` within tolerance against
+the same-policy single-worker build) is what decides whether it is acceptable.
+
+The path is still driven by a debug SQL function rather than `CREATE INDEX`: `amcanbuildparallel`
+and the AM wiring remain, as does the leader's writeout of the arena.  The 1M / 4-worker target is
+therefore still unmet -- but it is now measurable.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
