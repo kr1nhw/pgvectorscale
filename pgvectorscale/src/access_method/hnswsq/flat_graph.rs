@@ -1369,6 +1369,73 @@ mod tests {
     }
 
     #[pgrx::pg_test]
+    fn the_leader_promotes_the_best_entry_after_the_workers_stop() {
+        // Workers never promote the entry (every insert would serialize on one cache line),
+        // so the leader seeds one before launching and re-promotes after the join -- because
+        // a higher-level node may have appeared in between.  This pins that contract,
+        // including the part that is easy to get wrong: a claimed-but-unpublished slot has a
+        // level but no list yet, and must not become the entry.
+        let size = 1usize << 20;
+        // SAFETY: a fresh backend-owned segment, detached before the test returns.
+        let seg = unsafe { pgrx::pg_sys::dsm_create(size, 0) };
+        let toc = unsafe {
+            pgrx::pg_sys::shm_toc_create(
+                super::super::arena::HNSWSQ_TOC_MAGIC,
+                pgrx::pg_sys::dsm_segment_address(seg),
+                size,
+            )
+        };
+        let tranche = super::super::arena::register_tranche(c"hnswsq_entry_promotion_test");
+        let (stride, cap, nodes, slabs) = (8usize, 4usize, 8usize, 24usize);
+        let arena =
+            unsafe { super::super::arena::SharedArena::allocate(toc, stride, cap, nodes, slabs, tranche) };
+        let mut g = FlatGraph::in_arena(&arena);
+
+        // The leader's seed: a search needs an entry before any worker starts.
+        let a = g.claim_slot(0).expect("room");
+        g.publish(a, tid(1), false, &[1u8; 8]);
+        assert!(g.promote_entry(a), "the seed becomes the entry");
+
+        // What workers do: claim, publish, never promote.
+        let b = g.claim_slot(1).expect("room");
+        g.publish(b, tid(2), false, &[2u8; 8]);
+        let c = g.claim_slot(2).expect("room");
+        g.publish(c, tid(3), false, &[3u8; 8]);
+        assert_eq!(g.entry(), Some(a), "no worker promoted anything");
+
+        // The leader's post-join promotion picks the highest level.
+        assert_eq!(
+            super::super::driver::promote_best_entry(&mut g),
+            Some((c, 2)),
+            "the level-2 node wins"
+        );
+        assert_eq!(g.entry(), Some(c));
+        assert_eq!(g.entry_level(), 2);
+
+        // A claimed slot with a higher level is *not* entry material: it has no list yet.
+        let d = g.claim_slot(2).expect("room");
+        assert!(d > c);
+        assert_eq!(
+            super::super::driver::promote_best_entry(&mut g),
+            Some((c, 2)),
+            "only published nodes are considered"
+        );
+
+        // A peer handle sees the promoted entry, because it lives in the arena.
+        let peer_arena = unsafe { super::super::arena::SharedArena::attach(toc) };
+        let peer = FlatGraph::in_arena(&peer_arena);
+        assert_eq!(peer.entry(), Some(c));
+        assert_eq!(peer.entry_level(), 2);
+
+        drop(peer);
+        drop(peer_arena);
+        drop(g);
+        drop(arena);
+        // SAFETY: no handle references the mapping any more.
+        unsafe { pgrx::pg_sys::dsm_detach(seg) };
+    }
+
+    #[pgrx::pg_test]
     fn a_locked_write_reaches_a_peer_handle() {
         // `set_list_locked` is the backlink path: writing a node the caller does not
         // own, under that node's lock, through the shared chunk rather than a `&mut`.

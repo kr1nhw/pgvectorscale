@@ -221,6 +221,34 @@ impl BuildParams {
     }
 }
 
+/// Leader, after the workers stop: promote the highest-level published node to entry.
+///
+/// Workers never promote the entry themselves -- every insert would then serialize on one
+/// cache line, and promotion only matters once the graph stops growing.  The leader seeds an
+/// entry *before* launching so searches have somewhere to start (without one, every node is
+/// born with an empty list -- a failure this project has already produced once), and then
+/// has to re-promote here, because a higher-level node may have appeared afterwards.  That
+/// is this function's whole job, and its return value is what the build reports.
+///
+/// Only ids below the watermark are considered: a claimed-but-unpublished slot has a level
+/// but no list, and promoting one would hand searches an entry that is not there yet.
+pub fn promote_best_entry(g: &mut crate::access_method::hnswsq::flat_graph::FlatGraph) -> Option<(u32, usize)> {
+    let mut best: Option<(u32, usize)> = None;
+    for id in 0..g.watermark() as u32 {
+        let level = g.level(id) as usize;
+        if best.is_none_or(|(_, best_level)| level > best_level) {
+            best = Some((id, level));
+        }
+    }
+    if let Some((id, level)) = best {
+        // A no-op when the current entry already outranks it.
+        g.promote_entry(id);
+        assert_eq!(g.entry(), Some(id), "promotion must take effect");
+        return Some((id, level));
+    }
+    None
+}
+
 /// Key for the shared table-scan descriptor.
 pub const TOC_KEY_SCAN: u64 = 0x686e_7377_7371_2002;
 

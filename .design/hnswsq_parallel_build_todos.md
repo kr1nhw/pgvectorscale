@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5d: post-join entry promotion | done | `promote_best_entry`; workers never promote |
 | M3 step 5c: shared scan descriptor in the toc | done | `table_parallelscan_*`; one descriptor every worker reads |
 | M3 step 5b: build parameters + verified toc magic | done | `BuildParams` round-trips; `PARALLEL_MAGIC` is measured, not remembered |
 | M3 step 5: parallel worker entry, cross-process verified | done | workers load the library, attach the leader's arena, touch the shared cursors |
@@ -1210,6 +1211,23 @@ opened from the oids in `BuildParams`.  The callback is
 `extern "C-unwind" fn(index, tid, values, isnull, tupleIsAlive, state)`, which is where the
 vector for `claim_slot`/`plan_flat`/`apply_flat` comes from -- i.e. the next step is the
 insert loop itself, no further ABI discovery expected.
+
+### 3j.16 Who promotes the entry, and when
+
+Workers never promote the entry: every insert would then serialize on one cache line, and
+promotion only matters once the graph stops growing.  So the leader does it twice -- it seeds
+an entry *before* launching (without one, searches find nothing and every node is born with
+an empty list, a failure this project already produced once and caught only through the
+structure gate), and it re-promotes *after* the join, because a higher-level node may have
+appeared in between.
+
+`driver::promote_best_entry` is the second half.  It walks ids below the **watermark**, not
+below the claim cursor: a claimed-but-unpublished slot has a level but no list yet, and
+promoting one would hand searches an entry that is not there.  That distinction is what the
+new test pins, along with the fact that peer handles see the promoted entry (it lives in
+`ArenaState`, not in one handle's fields).
+
+Verified: 3 driver, 31 flat and 19 arena tests green.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
