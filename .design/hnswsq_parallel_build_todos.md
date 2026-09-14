@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5s: `build_index_parallel` extracted for `ambuild` | **done** | harness is a thin wrapper; behaviour identical |
 | **M3 step 5r: recall of a parallel-built index** | **done** | ef 40/100: parallel 0.80/1.00 vs single-builder 0.60/1.00 |
 | M3 step 5q: parallel writeout into a real index | **done** | 100 001 nodes written in 1912 ms total; structure checks clean |
 | **M3 step 5p: 1M sweep, acceptance met** | **done** | 1/2/4 workers = 109.5 / 53.8 / **27.4 s** (target: <=160 s at 4) |
@@ -1697,6 +1698,26 @@ parallel one is ahead at the tighter budget.  A plausible reading is that concur
 leaves a graph with more, shorter-range edges (the same effect that raises `no_incoming`), which
 helps at small ef and washes out at large ef -- worth testing on the harder dataset, not asserting
 from two numbers.
+
+### 3j.31 One implementation for the harness and for `CREATE INDEX`
+
+The parallel build now lives in `driver::build_index_parallel(heap_oid, index_oid, workers, dims,
+dist_type, budget_mb, write_out)`, and the SQL harness is a thin wrapper over it.  That matters for
+more than tidiness: every measurement taken through the harness is now a measurement of the function
+`ambuild` will call, so the numbers in 3j.28/3j.30 cannot drift away from what `CREATE INDEX` does.
+
+Verified behaviour-preserving on `t100k` (4 workers, write-out into a fresh index):
+`published=100001 written=100001`, `no_incoming=327 reachable=99674 self_links=0 duplicates=0
+max_len=32/32`, 2025 ms, and recall@10 at ef=40 = 0.80 -- i.e. the same result as before the split,
+with `no_incoming` varying in the band the earlier reproducibility runs established.
+
+**What the `ambuild` hook needs, now that the function exists** (and what `ambuild` already
+provides): the relations open (it has them), the meta page written *before* the build (its structure
+already does this -- the ordering constraint from 3j.19 is satisfied by construction), and an
+`IndexBuildResult` to return afterwards, with `index_tuples`/`heap_tuples` from the run.  The hook
+is therefore: when `hnswsq.build_workers > 0` and the build is not concurrent, call
+`build_index_parallel` and skip the sequential scan; then set `amcanbuildparallel` in the AM routine
+so the capability is advertised.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

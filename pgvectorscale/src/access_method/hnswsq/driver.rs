@@ -379,14 +379,26 @@ pub unsafe extern "C-unwind" fn hnswsq_parallel_build_main(
 ///
 /// Returns a one-line summary: rows published, structural checks, elapsed milliseconds, and how
 /// many workers actually ran.
-#[pg_extern]
-pub fn hnswsq_parallel_build_debug(
+/// Run a whole parallel build against a table and index that are already open, and report it.
+///
+/// This is the body the SQL harness wraps, and the function `ambuild` will call once
+/// `amcanbuildparallel` is wired: one implementation, so a measurement made through the harness is
+/// a measurement of exactly what `CREATE INDEX` will do.  It takes oids rather than relations
+/// because it opens and closes its own (every participant needs the same locks).
+///
+/// `budget_mb` sizes the arena the way `maintenance_work_mem` sizes the single-builder graph: too
+/// small and the workers simply stop claiming, which shows up as fewer published nodes rather
+/// than as an error.
+///
+/// Returns a one-line summary: rows published, structural checks, elapsed milliseconds, and how
+/// many workers actually ran.
+pub(crate) fn build_index_parallel(
     heap_oid: pg_sys::Oid,
     index_oid: pg_sys::Oid,
     workers: i32,
-    dims: i32,
-    dist_type: i32,
-    budget_mb: i32,
+    dims: u32,
+    dist_type: u32,
+    budget_mb: u64,
     write_out: bool,
 ) -> String {
     use pgrx::PgRelation;
@@ -398,7 +410,6 @@ pub fn hnswsq_parallel_build_debug(
     let m0 = m * 2;
     let ef_construction = options.get_ef_construction() as u32;
     let meta = crate::access_method::hnswsq::meta_page::HnswMetaPage::fetch(&index_rel);
-    let dims = dims as u32;
     let stride = dims * precision.elem_bytes() as u32;
     // The arena is sized from the caller's budget, exactly as the single-builder path sizes
     // its in-memory graph: too small and the workers simply stop claiming, which shows up as
@@ -517,6 +528,27 @@ pub fn hnswsq_parallel_build_debug(
     };
     let _ = (published, launched);
     summary
+}
+
+#[pg_extern]
+pub fn hnswsq_parallel_build_debug(
+    heap_oid: pg_sys::Oid,
+    index_oid: pg_sys::Oid,
+    workers: i32,
+    dims: i32,
+    dist_type: i32,
+    budget_mb: i32,
+    write_out: bool,
+) -> String {
+    build_index_parallel(
+        heap_oid,
+        index_oid,
+        workers,
+        dims.max(1) as u32,
+        dist_type.max(1) as u32,
+        budget_mb.max(1) as u64,
+        write_out,
+    )
 }
 
 #[cfg(any(test, feature = "pg_test"))]
