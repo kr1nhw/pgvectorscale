@@ -448,18 +448,9 @@ pub(crate) fn build_index_parallel(
             leader_setup(pcxt, stride as usize, m0 as usize, sizing, tranche);
         leader_scan_setup(pcxt, heap, snapshot);
 
-        // The leader seeds an entry: workers never promote one, and without an entry every
-        // node is born with no edges at all.
-        {
-            let mut seed = super::flat_graph::FlatGraph::in_arena(&arena);
-            if let Some(id) = seed.claim_slot(0) {
-                // A zero vector: the seed exists to give searches somewhere to start, and a
-                // zero encoding is valid for every layout.
-                let encoded = vec![0u8; stride as usize];
-                seed.publish(id, crate::util::ItemPointer::new(1, 1), false, &encoded);
-                let _ = seed.promote_entry(id);
-            }
-        }
+        // No seed node.  The first node a worker inserts establishes the entry itself (see
+        // `promote` in flat_engine), so the index holds exactly the table's rows -- a fabricated
+        // seed would be a real entry with a vector and a heap TID that no row has.
 
         let params_snapshot = BuildParams {
             rows: 0,
@@ -513,7 +504,10 @@ pub(crate) fn build_index_parallel(
         // `IndexBuildResult` below would report the truncated count as the table's row count.
         // (Measured before this check existed: 16 MB and 100k rows produced an index of 75 251
         // entries and rewrote the heap's `reltuples` to match.)
-        let indexed = published.saturating_sub(1); // the seed is not a row
+        // Every published node is a row: there is no seed node any more (the first node a worker
+        // inserts establishes the entry itself).  Subtracting one here -- as this did while the
+        // seed existed -- makes every complete build look one row short.
+        let indexed = published;
         if (scanned as usize) > indexed {
             pgrx::error!(
                 "hnswsq parallel build is incomplete: {} rows scanned but only {} indexed \
@@ -735,7 +729,7 @@ mod tests {
                 seed.publish(id, crate::util::ItemPointer::new(1, 1), false, &[1u8; 12]);
                 assert!(seed.promote_entry(id), "the seed owns the entry");
             }
-            arena.state().set_start_nodes(1);
+            arena.state().set_start_nodes(0);
 
             BuildParams {
                 rows: 200,

@@ -523,7 +523,17 @@ fn promote(locking: &Locking<'_>, g: &mut FlatGraph, new_id: u32) {
         Locking::SoleWriter => {
             g.promote_entry(new_id);
         }
-        Locking::Locks(_) => {}
+        Locking::Locks(_) => {
+            // The graph's very first node establishes the entry, exactly as on the single-builder
+            // path.  Without this a parallel build has *no* entry unless the leader fabricates one
+            // -- and a fabricated seed is a real index entry holding a vector and a heap TID that
+            // no row has, so a search can return a TID whose stored vector does not match the row.
+            // Only the empty case promotes: every later insert would otherwise serialize on the
+            // entry, and the leader re-promotes after the join anyway (3j.16).
+            if g.entry().is_none() {
+                g.promote_entry(new_id);
+            }
+        }
     }
 }
 

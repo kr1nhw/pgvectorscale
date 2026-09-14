@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M3 step 5w: fabricated seed removed -- recall now matches single-builder** | **done** | published=rows; ef 20/40/80 = 0.6/0.6/0.9, identical to 1 worker |
 | **M3 step 5v: incomplete-build + reltuples bugs fixed** | **done** | small memory now errors instead of truncating; `heap_tuples` is rows scanned |
 | **M3 step 5u: recall sweep, both scales, fresh indexes** | **done** | 100k: -0.10 at ef 20-40; 1M: mixed, +/-0.2-0.4 both ways, equal by ef 80 |
 | **M3 step 5t: `CREATE INDEX` drives the parallel build** | **done** | 100k in 2.6 s; `workers=0` bit-identical (fingerprint `3794aa11c860aba0`) |
@@ -1857,6 +1858,37 @@ vector is not the zero vector.  The single-builder path has no seed and no such 
 (`published=100000`).  This is a correctness issue, not a cosmetic one, and it is the next thing to
 fix: the seed should be a **real row** (its own vector and its own TID), or the leader should let
 the first worker's insert establish the entry as the single-builder path does.
+
+### 3j.35 Removing the fabricated seed fixed the recall gap
+
+The seed node (a zero vector with a fabricated TID) is gone.  The graph's **first node** now
+establishes the entry itself, the way the single-builder path does: `promote` in `flat_engine`
+promotes when the graph has no entry even under `Locking::Locks`, and only then -- every later
+insert would serialize on the entry, and the leader's post-join `promote_best_entry` still runs.
+
+On `t100k`, 4 workers, `CREATE INDEX`:
+
+```
+published=100000 written=100000          <-- exactly the table's rows, no extra entry
+reltuples(heap/index) = 100000/100000
+checks(published=100000 no_incoming=317 reachable=99681 self_links=0 duplicates=0 max_len=32/32)
+recall@10:  ef=20 -> 0.6    ef=40 -> 0.6    ef=80 -> 0.9
+```
+
+Those recall numbers are **identical to the single-builder build's** at all three points (3j.33:
+0.6 / 0.6 / 0.9), where the seeded parallel build was 0.5 / 0.5 / 0.853.
+
+**Which supersedes part of 3j.33.**  That entry read the 100k deficit (-0.10 at ef 20-40) as
+consistent with the connectivity delta.  It was not: it was the fabricated seed.  A zero vector is
+far from every real vector, so as the *entry* it is a poor place to start a search, and as a *node*
+it distorts the neighbourhoods that link to it.  The connectivity delta (307-317 nodes without an
+incoming edge) is real but has not been shown to cost recall at all.  The 1M comparison should be
+re-run for the same reason, since its "parallel better at ef 10-20" result was measured with the
+seed present.
+
+This is also a good argument for the completeness check that found it: the check was written for
+arena exhaustion, and it is what surfaced the seed's *count* -- one more entry than the table has
+rows -- which is what made the extra node obvious.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
