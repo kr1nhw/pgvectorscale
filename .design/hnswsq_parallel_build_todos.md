@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5m: leader teardown fixed, crash now in the worker's inserts | **leader verified** | stage 9 clean with 2 workers; stage 0 dies in a worker after ~3 s |
 | M3 step 5l: crash bisect | **worker startup, not worker code** | a do-nothing worker crashes too; the same flow works in the pgrx test cluster |
 | M3 step 5k: SQL-callable parallel build + first run | **crashes in the worker** | leader-only run is clean (3 ms); worker path segfaults |
 | M3 step 5j: the callback, the scan loop, the wired entry | done (compile-verified) | two workers launched, entered, and reached the relation open |
@@ -1476,6 +1477,46 @@ postmaster's account of the crash was lost.  Restart it with a logfile and
 `log_min_messages=debug1` (a crash names the signal and the process role), then rerun stage 9 --
 that will say whether the worker dies before or inside `ParallelWorkerMain`, which is the
 question no amount of further bisecting inside the worker can answer.
+
+### 3j.25 Two crashes, found by reading the log rather than guessing
+
+Restarting the scratch cluster with `-l` (it had been started without one, which is why the
+previous round had nothing to read) made the postmaster's account of the crash decisive, and it
+said something the code alone had not:
+
+```
+background worker "parallel worker" (PID 26432) exited with exit code 0
+LOG:  client backend (PID 26430) was terminated by signal 11: Segmentation fault
+```
+
+The worker was fine; the **leader** was dying.  In the debug function the summary `format!` read
+`arena.state()` *after* `DestroyParallelContext` -- which detaches the dsm segment, leaving the
+arena handle dangling.  Reading the values before teardown fixes it, and the check is that
+`stage 9` now completes with two workers:
+
+```
+workers launched=2 entered=0 failed=false published=1 slabs=1/67108855 \
+  checks(published=1 no_incoming=1 reachable=1 self_links=0 duplicates=0 max_len=0/32) elapsed_ms=6
+```
+
+(The `elapsed_ms=6` is just the leader: at stage 9 the workers return before attaching, which is
+why `entered=0` -- and why this is a clean control rather than a build.)
+
+With the leader fixed, the crash *moved*: at stage 0 the failing process is now the **worker**,
+and the timeline says it ran for about three seconds first --
+
+```
+14:53:26.104  starting background worker process "parallel worker for PID 27193"
+14:53:29.052  background worker "parallel worker" (PID 27194) was terminated by signal 11
+```
+
+-- so the workers are scanning and inserting, and the fault is inside the insert path (the
+callback, `flat_insert_at_level`, or the locked backlink write), not in startup.  That is the
+first time the parallel path has executed real work.
+
+**Next diagnostic:** extend `hnswsq.parallel_stage` into the callback -- return after
+`extract_vector`, after `plan_flat`, after `apply_flat`, before `publish` -- and bisect the same
+way.  The harness reports how far it got, so each stage is one run.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

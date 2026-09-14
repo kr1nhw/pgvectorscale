@@ -412,6 +412,9 @@ pub fn hnswsq_parallel_build_debug(
     let start = std::time::Instant::now();
     let mut published = 0usize;
     let mut launched = 0i32;
+    let mut entered = 0u32;
+    let mut failed = false;
+    let mut slabs_claimed = 0usize;
     let summary = unsafe {
         let heap = pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
@@ -467,10 +470,15 @@ pub fn hnswsq_parallel_build_debug(
 
         pg_sys::LaunchParallelWorkers(pcxt);
         pg_sys::WaitForParallelWorkersToFinish(pcxt);
+        // Everything the summary needs must be read *before* the context is destroyed:
+        // `DestroyParallelContext` detaches the segment, and the arena handle points into it.
+        // (The first version formatted the string afterwards and segfaulted the *leader* --
+        // the worker had exited cleanly, which is what the postmaster log said.)
         launched = (*pcxt).nworkers_launched;
         published = arena.state().watermark();
-        let failed = arena.state().failed();
-        let entered = arena.state().workers_entered();
+        failed = arena.state().failed();
+        entered = arena.state().workers_entered();
+        slabs_claimed = arena.state().claimed().1;
         let checks = super::flat_graph::check_lists(
             &super::flat_graph::FlatGraph::in_arena(&arena),
             m0 as usize,
@@ -485,7 +493,7 @@ pub fn hnswsq_parallel_build_debug(
             entered,
             failed,
             published,
-            arena.state().claimed().1,
+            slabs_claimed,
             layout.total_bytes,
             checks.published,
             checks.nodes_without_incoming,
