@@ -40,6 +40,16 @@ pinned seed, release, same host, unless stated):
 5. **M7**: settle the surviving policy (append/shrink only, or also exact) with the 1M
    measurement, then delete the legacy engine, the adapter and `build_engine`.
 
+**Blocked step, recorded so the next session does not re-discover it:** the 1M BIGANN
+`build_backfill` 0-vs-1 decision run (item 1 above) could not be started — host
+121.37.117.106 was unreachable over SSH for two consecutive attempts (connection
+timeout; it had also failed a banner exchange earlier in this session).  Everything
+needed for that run is committed and installable: the knob, the pinned-seed harness,
+and `run_sweep_hnswsq.sh`; the sequence is sync → `cargo pgrx install --release` →
+two builds (`hnswsq.build_engine = 1`, `build_backfill` 0 then 1, pinned seed) → sweep.
+No code or measurement depends on anything else being done first, so it can run as soon
+as the host answers.
+
 **Two traps this work has already paid for**, both worth re-reading before touching the
 harness: `cargo pgrx test` installs a *debug* extension over the release one (the cycle
 scripts now refuse to run against it), and recall alone cannot see connectivity damage
