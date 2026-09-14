@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5l: crash bisect | **worker startup, not worker code** | a do-nothing worker crashes too; the same flow works in the pgrx test cluster |
 | M3 step 5k: SQL-callable parallel build + first run | **crashes in the worker** | leader-only run is clean (3 ms); worker path segfaults |
 | M3 step 5j: the callback, the scan loop, the wired entry | done (compile-verified) | two workers launched, entered, and reached the relation open |
 | M3 step 5i: `worker_build_state` over the shared arena | done | from `BuildParams` + the arena; `BuildState` is crate-visible |
@@ -1438,6 +1439,43 @@ because the harness already reports how far it got.
 
 **Fix on the way here:** the index relation has to be opened with `index_open`, not `table_open`
 (the leader-side attempt failed loudly with "This operation is not supported for indexes").
+
+### 3j.24 The crash is in worker *startup*, not in the worker's code
+
+`hnswsq.parallel_stage` (debug-only) makes a worker stop after N steps, which bisected the crash
+in four runs:
+
+| stage | what the worker does | result |
+|---|---|---|
+| 9 | returns from the entry point immediately | **crash** |
+| 1 | opens the heap and index | crash |
+| 2 | + `BuildIndexInfo` | crash |
+| 3 | + `table_beginscan_parallel` | crash |
+| 4 | + the worker's `BuildState` | crash |
+| 0 | the whole build | crash |
+| -- | `workers=0` (leader only) | clean, 3 ms |
+
+So every stage crashes identically, including one where the worker touches nothing: **the fault is
+not in the worker's code at all**. Three follow-ups, each eliminating a hypothesis cheaply:
+
+* **arena size**: a 1 MB arena crashes the same way, so the large dsm segment at 64 MB is not the
+  trigger.
+* **parallel mode**: wrapping the context in `EnterParallelMode`/`ExitParallelMode` (which
+  PostgreSQL's own callers always do, and which this code did not) changes nothing -- correct to
+  add, but not the cause.
+* **the worker's own path**: ruled out by stage 9.
+
+What this leaves is how the context is *driven* from a SQL function, in this cluster.  The same
+sequence -- `CreateParallelContext` -> `InitializeParallelDSM` -> `LaunchParallelWorkers` ->
+`WaitForParallelWorkersToFinish` -> `DestroyParallelContext`, with workers successfully entering
+the entry point -- already works inside the pgrx test cluster, which is the main difference
+between the working and failing cases.
+
+**Next diagnostic, and it needs the log**: the scratch cluster was started without `-l`, so the
+postmaster's account of the crash was lost.  Restart it with a logfile and
+`log_min_messages=debug1` (a crash names the signal and the process role), then rerun stage 9 --
+that will say whether the worker dies before or inside `ParallelWorkerMain`, which is the
+question no amount of further bisecting inside the worker can answer.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

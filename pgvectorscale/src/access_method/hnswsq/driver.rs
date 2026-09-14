@@ -338,6 +338,12 @@ pub unsafe extern "C-unwind" fn hnswsq_parallel_build_main(
     _seg: *mut pg_sys::dsm_segment,
     toc: *mut pg_sys::shm_toc,
 ) {
+    // Debug: a worker that does nothing at all.  If this still crashes, the fault is in how the
+    // context was created rather than in the worker's own code.
+    if crate::access_method::hnswsq::options::HNSWSQ_PARALLEL_STAGE.get() == 9 {
+        return;
+    }
+
     let arena = worker_attach(toc);
     arena.state().worker_entered();
     arena.state().worker_started();
@@ -410,6 +416,10 @@ pub fn hnswsq_parallel_build_debug(
         let heap = pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let snapshot = pg_sys::GetActiveSnapshot();
+        // `EnterParallelMode` is what PostgreSQL's own callers do around a parallel context,
+        // and it is not optional: without it a *worker that does nothing at all* still takes
+        // the server down, because the worker inherits state the leader never established.
+        pg_sys::EnterParallelMode();
         let pcxt = pg_sys::CreateParallelContext(
             LIBRARY.as_ptr().cast_mut().cast::<std::os::raw::c_char>(),
             c"hnswsq_parallel_build_main".as_ptr().cast_mut(),
@@ -466,6 +476,7 @@ pub fn hnswsq_parallel_build_debug(
             m0 as usize,
         );
         pg_sys::DestroyParallelContext(pcxt);
+        pg_sys::ExitParallelMode();
         pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         pg_sys::table_close(heap, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         format!(

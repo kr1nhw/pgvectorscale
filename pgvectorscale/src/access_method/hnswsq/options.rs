@@ -167,6 +167,16 @@ pub static HNSWSQ_BUILD_BACKFILL: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32
 /// the in-memory graph; the transactional insert path is unaffected.
 pub static HNSWSQ_BUILD_WORKERS: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
 
+/// `hnswsq.parallel_stage`: **debug only** -- stop a parallel worker after this many steps, so
+/// a crash in the worker path can be bisected without recompiling.  `0` is a real build.
+///
+/// The stages are, in order: 9 before the worker does anything at all, 1 after opening the
+/// relations, 2 after `BuildIndexInfo`, 3 after `table_beginscan_parallel`, 4 after the worker's
+/// `BuildState`.  Anything else means "run to completion".  Stage 9 exists to separate "my
+/// worker code is wrong" from "PostgreSQL's worker startup is unhappy with how I drove it".  It exists because the worker path is new and a segfault there tells you
+/// nothing about which call caused it.
+pub static HNSWSQ_PARALLEL_STAGE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
+
 static mut RELOPT_KIND_HNSW: pg_sys::relopt_kind::Type = 0;
 
 /// Initialize GUC variables and reloptions for the hnswsq access method.
@@ -270,6 +280,27 @@ pub unsafe fn init() {
         &HNSWSQ_BUILD_BACKFILL,
         0,
         1,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("hnswsq.parallel_stage".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Debug only: stop a parallel worker after N steps (0 = run the build)."
+                    .as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "1 relations, 2 index info, 3 scan, 4 worker state; 0 or >4 runs the build."
+                    .as_pg_cstr(),
+            )
+        },
+        &HNSWSQ_PARALLEL_STAGE,
+        0,
+        9,
         pgrx::GucContext::Userset,
         pgrx::GucFlags::default(),
     );

@@ -517,15 +517,42 @@ pub(crate) unsafe fn parallel_worker_scan(
     // Each worker builds its own IndexInfo: it is palloc'd, so it cannot be shared, and it is
     // a deterministic function of the relation anyway.  It is what tells the scan which
     // column to hand the callback -- i.e. where the vector comes from.
+    // Debug bisect: `hnswsq.parallel_stage` stops the worker after N steps, because a segfault
+    // in a fresh code path says nothing about which call caused it.
+    let stage = crate::access_method::hnswsq::options::HNSWSQ_PARALLEL_STAGE.get();
+    if stage == 1 {
+        unsafe { pg_sys::index_close(index, lockmode) };
+        unsafe { pg_sys::table_close(heap, lockmode) };
+        return;
+    }
+
     let index_info = unsafe { pg_sys::BuildIndexInfo(index) };
+    if stage == 2 {
+        unsafe { pg_sys::index_close(index, lockmode) };
+        unsafe { pg_sys::table_close(heap, lockmode) };
+        return;
+    }
+
     let pscan = unsafe { crate::access_method::hnswsq::driver::scan_descriptor(toc) };
     let scan = unsafe { pg_sys::table_beginscan_parallel(heap, pscan.cast()) };
+    if stage == 3 {
+        unsafe { pg_sys::table_endscan(scan) };
+        unsafe { pg_sys::index_close(index, lockmode) };
+        unsafe { pg_sys::table_close(heap, lockmode) };
+        return;
+    }
 
     let mut ctx = ParallelInsertCtx {
         state: worker_build_state(params, arena),
         params: *params,
         locks: arena.locks() as *const _,
     };
+    if stage == 4 {
+        unsafe { pg_sys::table_endscan(scan) };
+        unsafe { pg_sys::index_close(index, lockmode) };
+        unsafe { pg_sys::table_close(heap, lockmode) };
+        return;
+    }
     let am = unsafe { (*heap).rd_tableam };
     let build_range = unsafe {
         (*am).index_build_range_scan
