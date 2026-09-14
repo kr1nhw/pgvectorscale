@@ -367,6 +367,47 @@ Reading:
 Caveat for M6: this dataset is hard (recall 0.2-0.5), so it cannot separate the two
 policies' *quality*; the 1M BIGANN sweep is the gate for that.
 
+## 3c. First structural measurement of the flat engine: 519 invisible nodes
+
+Wiring `check_lists` into the writeout and running a real 100k dim-128 build with the
+flat engine (append/shrink, no backfill in own-list selection) gave:
+
+```
+fingerprint=30db11c54b7edd31
+checks(published=100000 no_incoming=519 reachable=99477 self_links=0 duplicates=0 max_len=32)
+```
+
+So the graph is well formed (no self-links, no duplicates, capacity respected) but
+**0.52% of nodes have no incoming edge at all** -- invisible to every search -- and
+523 nodes are unreachable from the entry.  The recall sweep could not see this: at
+this dataset's granularity the numbers were identical to the legacy engine
+(0.0000 / 0.2000 / 0.2000 / 0.5000 at ef 10/40/160/640), which is exactly why the
+structural gate is a gate and recall is not.
+
+Likely cause, to be confirmed by measurement: **the missing backfill**.  The legacy
+engine's own lists are always filled to `cap` (occlusion-accepted entries plus the
+closest-pruned backfill), so every new node attempts `cap` backlinks; the flat engine
+selects the heuristic's output alone, so a node whose own list is short attempts few
+backlinks, and on a saturated target an occluded newcomer is admitted by none of
+them.  pgvector's forward list is also heuristic-only, so it plausibly has the same
+property -- its recall being 0.4-0.5 points below ours at ef 160 is consistent with
+that, not with a pure policy difference.
+
+Candidate fixes, to be measured (M3/M6), in order of least semantic change:
+
+1. restore the closest-pruned **backfill in `select_neighbors_flat`** (lists stay
+   full, so backlink attempts stay at `cap`), keeping the crash-free append/shrink
+   backlink policy -- the ids-only slab and the no-metadata property are unaffected,
+   since backfill only changes *which* ids are in the list;
+2. make admission of the *nearest* backlink target unconditional (a documented
+   exception shaped like ranked mode's `always_admit`, which was added for exactly
+   this failure mode earlier: without it recall fell to 0.63-0.76);
+3. accept it, and re-check on 1M BIGANN where a 0.5% invisible fraction costs recall
+   directly, before deciding.
+
+Either way the gate stands as the acceptance criterion for `workers > 0`: zero nodes
+without an incoming edge, everything reachable from the entry.
+
 ## 4. Test plan and gates
 
 * **Unit:** arena allocation/exhaustion/margin, `Rel<T>` round-trip, lock-order

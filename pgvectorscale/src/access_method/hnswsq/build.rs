@@ -337,6 +337,20 @@ fn flat_to_mem(flat: &FlatGraph) -> MemGraph {
 /// the flat engine when that is the active one.
 fn writeout_graph(state: &mut BuildState) {
     if let Some(flat) = state.flat.take() {
+        if state.stats.enabled {
+            // Structural gate on the graph the flat engine just produced, before it
+            // is converted for the writeout: `workers > 0` will be judged on exactly
+            // these numbers (zero nodes without an incoming edge, everything
+            // reachable from the entry) rather than on recall alone.
+            let checks =
+                crate::access_method::hnswsq::flat_graph::check_lists(&flat.graph, flat.graph.cap());
+            state.stats.check_published = checks.published;
+            state.stats.check_no_incoming = checks.nodes_without_incoming;
+            state.stats.check_reachable = checks.reachable_from_entry;
+            state.stats.check_self_links = checks.self_links;
+            state.stats.check_duplicates = checks.duplicate_links;
+            state.stats.check_max_len = checks.max_list_len;
+        }
         state.graph = flat_to_mem(&flat.graph);
     }
 }
@@ -414,6 +428,18 @@ pub struct BuildStats {
     /// work the search path does per insert).
     pub search_calls: u64,
     pub search_hits: u64,
+    /// Flat-engine structural gate, taken at writeout (`check_lists`): how many
+    /// nodes were published, how many of them had no incoming edge, how many were
+    /// reachable from the entry over layer-0 lists, self-links, duplicate links and
+    /// the longest list.  Zero everywhere means the graph is well formed and fully
+    /// connected -- the property a concurrent build is most likely to break, and
+    /// the one a recall number cannot show.
+    pub check_published: usize,
+    pub check_no_incoming: usize,
+    pub check_reachable: usize,
+    pub check_self_links: usize,
+    pub check_duplicates: usize,
+    pub check_max_len: usize,
     /// Stable fingerprint of the graph that was written out (see
     /// `MemGraph::fingerprint`).  Two builds with the same seed and engine must
     /// produce the same value; the two engines are expected to differ, because
@@ -454,7 +480,8 @@ impl BuildStats {
              search={:.1}ms select={:.1}ms backlink_pairs={:.1}ms backlink_select={:.1}ms \
              flush={:.1}ms accounted_total={:.1}ms fast_entries={} full_entries={} extras_seen={} \
              pair(select)={} pair(backlink)={} pair(extras)={} search_calls={} search_hits={} \
-             cutoff_skips={} ranked_admits={} ranked_prunes={} fingerprint={:016x}",
+             cutoff_skips={} ranked_admits={} ranked_prunes={} fingerprint={:016x} \
+             checks(published={} no_incoming={} reachable={} self_links={} duplicates={} max_len={})",
             self.nodes,
             self.backlink_lists,
             self.pair_dists,
@@ -477,6 +504,12 @@ impl BuildStats {
             self.ranked_admits,
             self.ranked_prunes,
             self.graph_fingerprint,
+            self.check_published,
+            self.check_no_incoming,
+            self.check_reachable,
+            self.check_self_links,
+            self.check_duplicates,
+            self.check_max_len,
         )
     }
 }
