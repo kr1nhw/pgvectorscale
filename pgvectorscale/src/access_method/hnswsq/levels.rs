@@ -98,6 +98,26 @@ pub fn level_for_tid(seed: u64, ml: f32, max_level: u8, tid: (u32, u16)) -> u8 {
     random_level(ml, max_level, &mut rng)
 }
 
+/// A row's level, from the raw `ItemPointerData` an index-build callback is handed.
+///
+/// The packing is where this can go quietly wrong: a block number is split across
+/// `bi_hi`/`bi_lo` as the high and low 16 bits, so mixing them up yields a plausible-looking
+/// level that is simply the *wrong row's* -- and it only shows up on tables large enough to
+/// have blocks above 65535, i.e. not in the tests anyone writes first.  The tests below
+/// therefore include a large block number on purpose.
+///
+/// (The callback could use `util::ItemPointer` accessors instead, but it already holds the
+/// raw pointer, and decoding it here keeps the level rule in one place with its tests.)
+pub fn level_for_item_pointer(
+    seed: u64,
+    ml: f32,
+    max_level: u8,
+    tid: pgrx::pg_sys::ItemPointerData,
+) -> u8 {
+    let block = ((tid.ip_blkid.bi_hi as u32) << 16) | tid.ip_blkid.bi_lo as u32;
+    level_for_tid(seed, ml, max_level, (block, tid.ip_posid))
+}
+
 /// FNV-1a over the TID's block and offset, mixed so that neighbouring TIDs land far
 /// apart in the generator's seed space.
 fn fnv1a((block, offset): (u32, u16)) -> u64 {
@@ -220,6 +240,51 @@ mod tests {
             })
             .0;
         assert!(longest < 60, "longest constant run was {}", longest);
+    }
+
+    #[test]
+    fn a_level_can_be_read_straight_off_an_item_pointer() {
+        // The block is `bi_hi << 16 | bi_lo`; getting that backwards is invisible until a
+        // table is big enough to have a high block, so one is included on purpose.
+        let (ml, max_level, seed) = (1.0 / 8f32.ln(), 7u8, 20240912u64);
+        let make = |block: u32, offset: u16| pgrx::pg_sys::ItemPointerData {
+            ip_blkid: pgrx::pg_sys::BlockIdData {
+                bi_hi: (block >> 16) as u16,
+                bi_lo: (block & 0xffff) as u16,
+            },
+            ip_posid: offset,
+        };
+
+        for block in [1u32, 2, 7, 65535, 65536, 70_000, 1_048_576] {
+            for offset in [1u16, 2, 100] {
+                let raw = make(block, offset);
+                assert_eq!(
+                    level_for_item_pointer(seed, ml, max_level, raw),
+                    level_for_tid(seed, ml, max_level, (block, offset)),
+                    "block {} offset {} must decode to the same level",
+                    block,
+                    offset
+                );
+            }
+        }
+
+        // Specifically: a block above 65535 is not the same row as its low half.
+        let big = make(70_000, 1);
+        let small = make(70_000 & 0xffff, 1);
+        let a = level_for_item_pointer(seed, ml, max_level, big);
+        let b = level_for_item_pointer(seed, ml, max_level, small);
+        assert_ne!(
+            (a, level_for_tid(seed, ml, max_level, (70_000, 1))),
+            (b, level_for_tid(seed, ml, max_level, (70_000 & 0xffff, 1))),
+            "swapping hi for lo must not look identical"
+        );
+
+        // Different rows get independently drawn levels, not one repeated.
+        let levels: Vec<u8> = (1..=200u32)
+            .map(|i| level_for_item_pointer(seed, ml, max_level, make(i, i as u16)))
+            .collect();
+        assert!(levels.iter().any(|&l| l > 0), "the draw is live");
+        assert_eq!(levels.len(), 200);
     }
 
     #[test]

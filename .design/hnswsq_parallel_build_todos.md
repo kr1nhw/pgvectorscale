@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5f: level from a raw `ItemPointerData` | done | block hi/lo decoding pinned, incl. blocks > 65535 |
 | M3 step 5e: one insert body, two level sources | done | `flat_insert_at_level` + `level_seed`; gate bit-identical |
 | M3 step 5d: post-join entry promotion | done | `promote_best_entry`; workers never promote |
 | M3 step 5c: shared scan descriptor in the toc | done | `table_parallelscan_*`; one descriptor every worker reads |
@@ -1252,6 +1253,29 @@ RNG, so this is a behaviour-preserving refactor, and `flat_insert_at_level` is n
 One small lesson from the patch: adding the field by regex hit `SampleState`'s literal as well,
 and the compiler named the line.  Worth a glance at *every* insertion site when a struct
 literal is built by pattern.
+
+### 3j.18 Decoding the row's TID, and what the worker body still needs
+
+An index-build callback holds a raw `ItemPointerData`, so `levels::level_for_item_pointer`
+decodes it into the `(block, offset)` the level rule takes.  The packing is the trap: a block
+number is `bi_hi << 16 | bi_lo`, and swapping them yields a plausible level for the *wrong
+row* -- invisible until a table has blocks above 65535, i.e. not in any test someone writes
+first.  The test therefore includes 65536, 70_000 and 1_048_576 on purpose, and checks that a
+large block does not decode to its own low half.
+
+**What the worker body still needs**, scoped by reading the code rather than guessing:
+
+* its own `BuildState`.  The leader's construction is ~40 inline lines inside the build
+  function (codec from `codec_for(&index_rel, &meta)`, `m`/`m0`/`ef_construction`/`max_level`
+  from the reloptions, `ml` from the meta page, `pair_buf` from the dimensions), not a
+  callable helper, so a worker either grows one from `BuildParams` plus a `table_open` of the
+  index oid, or that construction is factored out of the build function first -- factoring is
+  the cleaner of the two and is what the next round should do.
+* the callback: `extract_vector(*values)` -> `preprocess_cosine` when the distance type is
+  cosine -> the level -> `flat_insert_at_level`, mirroring the existing callback at
+  `build.rs:~1545`.
+* the `index_build_range_scan` loop around it, plus the leader's writeout after the join and
+  `amcanbuildparallel` under `build_parallel`.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
