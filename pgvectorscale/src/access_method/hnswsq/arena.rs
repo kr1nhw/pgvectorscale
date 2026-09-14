@@ -1197,7 +1197,6 @@ mod tests {
     // arena (LWLocks, and cross-process), and this test exists to check the protocol and
     // the concurrent write accessors before that wiring lands.
     #[pgrx::pg_test]
-    #[ignore = "flakes under full-suite scheduling; see the comment above before trusting"]
     fn node_locks_serialize_concurrent_list_writes() {
         // The backlink step's real contention: writers replacing one node's list while
         // readers copy it.  Threads rather than processes, but the lock and the write
@@ -1233,6 +1232,11 @@ mod tests {
         let locks = NodeLocks::new(nodes);
 
         let rounds = 250;
+        // Readers record what they observe instead of panicking: a panic inside a scoped
+        // thread loses its message, which is what hid this failure.  The writers keep
+        // panicking on purpose -- if the report below comes back empty *and* a thread
+        // panicked, the culprit is a writer, not the read path.
+        let seen_torn = std::sync::Mutex::new(Vec::<String>::new());
         std::thread::scope(|scope| {
             for w in 0..2u32 {
                 let arena = &arena;
@@ -1254,24 +1258,35 @@ mod tests {
             for _ in 0..2 {
                 let arena = &arena;
                 let locks = &locks;
+                let seen_torn = &seen_torn;
                 scope.spawn(move || {
                     let chunk = arena.chunk();
-                    for _ in 0..rounds {
+                    for round in 0..rounds {
                         // The read lock excludes both writers, so this must be one
                         // writer's list, never a torn one.
                         let _guard = locks.read(0);
                         let n = chunk.region_u16(layout.lens)[0] as usize;
-                        assert!(n <= cap, "length {} exceeds capacity {}", n, cap);
                         let seen: Vec<u32> = chunk.region_u32(layout.ids)[0..n].to_vec();
-                        assert!(
-                            seen == [1, 2, 3] || seen == [3, 2, 1],
-                            "a reader saw a torn list: {:?}",
-                            seen
-                        );
+                        if n > cap || (seen != [1, 2, 3] && seen != [3, 2, 1]) {
+                            seen_torn.lock().unwrap().push(format!(
+                                "round {}: len={} ids={:?}",
+                                round, n, seen
+                            ));
+                            return;
+                        }
                     }
                 });
             }
         });
+
+        // What the readers saw, if anything -- the whole point of this run.
+        let torn = seen_torn.into_inner().unwrap();
+        assert!(
+            torn.is_empty(),
+            "{} reader observation(s) of a non-exclusive read lock: {:?}",
+            torn.len(),
+            &torn[..torn.len().min(4)]
+        );
 
         // The arena is still consistent afterwards, and the lock is free.
         let final_list: Vec<u32> = arena.chunk().region_u32(layout.ids)[0..3].to_vec();
