@@ -477,11 +477,20 @@ unsafe extern "C-unwind" fn parallel_insert_callback(
     _tuple_is_alive: bool,
     state: *mut std::os::raw::c_void,
 ) {
+    // Debug bisect of the insert path (`hnswsq.parallel_stage`): 5 returns before reading the
+    // tuple, 6 after extracting the vector, 7 after deciding the level.  0 is the real thing.
+    let stage = crate::access_method::hnswsq::options::HNSWSQ_PARALLEL_STAGE.get();
+    if stage == 5 {
+        return;
+    }
     if unsafe { *isnull } {
         return;
     }
     let ctx = unsafe { &mut *(state as *mut ParallelInsertCtx) };
     let mut vec = unsafe { extract_vector(*values) };
+    if stage == 6 {
+        return;
+    }
     if ctx.state.distance_type == DistanceType::Cosine {
         preprocess_cosine(&mut vec);
     }
@@ -492,6 +501,9 @@ unsafe extern "C-unwind" fn parallel_insert_callback(
         ctx.params.max_level,
         unsafe { *tid },
     );
+    if stage == 7 {
+        return;
+    }
     // SAFETY: the arena (and so its locks) outlives the scan, and this is the only writer of
     // the nodes it touches that does not hold their lock.
     let locking = Locking::Locks(unsafe { &*ctx.locks });

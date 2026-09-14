@@ -172,7 +172,8 @@ pub static HNSWSQ_BUILD_WORKERS: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>
 ///
 /// The stages are, in order: 9 before the worker does anything at all, 1 after opening the
 /// relations, 2 after `BuildIndexInfo`, 3 after `table_beginscan_parallel`, 4 after the worker's
-/// `BuildState`.  Anything else means "run to completion".  Stage 9 exists to separate "my
+/// `BuildState`, then -- inside the row callback -- 5 before reading the tuple, 6 after
+/// extracting the vector, 7 after deciding the level.  Anything else means "run to completion".  Stage 9 exists to separate "my
 /// worker code is wrong" from "PostgreSQL's worker startup is unhappy with how I drove it".  It exists because the worker path is new and a segfault there tells you
 /// nothing about which call caused it.
 pub static HNSWSQ_PARALLEL_STAGE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);

@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5n: crash pinned to `index_build_range_scan` | **one call** | stages 1-4 clean with a worker running; 5-7 crash; the delta is the scan |
 | M3 step 5m: leader teardown fixed, crash now in the worker's inserts | **leader verified** | stage 9 clean with 2 workers; stage 0 dies in a worker after ~3 s |
 | M3 step 5l: crash bisect | **worker startup, not worker code** | a do-nothing worker crashes too; the same flow works in the pgrx test cluster |
 | M3 step 5k: SQL-callable parallel build + first run | **crashes in the worker** | leader-only run is clean (3 ms); worker path segfaults |
@@ -1517,6 +1518,42 @@ first time the parallel path has executed real work.
 **Next diagnostic:** extend `hnswsq.parallel_stage` into the callback -- return after
 `extract_vector`, after `plan_flat`, after `apply_flat`, before `publish` -- and bisect the same
 way.  The harness reports how far it got, so each stage is one run.
+
+### 3j.26 The crash is `index_build_range_scan`, not my callback
+
+Extending the stage GUC into the row callback separated the scan from the insert, and with the
+leader teardown fixed the earlier stages are clean, which they were not before:
+
+| stage | what the worker does | result |
+|---|---|---|
+| 1 | opens heap and index | clean, `entered=1` |
+| 2 | + `BuildIndexInfo` | clean |
+| 3 | + `table_beginscan_parallel` and `table_endscan` | clean |
+| 4 | + the worker's `BuildState` | clean |
+| 5 | + `index_build_range_scan` (**callback returns before reading the tuple**) | **crash** |
+| 6 | + `extract_vector` | crash |
+| 7 | + the level | crash |
+| 0 | the whole insert | crash |
+
+Two things follow.  First, the crash is **not in the callback**: stage 5 returns before touching
+`values` or `isnull`, and still dies.  Second, the only difference between the clean stage 4 and
+the crashing stage 5 is the `rd_tableam->index_build_range_scan` call -- so that call, or the scan
+descriptor handed to it, is the fault.
+
+The argument list matches PostgreSQL's own `table_index_build_scan` wrapper exactly
+(`(... , allow_sync, false /*anyvisible*/, progress, 0, InvalidBlockNumber, callback, state,
+scan)`), so the suspect is the **scan descriptor**: stage 3 creates it and tears it down without
+ever scanning, and stage 5 is the first call that actually walks the heap through it -- i.e. the
+first call that uses the *snapshot* the descriptor carries.  If `table_parallelscan_initialize`
+did not serialize the snapshot into the descriptor the way this code assumes, a worker reading it
+is reading something that is not there, which is exactly a segfault at the first tuple.
+
+**Next experiment (one run):** in the worker, immediately after `table_beginscan_parallel`, log
+`(*scan).rs_snapshot` and compare it with what the leader's descriptor holds.  Null or foreign
+means the leader-side setup is wrong (the snapshot has to be registered/exportable before it is
+copied into a descriptor that another process will read).  If it looks right, the next suspect is
+`index_info`, which each worker builds with `BuildIndexInfo` -- palloc'd in the worker, which the
+scan may then expect to have been prepared (`ii_ExpressionsState`) by the leader.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
