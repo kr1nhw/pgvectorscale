@@ -3,8 +3,8 @@
 //! The shared-memory arena will hand every worker a `&HnswArena`, so mutation has
 //! to go through interior locks — one per node, which is also the granularity the
 //! backlink step needs (one target list at a time).  In this prototype the locks
-//! are `std::sync::RwLock`s; in the arena they become LWLock tranches behind the
-//! same read/write API, so the algorithm code does not change.
+//! are `std::sync::RwLock`s; in a parallel build they are LWLocks from a tranche of
+//! our own behind the same read/write API, so the algorithm code does not change.
 //!
 //! The one rule the protocol depends on: **at most one node write lock may be held
 //! at a time**.  Two would make lock-order deadlocks possible (backlink updates
@@ -15,6 +15,7 @@
 //! freely (searches read many nodes) and a read guard never blocks another read.
 
 use std::cell::Cell;
+use std::marker::PhantomData;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 thread_local! {
@@ -22,49 +23,147 @@ thread_local! {
     static WRITE_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Read guard: one node's data may be read while other threads read it too.
+/// Read guard: one node's data may be read while others read it too.
 pub struct NodeReadGuard<'a> {
-    _guard: RwLockReadGuard<'a, ()>,
+    backing: GuardBacking<'a>,
 }
 
 /// Write guard: exclusive access to one node's list.
 pub struct NodeWriteGuard<'a> {
-    _guard: RwLockWriteGuard<'a, ()>,
+    backing: GuardBacking<'a>,
+}
+
+/// What a guard holds: the prototype's `RwLock` guard, or an acquired LWLock that
+/// has to be released explicitly.
+enum GuardBacking<'a> {
+    Local(RwLockReadGuard<'a, ()>),
+    LocalWrite(RwLockWriteGuard<'a, ()>),
+    // The lock lives in the shared segment, so it outlives any borrow we could name;
+    // the `PhantomData` keeps the guard tied to the `NodeLocks` that handed it out.
+    Shared {
+        lock: *mut pgrx::pg_sys::LWLock,
+        _owner: PhantomData<&'a NodeLocks>,
+    },
+}
+
+impl Drop for NodeReadGuard<'_> {
+    fn drop(&mut self) {
+        if let GuardBacking::Shared { lock, .. } = self.backing {
+            // SAFETY: acquired in `read` and not released since; `Drop` runs once.
+            unsafe { pgrx::pg_sys::LWLockRelease(lock) };
+        }
+    }
 }
 
 impl Drop for NodeWriteGuard<'_> {
     fn drop(&mut self) {
+        if let GuardBacking::Shared { lock, .. } = self.backing {
+            // SAFETY: acquired in `write` and not released since; `Drop` runs once.
+            unsafe { pgrx::pg_sys::LWLockRelease(lock) };
+        }
         WRITE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
 }
 
+/// One lock per node slot, over either backing: the prototype's `RwLock`s, or
+/// LWLocks placed in the shared segment by a parallel build.
+enum LockBacking {
+    Local(Vec<RwLock<()>>),
+    Shared { locks: *mut pgrx::pg_sys::LWLock, count: usize },
+}
+
 /// One lock per node slot.
 pub struct NodeLocks {
-    locks: Vec<RwLock<()>>,
+    locks: LockBacking,
+}
+
+// SAFETY: exclusive/shared access to each slot is enforced by the backing lock
+// itself -- an `RwLock` across threads, an LWLock across the processes that share
+// the segment -- and the arena only reaches a node's bytes while holding its guard.
+unsafe impl Send for NodeLocks {}
+// SAFETY: as above; the raw pointer is only dereferenced inside acquire/release.
+unsafe impl Sync for NodeLocks {}
+
+/// Create and register an LWLock tranche for a shared arena, returning its id.
+///
+/// This is the runtime route, not `RequestNamedLWLockTranche`: that one only works
+/// while shared memory is being set up (i.e. from `shared_preload_libraries`), and
+/// hnswsq is loaded on demand.  `name` must be `'static` because PostgreSQL stores
+/// the pointer and reads it long after this call (diagnostics, `pg_locks`).
+pub fn register_tranche(name: &'static std::ffi::CStr) -> i32 {
+    // SAFETY: both calls are unconditionally safe to make in a live backend; the
+    // name outlives the process (see above).
+    unsafe {
+        let id = pgrx::pg_sys::LWLockNewTrancheId();
+        pgrx::pg_sys::LWLockRegisterTranche(id, name.as_ptr());
+        id
+    }
+}
+
+/// Initialize `count` LWLocks in the shared segment and return the arena's view of
+/// them.  The leader calls this once, before any worker attaches.
+///
+/// # Safety
+///
+/// `locks` must point to `count` writable, suitably aligned `LWLock`s that live in
+/// the shared segment for as long as the segment does, and `tranche` must be a
+/// registered tranche id.  Nothing else may initialize or use them concurrently.
+pub unsafe fn init_shared_locks(
+    locks: *mut pgrx::pg_sys::LWLock,
+    count: usize,
+    tranche: i32,
+) -> NodeLocks {
+    for i in 0..count {
+        pgrx::pg_sys::LWLockInitialize(locks.add(i), tranche);
+    }
+    NodeLocks {
+        locks: LockBacking::Shared { locks, count },
+    }
 }
 
 impl NodeLocks {
     pub fn new(nodes: usize) -> Self {
         Self {
-            locks: (0..nodes).map(|_| RwLock::new(())).collect(),
+            locks: LockBacking::Local((0..nodes).map(|_| RwLock::new(())).collect()),
         }
+    }
+
+    /// Whether the locks live in shared memory (a parallel build) rather than in
+    /// this backend's heap.
+    pub fn is_shared(&self) -> bool {
+        matches!(self.locks, LockBacking::Shared { .. })
     }
 
     /// Add locks for newly published nodes (the arena grows by claiming node ids
     /// from a shared counter; the lock array is extended under the caller's
     /// serialization, never while a worker holds a guard).
     pub fn grow_to(&mut self, nodes: usize) {
-        while self.locks.len() < nodes {
-            self.locks.push(RwLock::new(()));
+        match &mut self.locks {
+            LockBacking::Local(locks) => {
+                while locks.len() < nodes {
+                    locks.push(RwLock::new(()));
+                }
+            }
+            // A shared segment cannot grow: its size is fixed at `shm_toc` allocation
+            // time, so the node budget is derived from it up front (`plan_capacity`).
+            LockBacking::Shared { count, .. } => assert!(
+                nodes <= *count,
+                "a shared arena cannot grow past its segment ({} locks, wanted {})",
+                count,
+                nodes
+            ),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.locks.len()
+        match &self.locks {
+            LockBacking::Local(locks) => locks.len(),
+            LockBacking::Shared { count, .. } => *count,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.locks.is_empty()
+        self.len() == 0
     }
 
     /// Shared access to `id`'s node.
@@ -72,11 +171,28 @@ impl NodeLocks {
     /// Panics if the id has no lock slot, which is a programming error: ids come
     /// from the graph's own id space, and claiming an id publishes its slot first.
     pub fn read(&self, id: u32) -> NodeReadGuard<'_> {
-        NodeReadGuard {
-            _guard: self.locks[id as usize]
-                .read()
-                .unwrap_or_else(|e| e.into_inner()),
-        }
+        let i = id as usize;
+        let backing = match &self.locks {
+            LockBacking::Local(locks) => GuardBacking::Local(
+                locks[i].read().unwrap_or_else(|e| e.into_inner()),
+            ),
+            LockBacking::Shared { locks, .. } => {
+                assert!(i < self.len(), "node {} exceeds the lock array", id);
+                // SAFETY: `i` is inside the initialized array, and the lock lives in
+                // the segment for at least as long as this guard.
+                unsafe {
+                    pgrx::pg_sys::LWLockAcquire(
+                        locks.add(i),
+                        pgrx::pg_sys::LWLockMode::LW_SHARED,
+                    )
+                };
+                GuardBacking::Shared {
+                    lock: unsafe { locks.add(i) },
+                    _owner: PhantomData,
+                }
+            }
+        };
+        NodeReadGuard { backing }
     }
 
     /// Exclusive access to `id`'s node.
@@ -85,9 +201,27 @@ impl NodeLocks {
     /// backlink protocol takes one target lock at a time precisely so the lock
     /// order can never form a cycle.
     pub fn write(&self, id: u32) -> NodeWriteGuard<'_> {
-        let guard = self.locks[id as usize]
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let i = id as usize;
+        let backing = match &self.locks {
+            LockBacking::Local(locks) => GuardBacking::LocalWrite(
+                locks[i].write().unwrap_or_else(|e| e.into_inner()),
+            ),
+            LockBacking::Shared { locks, .. } => {
+                assert!(i < self.len(), "node {} exceeds the lock array", id);
+                // SAFETY: `i` is inside the initialized array, and the lock lives in
+                // the segment for at least as long as this guard.
+                unsafe {
+                    pgrx::pg_sys::LWLockAcquire(
+                        locks.add(i),
+                        pgrx::pg_sys::LWLockMode::LW_EXCLUSIVE,
+                    )
+                };
+                GuardBacking::Shared {
+                    lock: unsafe { locks.add(i) },
+                    _owner: PhantomData,
+                }
+            }
+        };
         WRITE_DEPTH.with(|d| {
             let depth = d.get();
             assert_eq!(
@@ -99,7 +233,7 @@ impl NodeLocks {
             );
             d.set(depth + 1);
         });
-        NodeWriteGuard { _guard: guard }
+        NodeWriteGuard { backing }
     }
 }
 
@@ -386,7 +520,12 @@ impl Chunk {
     }
 }
 
-#[cfg(test)]
+// `any(test, feature = "pg_test")`, not just `test`: the `#[pg_test]` wrappers below are
+// turned into SQL by the build script, which compiles the crate *without* `cfg(test)`,
+// so a `cfg(test)`-only module would register the Rust test but never create its
+// `tests.<name>()` function ("does not exist" at run time).
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod tests {
     use super::*;
 
@@ -575,6 +714,62 @@ mod tests {
         let misaligned = unsafe { words.as_mut_ptr().cast::<u8>().add(4).cast::<u64>() };
         // SAFETY: never dereferenced -- `attach` rejects it before touching memory.
         let _ = unsafe { Chunk::attach(misaligned, layout) };
+    }
+
+    // The LWLock path needs a live backend (acquire/release touch `MyProc`), so unlike
+    // the rest of this module it is a `#[pg_test]`.
+    #[pgrx::pg_test]
+    fn shared_locks_are_lwlocks_from_our_own_tranche() {
+        let tranche = register_tranche(c"hnswsq_arena_test");
+        assert!(tranche > 0, "a runtime tranche id must be allocated");
+
+        // Backend-local storage in LWLock shape.  What this checks is the
+        // acquire/release plumbing and the arena's own write rule; cross-process
+        // contention is the parallel build's job (LWLocks are per-process anyway, so
+        // two threads here could not contend for one correctly).
+        let mut locks = [std::mem::MaybeUninit::<pgrx::pg_sys::LWLock>::uninit(); 2];
+        let base = locks.as_mut_ptr().cast::<pgrx::pg_sys::LWLock>();
+        // SAFETY: live, aligned, backend-local storage, initialized here, used only
+        // from this backend, and never grown (the shared backing asserts on grow).
+        let arena = unsafe { init_shared_locks(base, 2, tranche) };
+
+        assert!(arena.is_shared());
+        assert_eq!(arena.len(), 2);
+        assert!(!arena.is_empty());
+
+        // Reads share, writes exclude, and re-acquiring after the guards drop would
+        // *hang* rather than fail if a release were missing -- so a second pass here
+        // is the actual assertion that the LWLocks were released.
+        {
+            let _r0 = arena.read(0);
+            let _r1 = arena.read(1);
+        }
+        {
+            let _w = arena.write(0);
+        }
+        {
+            let _w = arena.write(1);
+        }
+        {
+            let _r = arena.read(0);
+            let _w = arena.write(1);
+        }
+
+        // A segment is fixed at allocation time, so growing past it is an error.
+        let mut arena = arena;
+        arena.grow_to(2); // no-op, exactly at capacity
+        assert_eq!(arena.len(), 2);
+    }
+
+    #[pgrx::pg_test]
+    #[should_panic(expected = "cannot grow past its segment")]
+    fn a_shared_arena_cannot_grow_past_its_segment() {
+        let tranche = register_tranche(c"hnswsq_arena_grow_test");
+        let mut locks = [std::mem::MaybeUninit::<pgrx::pg_sys::LWLock>::uninit(); 1];
+        let base = locks.as_mut_ptr().cast::<pgrx::pg_sys::LWLock>();
+        // SAFETY: as above.
+        let mut arena = unsafe { init_shared_locks(base, 1, tranche) };
+        arena.grow_to(2);
     }
 
     #[test]

@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 4b: node locks as LWLocks | done | `NodeLocks` over `RwLock`s *or* a tranche we register at runtime; 2 `pg_test`s |
 | M3 step 4a: chunk over shared memory | done | `Chunk` owns a `Vec<u64>` *or* borrows a segment (`attach`); relocation asserted by test (§3j) |
 | incremental exact-match probe test | flaky, not ours | `pg_test_hnswsq_incremental_empty_start_sq8_provisional`: 1 failure in one grouped run, clean on rerun (§3k) |
 | suite has 2 pre-existing red IVF tests | not ours | `ivf::options::tests::pg_test_ivf_options_{defaults,custom}`: no default opclass exists (§3j) |
@@ -788,9 +789,45 @@ moved arena and checks the owner sees it.  That is exactly what a dsm segment do
 to a chunk, and it is why `ItemPointer` (block/offset, not a pointer) is safe to
 store while e.g. a `Vec` would not be.
 
-Still to come in step 4: `NodeLocks`' `RwLock`s become LWLock tranches from
-`RequestNamedLWLockTranche`, and the graph handle is built over the `shm_toc`
-lookup instead of `Chunk::new`.
+### 3j.2 Node locks as LWLocks (M3 step 4, second half)
+
+`NodeLocks` now serves the same `read`/`write` API over either backing: the
+prototype's `RwLock`s, or LWLocks that a parallel build places in its own segment.
+The guards became an enum internally (`GuardBacking`) because an `RwLock` guard
+releases by dropping while an LWLock has to be released explicitly -- so
+`NodeReadGuard` grew a `Drop` it did not need before.
+
+Two decisions worth recording, both from PostgreSQL's rules rather than preference:
+
+* **`LWLockNewTrancheId` + `LWLockRegisterTranche`, not
+  `RequestNamedLWLockTranche`.**  The latter only works while shared memory is being
+  set up -- i.e. from `shared_preload_libraries` -- and hnswsq is loaded on demand,
+  so a named tranche is not available to us.  Registering a tranche id at runtime and
+  `LWLockInitialize`-ing our own locks in our own segment is the route parallel
+  index builds use.  The registered name must be `'static`, since PostgreSQL keeps
+  the pointer (it shows up in `pg_locks`) rather than copying the string.
+* **A shared arena cannot grow.**  `grow_to` still works on the `RwLock` backing, but
+  with LWLocks it asserts: a segment's size is fixed at `shm_toc` allocation time, so
+  the node budget must come from `plan_capacity` before any worker starts, and a lock
+  array that is too small is a setup bug, not a runtime condition.
+
+The LWLock path needs a live backend (acquire/release touch `MyProc`) and LWLocks are
+per-process, so contention cannot be tested from two threads in one backend and is
+deliberately left to the parallel build.  What the two new `pg_test`s do assert:
+tranche registration, shared and exclusive acquire/release (re-acquiring in a second
+pass, which would *hang* rather than fail if a release were missing), and the
+no-growth rule.
+
+**Gotcha found here, worth remembering for any future `#[pg_test]`:** a test module
+gated `#[cfg(test)]` registers the Rust test but never creates its
+`tests.<name>()` SQL function -- the build script emits that SQL and compiles the
+crate *without* `cfg(test)`, so the failure is "function tests.foo() does not exist"
+at run time.  The module must be gated
+`#[cfg(any(test, feature = "pg_test"))]` and carry `#[pgrx::pg_schema]`.
+
+Still to come in step 4: the graph handle is built over the `shm_toc` lookup instead
+of `Chunk::new`, and the driver allocates the segment (chunk + locks together) so a
+worker attaches both from the toc.
 
 **The swap is done:** every per-node array is a chunk region, the `Vec`s are empty in
 chunk mode, and only `nodes_used`/`slabs_used` are kept on the side.  The `Vec` arms
