@@ -51,13 +51,15 @@ pub struct FlatGraph {
     vectors: Vec<u8>,
     /// When set, node storage lives in this chunk (the arena shape) instead of the
     /// `Vec`s, and `layout` describes its regions.  Being converted region by region:
-    /// `vectors`, `ids`, `lens`, `levels` and the two per-node flags are in the
-    /// chunk; `tids` and `slab_off` follow, at which point the `Vec` fields
-    /// disappear.
+    /// Every array below now lives in this chunk (vectors, ids, lens, levels, tids,
+    /// clamped, published, slab_off), so the `Vec` fields are empty in this mode and
+    /// only `nodes_used`/`slabs_used` are kept on the side.  The `Vec` arms are the
+    /// grow-mode backing, kept until the arena is the only mode.
     chunk: Option<Chunk>,
     layout: ArenaLayout,
     /// `slab_off[node]` = index of the node's layer-0 slab; a node with
     /// `level + 1` layers owns `slab_off[node] .. slab_off[node] + level + 1`.
+    /// Empty when the graph is chunk-backed, like every other `Vec` here.
     slab_off: Vec<u32>,
     /// `slabs * cap` ids.
     ids: Vec<u32>,
@@ -124,14 +126,12 @@ impl FlatGraph {
         // region, so the `Vec` copy stays empty (and `heap_bytes` reports the layout).
         g.layout = arena_layout(stride, cap, max_nodes, max_slabs);
         g.chunk = Some(Chunk::new(g.layout));
-        // `levels` is a chunk region now too, so no `Vec` capacity for it.
-        g.tids.reserve_exact(max_nodes);
-        // `clamped` and `published_flags` are chunk regions now as well.
-        g.slab_off.reserve_exact(max_nodes);
-        // `ids` and `lens` are chunk regions now, so no `Vec` capacity is reserved
-        // for them -- that was up to `max_slabs * cap * 4` bytes of dead allocation.
+        // Every per-node array is a chunk region now, so no `Vec` capacity is
+        // reserved for any of them -- `ids`/`lens` alone would have been up to
+        // `max_slabs * cap * 4` bytes of dead allocation, and `nodes_used`/
+        // `slabs_used` are the only cursors the graph keeps on the side.
+        g.nodes_used = 0;
         g.slabs_used = 0;
-        g.published_flags.reserve_exact(max_nodes);
         g
     }
 
@@ -159,16 +159,21 @@ impl FlatGraph {
             None => self.levels.push(level),
         }
         debug_assert!(self.chunk.is_some() || self.levels.len() == self.nodes_used);
-        self.tids.push(ItemPointer::new_invalid());
+        let i = id as usize;
         match self.chunk.as_mut() {
-            // The flags are zero with the chunk, but write them anyway: a slot is
-            // never reused, and correctness should not rest on zeroed allocation.
+            // Chunk mode: every per-node region is claimed here.  The flags are zero
+            // with the chunk and a slot is never reused, but the tid *must* be
+            // written: an all-zero `ItemPointer` is block 0 / offset 0, not the
+            // invalid one, so a reader that slipped past the watermark would find a
+            // real-looking pointer instead of "no row yet".
             Some(chunk) => {
-                let i = id as usize;
+                chunk.region_slice_mut::<ItemPointer>(self.layout.tids)[i] =
+                    ItemPointer::new_invalid();
                 chunk.region_bytes_mut(self.layout.clamped)[i] = 0;
                 chunk.region_bytes_mut(self.layout.published)[i] = 0;
             }
             None => {
+                self.tids.push(ItemPointer::new_invalid());
                 self.clamped.push(false);
                 self.published_flags.push(false);
             }
@@ -176,7 +181,11 @@ impl FlatGraph {
         if self.chunk.is_none() {
             self.vectors.resize(self.vectors.len() + self.stride, 0);
         }
-        self.slab_off.push(self.slabs_used as u32);
+        let base = self.slabs_used as u32;
+        match self.chunk.as_mut() {
+            Some(chunk) => chunk.region_u32_mut(self.layout.slab_off)[i] = base,
+            None => self.slab_off.push(base),
+        }
         self.slabs_used += layers;
         if self.chunk.is_none() {
             // Grow mode only: `lens`/`ids` are the storage.  They are kept in
@@ -196,7 +205,10 @@ impl FlatGraph {
         let i = id as usize;
         assert!(i < self.len(), "publish of an unclaimed id");
         assert!(!self.is_published(i), "node {} published twice", id);
-        self.tids[i] = tid;
+        match self.chunk.as_mut() {
+            Some(chunk) => chunk.region_slice_mut::<ItemPointer>(self.layout.tids)[i] = tid,
+            None => self.tids[i] = tid,
+        }
         match self.chunk.as_mut() {
             Some(chunk) => chunk.region_bytes_mut(self.layout.clamped)[i] = clamped as u8,
             None => self.clamped[i] = clamped,
@@ -299,7 +311,7 @@ impl FlatGraph {
             .claim_slot(level)
             .expect("graph capacity exhausted (use try_push_node, or claim/publish)");
         self.publish(id, tid, clamped, encoded);
-        debug_assert_eq!(self.slab_off.len(), self.nodes_used);
+        debug_assert!(self.chunk.is_some() || self.slab_off.len() == self.nodes_used);
         debug_assert!(self.slab_base(id).is_some());
     }
 
@@ -365,7 +377,10 @@ impl FlatGraph {
 
     #[inline]
     pub fn tid(&self, id: u32) -> ItemPointer {
-        self.tids[id as usize]
+        match &self.chunk {
+            Some(chunk) => chunk.region_slice::<ItemPointer>(self.layout.tids)[id as usize],
+            None => self.tids[id as usize],
+        }
     }
 
     #[inline]
@@ -423,7 +438,16 @@ impl FlatGraph {
 
     #[inline]
     fn slab_base(&self, id: u32) -> Option<usize> {
-        let base = *self.slab_off.get(id as usize)? as usize;
+        // Bound by `nodes_used`, not by the array length: in chunk mode the region is
+        // `max_nodes` long, so a length check would accept unclaimed ids and hand out
+        // slabs for nodes that do not exist yet.
+        if id as usize >= self.nodes_used {
+            return None;
+        }
+        let base = match &self.chunk {
+            Some(chunk) => chunk.region_u32(self.layout.slab_off)[id as usize],
+            None => self.slab_off[id as usize],
+        } as usize;
         // A node with `level + 1` layers must own that many slabs.
         let layers = self.level(id) as usize + 1;
         (base + layers <= self.slabs_used).then_some(base)
@@ -814,6 +838,18 @@ mod tests {
             assert_eq!(chunk.region_bytes(g.layout.published)[3], 1);
             assert_eq!(chunk.region_bytes(g.layout.clamped)[0], 0, "not neighbours");
         }
+        assert!(
+            g.tids.is_empty() && g.slab_off.is_empty(),
+            "the last two arrays are in the chunk as well"
+        );
+        assert!(g.tid(3).is_valid(), "a published node's tid comes back");
+        // The id bounds the lookup, not the (max_nodes-long) region: an id that was
+        // never claimed must not resolve to slabs, and its tid reads invalid rather
+        // than as the zeroed block 0 / offset 0 that an untouched region holds.
+        assert_eq!(g.slab_base(7), None, "unclaimed id has no slabs");
+        assert!(!g.tid(7).is_valid(), "unclaimed slot was written as invalid");
+        assert_eq!(g.slab_base(0), Some(0), "and claimed ids still resolve");
+        assert_eq!(g.slab_base(3), Some(5), "after the 3-layer claim's slabs");
 
         // The grow-mode graph still uses its Vecs, with the same cursor semantics.
         let mut g = FlatGraph::new(stride, cap);
@@ -828,6 +864,9 @@ mod tests {
         assert_eq!(g.levels.len(), 1, "and keeps the level store in lockstep");
         assert!(!g.clamped.is_empty() && !g.published_flags.is_empty());
         assert!(!g.clamped(0) && g.len() == 1);
+        assert!(!g.tids.is_empty() && !g.slab_off.is_empty());
+        assert!(g.tid(0).is_valid());
+        assert_eq!(g.slab_base(5), None, "grow mode rejects unclaimed ids too");
         assert_eq!(g.slab_base(0), Some(0));
     }
 

@@ -22,7 +22,8 @@ pinned seed, release, same host, unless stated):
 | structural gate (`check_lists`, both engines) | done | wired into the stats line; found the connectivity finding below |
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
-| M3 storage swap (region by region) | in progress | `vectors` ✓, `ids` ✓, `lens` ✓ + `slabs_used`, `levels` ✓ + `nodes_used`, `clamped`/`published` ✓; gate bit-identical after each (§3j) |
+| M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| incremental exact-match probe test | flaky, not ours | `pg_test_hnswsq_incremental_empty_start_sq8_provisional`: 1 failure in one grouped run, clean on rerun (§3k) |
 | suite has 2 pre-existing red IVF tests | not ours | `ivf::options::tests::pg_test_ivf_options_{defaults,custom}`: no default opclass exists (§3j) |
 
 **Remaining, in order:**
@@ -719,6 +720,7 @@ bytes live, never which graph is built.
 | 3 | `lens` (slab lengths, + new `slabs_used` cursor) | identical |
 | 4 | `levels` (node levels, + new `nodes_used` cursor; `len()` reads it) | identical |
 | 5 | `clamped` + `published` (per-node flags, byte regions) | identical |
+| 6 | `tids` + `slab_off` (heap TIDs, layer-0 slab index) | identical + integration suite |
 
 Two consequences worth naming:
 
@@ -743,9 +745,51 @@ Two consequences worth naming:
   observable, which is exactly the state the watermark relies on.  `claim_slot`
   therefore writes both zeros anyway, so correctness never rests on allocation
   zeroing.
-* left: `tids` and `slab_off`.  `tids` is the first region whose element is not a
-  scalar (`ItemPointer`, 6 bytes), so it reads through `region_slice::<T>` and
-  depends on the region's alignment being at least `align_of::<ItemPointer>()`.
+* `tids` + `slab_off` close the swap, and each had a trap that a mechanical
+  rewrite would have walked into:
+  * **an all-zero `ItemPointer` is not the invalid one.**  It is block 0 /
+    offset 0 -- a real-looking pointer -- so a claimed slot cannot inherit
+    "unwritten" from the chunk's zeroed memory the way the flags can.  `claim_slot`
+    writes `ItemPointer::new_invalid()` into the region explicitly.
+  * **`slab_base` was bounded by `slab_off.get(id)`**, i.e. by a `Vec` that is empty
+    in chunk mode; the region, by contrast, is `max_nodes` long, so a length-based
+    bound would happily resolve slabs for unclaimed ids.  It is now bounded by
+    `nodes_used`, with unit tests for both an unclaimed id (`slab_base(7) == None`)
+    and claimed ones.
+  * `tids` is also the one region the fingerprint gate cannot see: the fingerprint
+    covers id/layer/list structure, so a broken heap TID would pass it and corrupt
+    results silently.  The `access_method::hnswsq` integration tests (which build and
+    scan) are the gate for it -- that is why step 6 ran them as well.
+
+**The swap is done:** every per-node array is a chunk region, the `Vec`s are empty in
+chunk mode, and only `nodes_used`/`slabs_used` are kept on the side.  The `Vec` arms
+of each accessor remain as the grow-mode backing until the arena is the only mode.
+
+## 3k. Flaky incremental exact-match probe (pre-existing, not from the swap)
+
+`access_method::hnswsq::tests::tests::pg_test_hnswsq_incremental_empty_start_sq8_provisional`
+failed in one grouped run of `cargo pgrx test pg18 access_method::hnswsq`
+(95 passed / 1 failed, 349.7 s) and then passed both alone (11.3 s) and in an
+immediate rerun of the same grouped command (exit 0).  So it is a flake, not a
+deterministic regression, and it is on the **disk insert path**, which the storage
+swap does not touch (`disk_mode` builds never construct a `FlatGraph`).
+
+Why it is still worth chasing: the assertion is not a recall threshold but an
+exact-match probe -- after each 200-row batch, `ORDER BY embedding <-> probe LIMIT 1`
+must return the probe row itself, whose distance is 0.  A miss therefore means a
+row that was inserted is *not reachable from the entry point*, which is the
+insert-path analogue of the connectivity finding in §3c (a node with no incoming
+edge is invisible to every search).  Pinning `hnswsq.build_seed` (done in
+`incremental_case`) was not enough to make it reproducible, so something on that
+path is still not pinned.
+
+To capture the next occurrence -- the test already logs `got`/`expected` per batch
+and dumps `hnswsq_diag('hs_i_idx')`, which is what identifies the missing node:
+
+```sh
+PGRX_HOME=... RUST_TEST_THREADS=1 cargo pgrx test pg18 access_method::hnswsq 2>&1 | \
+  sed -n '/panicked/,/Client Error/p'
+```
 
 **Suite state:** `cargo pgrx test pg18` reports 247 passed, 10 ignored, and **2
 failures that are pre-existing and unrelated**:
