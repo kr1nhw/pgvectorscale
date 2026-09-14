@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M3 step 5u: recall sweep, both scales, fresh indexes** | **done** | 100k: -0.10 at ef 20-40; 1M: mixed, +/-0.2-0.4 both ways, equal by ef 80 |
 | **M3 step 5t: `CREATE INDEX` drives the parallel build** | **done** | 100k in 2.6 s; `workers=0` bit-identical (fingerprint `3794aa11c860aba0`) |
 | M3 step 5s: `build_index_parallel` extracted for `ambuild` | **done** | harness is a thin wrapper; behaviour identical |
 | **M3 step 5r: recall of a parallel-built index** | **done** | ef 40/100: parallel 0.80/1.00 vs single-builder 0.60/1.00 |
@@ -1770,6 +1771,55 @@ or page plan is suspect, so verify the meta page's `build_result` and the entry 
 **The measurement lesson, since it cost a wrong conclusion:** a harness that writes into an
 already-built index measures the union of two builds.  Every recall number must come from a fresh
 index, and the harness should create one rather than being handed an existing one.
+
+### 3j.33 The recall sweep, at both scales, on fresh indexes
+
+Fresh index for every build (a harness that writes into an already-built index measures the union
+of two builds -- 3j.32), same ground truth, same queries, recall@10:
+
+`t100k` (100k rows):
+
+| ef | single-builder, 1 worker | parallel, 4 workers | delta |
+|---|---|---|---|
+| 10 | 0.500 | 0.500 | 0 |
+| 20 | 0.600 | 0.500 | -0.100 |
+| 40 | 0.600 | 0.500 | -0.100 |
+| 80 | 0.900 | 0.853 | -0.047 |
+| 160 | 1.000 | 1.000 | 0 |
+| 320 | 1.000 | 1.000 | 0 |
+
+`t1000000` (1M rows; single-builder `no_incoming=1`, parallel `no_incoming=1685`, parallel build
+32.1 s end to end through `CREATE INDEX`):
+
+| ef | single-builder, 1 worker | parallel, 4 workers | delta |
+|---|---|---|---|
+| 10 | 0.400 | 0.600 | **+0.200** |
+| 20 | 0.400 | 0.800 | **+0.400** |
+| 40 | 1.000 | 0.800 | -0.200 |
+| 80 | 1.000 | 1.000 | 0 |
+| 160 | 1.000 | 1.000 | 0 |
+
+**What this says.**  The 100k result is a consistent, small deficit at tight budgets that washes out
+by ef=160 -- consistent with the connectivity delta (307 vs 0 nodes without an incoming edge).  The
+1M result is *not* a deficit: the parallel build is better by 0.2-0.4 at ef 10-20 and worse by 0.2 at
+ef=40, with both saturating by ef=80, despite carrying 1685 such nodes.  Two different tables giving
+opposite signs at tight ef is the signature of a *different graph*, not a worse one: the two builds
+place their edges differently, and which one wins at a given budget depends on the data.
+
+**Consequence for the acceptance criterion.**  The plan words the concurrency gate as "recall within
+0.005 of the same-policy single-worker build".  Taken per ef, neither build passes that on either
+table (the gaps are 0.05-0.4, i.e. 10-80 of 200 queries) -- and it is not clear it should: two
+different-but-sound graphs will not agree to a hundredth of a point at every budget.  What the
+evidence supports is a gate at an *operating point* (e.g. "recall within 0.005 at the ef the index
+is expected to serve", or "at the ef where recall reaches 0.95"), plus a structural gate
+(`no_incoming`/`reachable` within a band, which is what actually distinguishes the two).  That is a
+plan-level decision, flagged rather than assumed -- and the BIGANN sweep on host 121 is where a
+128-dimension, harder dataset would settle it.
+
+**Still unexplained and worth one more look:** why single-builder recall at 1M jumps from 0.4 at
+ef=20 to 1.0 at ef=40 while the parallel one climbs 0.6, 0.8, 0.8.  Both are 200-query estimates, so
+each 0.005 is one query and these are 8-80 query differences -- real, not noise, and the shape
+suggests a few hard queries with different graph neighbourhoods rather than a systematic effect.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
