@@ -81,7 +81,52 @@ into the algorithm code.
 
 Sizes: S ≤ half a session, M ≈ one session, L ≈ a session or more with debugging.
 
-**T0 — Freeze the graph interface (M).**  Put the memory-graph accessor surface
+**Approach change (decided): build the new memory graph *alongside* the old one.**
+
+Rather than freezing an interface over the existing `MemGraph` and then porting
+it in place (the original T0→T1 order), the new implementation is written as a
+separate module and the legacy one is deleted only once the new one passes every
+gate.  Why this is better here:
+
+* the window in which the build path is half-ported disappears — the legacy path
+  keeps compiling, keeps passing tests and keeps being the default throughout;
+* the legacy implementation becomes a *live* A/B reference instead of a
+  historical one (recall, invariants, size and build time can be compared in the
+  same binary, same dataset, same seed);
+* the algorithms are private to each implementation, so the shared surface is
+  only what the *build driver* needs (`ambuild`, the spill/budget check, the
+  writeout, the stats line) — a much narrower trait than the full accessor
+  surface the original T0 planned, and one that can be shaped once the new graph
+  exists rather than guessed up front.
+
+Consequences to honour while both exist:
+
+* a temporary GUC selects the engine (e.g. `hnswsq.build_engine = legacy|arena`),
+  removed together with the legacy module;
+* the A/B is **statistical, not bit-identical**: the two implementations
+  deliberately differ in backlink policy (exact re-prune vs append/shrink), so
+  graph equality cannot be asserted — the comparison is recall sweep, connectivity
+  invariants, size and build time, plus bit-identical *self*-comparison per engine
+  (same seed) to catch nondeterminism;
+* `workers = 0` keeps routing to the legacy engine until the new one passes, and
+  the query path is untouched by both.
+
+**Deletion decision (must be taken *before* dropping the legacy engine).**  Once
+the legacy `MemGraph` is deleted, whatever policy the surviving implementation
+implements becomes the *default single-backend* behaviour.  If the new engine
+implements only append/shrink, the default build loses the exact policy's
+advantage — measured at 0.4-0.5 points of recall@10 (99.3 vs 98.9 at ef 160 on 1M
+BIGANN; sharper at low ef in the dim-16 ranked A/B) — for every user, not just
+those who opt into `build_workers > 0`.  Two ways out, to be settled with a
+measurement on 1M BIGANN rather than by default:
+
+1. accept append/shrink everywhere (simplest; the ids-only slab stays, no
+   metadata anywhere) and document the recall shift, or
+2. let the surviving engine implement both policies (exact needs `list_dists` +
+   `list_masks` back in the slab — the ~150 MB/complexity the T6 decision was
+   meant to avoid) and keep exact as the default.
+
+**T0 — Freeze the graph interface (M) — superseded by the approach above.**  Put the memory-graph accessor surface
 behind a trait (`level/tid/clamped/vector/probe/expand/set_list/entry`) so
 `mem_plan`/`mem_apply`/`search_layer_mem`/`backlink_prune_mem` compile against
 either the existing `MemGraph` or the arena.  *Why first:* the arena port must not
