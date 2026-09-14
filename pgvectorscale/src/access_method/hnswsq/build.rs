@@ -53,7 +53,16 @@ const CHUNK_MARGIN: usize = 64;
 // ---------------------------------------------------------------------------
 
 /// The build's backend-local state (pgvector `HnswBuildState`).
+#[cfg(any(test, feature = "pg_test"))]
+pub struct BuildTimers {
+    pub search_ns: std::cell::Cell<u128>,
+    pub backlink_ns: std::cell::Cell<u128>,
+    pub select_ns: std::cell::Cell<u128>,
+}
+
 pub struct BuildState {
+    #[cfg(any(test, feature = "pg_test"))]
+    pub timers: BuildTimers,
     pub heap: Option<pg_sys::Relation>,
     pub index: pg_sys::Relation,
     pub index_info: *mut pg_sys::IndexInfo,
@@ -275,6 +284,8 @@ unsafe fn insert_tuple_in_memory(build: &mut BuildState, element: *mut Element) 
     }
 
     // Find neighbors for element
+    #[cfg(any(test, feature = "pg_test"))]
+    let t0 = std::time::Instant::now();
     find_element_neighbors(
         base,
         element,
@@ -290,7 +301,12 @@ unsafe fn insert_tuple_in_memory(build: &mut BuildState, element: *mut Element) 
         &mut build.visited,
     );
 
+    #[cfg(any(test, feature = "pg_test"))]
+    build.timers.search_ns.set(build.timers.search_ns.get() + t0.elapsed().as_nanos());
+
     // Update graph in memory
+    #[cfg(any(test, feature = "pg_test"))]
+    let t1 = std::time::Instant::now();
     update_graph_in_memory(
         base,
         support,
@@ -301,6 +317,8 @@ unsafe fn insert_tuple_in_memory(build: &mut BuildState, element: *mut Element) 
         &mut build.scratch.local,
         &mut build.pair_scratch,
     );
+    #[cfg(any(test, feature = "pg_test"))]
+    build.timers.backlink_ns.set(build.timers.backlink_ns.get() + t1.elapsed().as_nanos());
 
     // Release entry lock
     pg_sys::LWLockRelease(std::ptr::addr_of_mut!((*graph).entry_lock));
@@ -652,6 +670,12 @@ unsafe fn flush_pages(build: &mut BuildState) {
     create_graph_pages(build);
     write_neighbor_tuples(build);
 
+    #[cfg(any(test, feature = "pg_test"))]
+    pgrx::log!(
+        "hnswsq build stats: search_s={} backlink_s={}",
+        build.timers.search_ns.get() as f64 / 1e9,
+        build.timers.backlink_ns.get() as f64 / 1e9
+    );
     (*build.graph_ptr).flushed = true;
     pg_sys::MemoryContextReset(build.graph_ctx.value());
     (*build.graph_ptr).memory_used = 0;
@@ -1105,6 +1129,12 @@ pub unsafe fn init_build_state(
         tmp_ctx,
         tranche,
         seed: HNSW_BUILD_SEED.get(),
+        #[cfg(any(test, feature = "pg_test"))]
+        timers: BuildTimers {
+            search_ns: std::cell::Cell::new(0),
+            backlink_ns: std::cell::Cell::new(0),
+            select_ns: std::cell::Cell::new(0),
+        },
         leader: None,
         scratch: SearchScratch::new(m),
         decode: Vec::with_capacity(dimensions),

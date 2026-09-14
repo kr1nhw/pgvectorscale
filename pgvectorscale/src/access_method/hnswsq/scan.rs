@@ -77,9 +77,9 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
 
     // The entry element must outlive the search results (the candidates in
     // `w` reference it until amgettuple drains them), so it lives in the
-    // scan's element store like every other materialized element.
-    state.scratch.elements.push(entry);
-    let entry_ptr = state.scratch.elements.last_mut().unwrap().as_mut() as *mut Element;
+    // scan's element arena like every other materialized element.
+    let entry_ptr = state.scratch.elements.alloc();
+    std::ptr::copy_nonoverlapping(&*entry, entry_ptr, 1);
 
     let q = if state.q.is_empty() {
         None
@@ -121,7 +121,7 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
     }
 
     let ef = (HNSW_EF_SEARCH.get() as usize).max(1);
-    let mut discarded: CandidateHeap = CandidateHeap::new();
+    let mut discarded: CandidateHeap = CandidateHeap::with_capacity(ef + 1);
     let w = search_layer(
         std::ptr::null_mut(),
         Some(index),
@@ -288,7 +288,10 @@ pub unsafe extern "C-unwind" fn ambeginscan(
         support,
         first: true,
         w: Vec::new(),
-        visited: Visited::new(256),
+        // Sized for the worst-case ef (1000) like pgvector's
+        // InitVisited(ef * m * 2): a too-small table rehashes per grow and
+        // the rehash churn dominates the per-query cost.
+        visited: Visited::new(1000 * m * 2),
         discarded: None,
         q: Vec::new(),
         m,
@@ -469,6 +472,15 @@ pub unsafe extern "C-unwind" fn amgettuple(
 pub unsafe extern "C-unwind" fn amendscan(scan: pg_sys::IndexScanDesc) {
     let ptr = (*scan).opaque as *mut ScanState;
     if !ptr.is_null() {
+        #[cfg(any(test, feature = "pg_test"))]
+        {
+            let state = &*ptr;
+            pgrx::log!(
+                "hnswsq scan stats: visited_len={} tuples={}",
+                state.visited.len(),
+                state.tuples
+            );
+        }
         drop(Box::from_raw(ptr));
         (*scan).opaque = std::ptr::null_mut();
     }

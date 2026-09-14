@@ -312,6 +312,19 @@ pub fn init_element_from_block(
     element
 }
 
+/// Fill a zeroed, caller-owned element in place (`init_element_from_block`
+/// without the Box).
+pub unsafe fn init_element_at(
+    element: *mut Element,
+    blkno: pg_sys::BlockNumber,
+    offno: pg_sys::OffsetNumber,
+) {
+    (*element).blkno = blkno;
+    (*element).offno = offno;
+    (*element).neighbor_offno = pg_sys::InvalidOffsetNumber;
+    (*element).neighbor_page = pg_sys::InvalidBlockNumber;
+}
+
 // ---------------------------------------------------------------------------
 // Metapage (hnswutils.c: HnswGetMetaPageInfo / HnswUpdateMetaPage /
 // hnswbuild.c: CreateMetaPage)
@@ -667,7 +680,7 @@ pub unsafe fn load_element_impl(
     load_vec: bool,
     max_distance: Option<f32>,
     element: Option<*mut Element>,
-    store: Option<&mut Vec<Box<Element>>>,
+    store: Option<&mut ElementArena>,
 ) -> Option<*mut Element> {
     let vec_bytes = support.codec.vector_bytes();
 
@@ -711,8 +724,9 @@ pub unsafe fn load_element_impl(
         let eptr = match (element, store) {
             (Some(e), _) => e,
             (None, Some(store)) => {
-                store.push(init_element_from_block(blkno, offno));
-                store.last_mut().unwrap().as_mut() as *mut Element
+                let eptr = store.alloc();
+                init_element_at(eptr, blkno, offno);
+                eptr
             }
             (None, None) => unreachable!("element or store required"),
         };
@@ -1007,6 +1021,67 @@ pub unsafe fn load_unvisited_from_disk(
 // Algorithm 2 from the paper (hnswutils.c: HnswSearchLayer)
 // ---------------------------------------------------------------------------
 
+/// A bump allocator for the elements a search materializes.  The candidates
+/// hold raw pointers into it for as long as the caller uses the results, so
+/// allocations must be address-stable: fixed-capacity chunks give one
+/// allocation per [`ELEMENT_ARENA_CHUNK`] elements instead of one `malloc`
+/// per admitted candidate (the pgvector reference pallocs per candidate, but
+/// its palloc is cheaper than a general-purpose malloc + free pair).
+pub struct ElementArena {
+    chunks: Vec<*mut Element>,
+    next: usize,
+    len: usize,
+}
+
+/// Elements per arena chunk (512 × ~128 B ≈ 64 KiB).
+const ELEMENT_ARENA_CHUNK: usize = 512;
+
+impl ElementArena {
+    pub fn new() -> Self {
+        ElementArena {
+            chunks: Vec::new(),
+            next: ELEMENT_ARENA_CHUNK,
+            len: 0,
+        }
+    }
+
+    /// Allocate one zeroed element with a stable address; the caller fills it
+    /// in (an on-disk element never takes its lock).
+    pub fn alloc(&mut self) -> *mut Element {
+        if self.next == ELEMENT_ARENA_CHUNK {
+            let layout = std::alloc::Layout::array::<Element>(ELEMENT_ARENA_CHUNK).unwrap();
+            let p = unsafe { std::alloc::alloc_zeroed(layout) } as *mut Element;
+            assert!(!p.is_null(), "out of memory allocating element arena chunk");
+            self.chunks.push(p);
+            self.next = 0;
+        }
+        let ptr = unsafe { (*self.chunks.last().unwrap()).add(self.next) };
+        self.next += 1;
+        self.len += 1;
+        ptr
+    }
+
+    /// Elements currently allocated.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+        self.next = ELEMENT_ARENA_CHUNK;
+        self.len = 0;
+    }
+}
+
+impl Drop for ElementArena {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::array::<Element>(ELEMENT_ARENA_CHUNK).unwrap();
+        for chunk in self.chunks.drain(..) {
+            unsafe { std::alloc::dealloc(chunk.cast::<u8>(), layout) };
+        }
+    }
+}
+
 /// Scratch space the search layer and its callers reuse across calls
 /// (pgvector pallocs the same per call in the caller's reset context).
 /// `elements` owns the on-disk elements materialized by the search, keeping
@@ -1016,7 +1091,7 @@ pub struct SearchScratch {
     pub unvisited: Vec<Unvisited>,
     pub tids: Vec<pg_sys::ItemPointerData>,
     pub local: Vec<Candidate>,
-    pub elements: Vec<Box<Element>>,
+    pub elements: ElementArena,
 }
 
 impl SearchScratch {
@@ -1025,7 +1100,7 @@ impl SearchScratch {
             unvisited: Vec::with_capacity(unvisited_capacity(m)),
             tids: Vec::with_capacity(unvisited_capacity(m)),
             local: Vec::with_capacity(unvisited_capacity(m)),
-            elements: Vec::new(),
+            elements: ElementArena::new(),
         }
     }
 }
@@ -1056,9 +1131,13 @@ pub unsafe fn search_layer(
     scratch: &mut SearchScratch,
 ) -> Vec<SearchCandidate> {
     let mut w: Vec<SearchCandidate> = Vec::new();
-    let mut c: CandidateHeap = CandidateHeap::new();
-    let mut furthest: FurthestHeap = FurthestHeap::new();
+    let mut c: CandidateHeap = CandidateHeap::with_capacity(ef + 1);
+    let mut furthest: FurthestHeap = FurthestHeap::with_capacity(ef + 1);
     let mut wlen = 0usize;
+    #[cfg(any(test, feature = "pg_test"))]
+    let mut n_probes: u64 = 0;
+    #[cfg(any(test, feature = "pg_test"))]
+    let mut n_expansions: u64 = 0;
     let lm = get_layer_m(m, lc);
 
     if init_visited {
@@ -1099,6 +1178,10 @@ pub unsafe fn search_layer(
         }
 
         let c_element = crate::access_method::hnswsq::ptr::access::<Element>(base, c_sc.element);
+        #[cfg(any(test, feature = "pg_test"))]
+        {
+            n_expansions += 1;
+        }
 
         match index {
             None => {
@@ -1140,6 +1223,10 @@ pub unsafe fn search_layer(
                 (Unvisited::Element(hp), None) => {
                     e_element = crate::access_method::hnswsq::ptr::access::<Element>(base, hp);
                     e_distance = get_element_distance(base, e_element, q.unwrap_or(&[]), support);
+                    #[cfg(any(test, feature = "pg_test"))]
+                    {
+                        n_probes += 1;
+                    }
                 }
                 (Unvisited::Tid(tid), Some(index)) => {
                     let blkno = ip_block(&tid);
@@ -1212,6 +1299,18 @@ pub unsafe fn search_layer(
     // Add each element of W to w
     while let Some(item) = furthest.pop() {
         w.push(item.0);
+    }
+
+    #[cfg(any(test, feature = "pg_test"))]
+    if index.is_none() && n_probes > 0 {
+        pgrx::log!(
+            "hnswsq search_layer: lc={} ef={} wlen={} probes={} expansions={}",
+            lc,
+            ef,
+            wlen,
+            n_probes,
+            n_expansions
+        );
     }
 
     w
