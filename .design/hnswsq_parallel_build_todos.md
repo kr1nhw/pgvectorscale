@@ -408,6 +408,43 @@ Candidate fixes, to be measured (M3/M6), in order of least semantic change:
 Either way the gate stands as the acceptance criterion for `workers > 0`: zero nodes
 without an incoming edge, everything reachable from the entry.
 
+## 3d. Fix (1) measured: backfill does not fix connectivity and costs 51% build time
+
+Restoring the closest-pruned backfill in `select_neighbors_flat` (own lists filled to
+`cap` with the pruned candidates, as the legacy engine does) and re-running the same
+100k dim-128 build:
+
+| | heuristic-only (decided policy) | with backfill |
+|---|---|---|
+| build | 20.65 s | **31.14 s (+51%)** |
+| plan (beam search + selection) | 11.9 s | 12.46 s |
+| apply (own lists + backlinks) | 7.9 s | **17.68 s (2.2x)** |
+| `no_incoming` | 519 | **426** |
+| `reachable` | 99 477 | 99 572 |
+| recall@10 ef 10/40/160/640 | 0.0000 / 0.2000 / 0.2000 / 0.5000 | **0.1000 / 0.2945 / 0.3000 / 0.5000** |
+
+Two conclusions:
+
+* **the hypothesis was mostly wrong** — backfill is not the cause of the invisible
+  nodes: it removed 93 of 519 and left 426 (0.43%).  The mechanism must be something
+  else (a newcomer occluded from every accepted entry of every target it selected is
+  simply never admitted when those targets are saturated);
+* **the cost is real**: full lists mean every backlink lands on a saturated target, so
+  the apply half does the full re-measure + occlusion walk over `cap+1` candidates
+  instead of an O(1) append: apply 2.2x, total build +51%.  In exchange recall at
+  this dataset's low/mid ef improves a lot (ef 40: 0.2000 -> 0.2945).
+
+That is a *quality-versus-throughput* trade, not a defect fix, so the code was
+reverted to the decided policy (heuristic-only own lists, ids-only slabs) and the
+variant stays available as a measured option.  Before choosing between them, the
+control experiment is missing and is the next measurement: **what is the legacy
+engine's own `no_incoming` at 100k?**  `check_lists` only exists for the flat graph,
+so it needs a `MemGraph` variant.  If legacy also leaves a few hundred nodes without
+incoming edges at this scale, the flat engine has no connectivity defect and the
+remaining question is purely the recall/build trade above; if legacy is at zero, the
+append/shrink engine needs fix (2) (unconditional admission of the nearest backlink
+target, the `always_admit` shape from ranked mode).
+
 ## 4. Test plan and gates
 
 * **Unit:** arena allocation/exhaustion/margin, `Rel<T>` round-trip, lock-order
