@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M3 step 5x: 1M re-run without the seed** | **done** | identical to the seeded run; mixed vs single-builder, equal by ef 80 |
 | **M3 step 5w: fabricated seed removed -- recall now matches single-builder** | **done** | published=rows; ef 20/40/80 = 0.6/0.6/0.9, identical to 1 worker |
 | **M3 step 5v: incomplete-build + reltuples bugs fixed** | **done** | small memory now errors instead of truncating; `heap_tuples` is rows scanned |
 | **M3 step 5u: recall sweep, both scales, fresh indexes** | **done** | 100k: -0.10 at ef 20-40; 1M: mixed, +/-0.2-0.4 both ways, equal by ef 80 |
@@ -1889,6 +1890,40 @@ seed present.
 This is also a good argument for the completeness check that found it: the check was written for
 arena exhaustion, and it is what surfaced the seed's *count* -- one more entry than the table has
 rows -- which is what made the extra node obvious.
+
+### 3j.36 The 1M comparison, re-run without the seed
+
+`t1000000`, fresh index for each build, 4 workers for the parallel one (`published=1000000
+written=1000000`, `no_incoming=1601`, 34.1 s end to end through `CREATE INDEX`), against the
+single-builder flat build at 1 worker with the pinned seed:
+
+| ef | single-builder, 1 worker | parallel, 4 workers | delta |
+|---|---|---|---|
+| 10 | 0.400 | 0.600 | +0.200 |
+| 20 | 0.400 | 0.800 | +0.400 |
+| 40 | 1.000 | 0.800 | -0.200 |
+| 80 | 1.000 | 1.000 | 0 |
+| 160 | 1.000 | 1.000 | 0 |
+
+Two things this settles.
+
+**The seed was not a factor at 1M.**  These numbers are identical to the seeded run in 3j.33, so the
+1M graph is insensitive to the extra node while the 100k graph was not.  The single-builder side
+also reproduces its earlier values exactly (0.4 / 0.4 / 1.0 / 1.0 / 1.0), which is a useful check on
+the measurement rather than on the build.
+
+**Neither build is systematically better.**  At 1M the parallel build wins the two tightest budgets
+by 0.2 and 0.4 and loses ef=40 by 0.2; at 100k (3j.35) it matches exactly.  That is a *different*
+graph, not a worse one: the two builds place edges differently and the winner depends on the data
+and the budget.
+
+**Which settles the gate question more firmly than 3j.33 did.**  A per-ef "within 0.005" criterion
+cannot be met by two sound graphs that differ in how they place edges, and demanding it would reject
+builds that are better at some operating points than the reference.  The evidence supports
+(a) a structural gate -- `no_incoming`/`reachable` within a band, which is cheap and stable -- plus
+(b) a recall gate at a *declared* operating point.  For a default, the sensible operating point is
+where the reference reaches its target recall (here ef=80, where both are 1.0).  Flagged as a
+plan-level decision; the BIGANN sweep on host 121 is what would justify a particular choice.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
