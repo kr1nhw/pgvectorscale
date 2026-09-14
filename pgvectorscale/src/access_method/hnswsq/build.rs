@@ -599,6 +599,41 @@ pub(crate) unsafe fn parallel_worker_scan(
     }
 }
 
+/// Leader, after the workers stop: write the arena's graph into the index.
+///
+/// The bridge is the single-builder one -- `writeout_graph` turns the flat graph into a
+/// `MemGraph`, and `flush_mem_graph` writes that out -- driven from a `BuildState` built over the
+/// *arena* rather than over a private graph.  Nothing new is written for the parallel case, which
+/// is the point: a parallel build and a single-builder build produce the same artifact by the same
+/// path, so any difference in the result is a difference in the graph, not in the writer.
+///
+/// Returns the number of nodes written.
+///
+/// # Safety
+///
+/// `index_rel` must be an open hnswsq index whose pages this build may own, and `params`/`arena`
+/// must be the ones the workers built with.
+pub(crate) unsafe fn write_out_arena(
+    index_rel: &pgrx::PgRelation,
+    params: &crate::access_method::hnswsq::driver::BuildParams,
+    arena: &crate::access_method::hnswsq::arena::SharedArena,
+) -> usize {
+    let mut state = worker_build_state(params, arena);
+    writeout_graph(&mut state);
+    let nodes = state.graph.len();
+    if nodes > 0 {
+        let (entry_ptr, entry_level, insert_page) = unsafe {
+            flush_mem_graph(index_rel, &state.graph, &state.codec, state.m, state.m0)
+        };
+        unsafe {
+            HnswMetaPage::update(index_rel, |meta| {
+                meta.set_build_result(entry_ptr, entry_level, nodes as u64, insert_page);
+            });
+        }
+    }
+    nodes
+}
+
 /// The state a parallel worker builds with, from the leader's published parameters and the
 /// shared arena -- i.e. the table in the design doc, in code.
 ///

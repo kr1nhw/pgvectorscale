@@ -387,6 +387,7 @@ pub fn hnswsq_parallel_build_debug(
     dims: i32,
     dist_type: i32,
     budget_mb: i32,
+    write_out: bool,
 ) -> String {
     use pgrx::PgRelation;
 
@@ -415,6 +416,7 @@ pub fn hnswsq_parallel_build_debug(
     let mut entered = 0u32;
     let mut failed = false;
     let mut slabs_claimed = 0usize;
+    let mut written = 0usize;
     let summary = unsafe {
         let heap = pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
@@ -447,7 +449,7 @@ pub fn hnswsq_parallel_build_debug(
             }
         }
 
-        BuildParams {
+        let params_snapshot = BuildParams {
             rows: 0,
             seed: 20240912,
             heap_oid: u32::from(heap_oid),
@@ -465,8 +467,8 @@ pub fn hnswsq_parallel_build_debug(
             backfill: 0,
             backlink_mode: 0,
             tranche,
-        }
-        .publish((*pcxt).toc);
+        };
+        params_snapshot.publish((*pcxt).toc);
 
         pg_sys::LaunchParallelWorkers(pcxt);
         pg_sys::WaitForParallelWorkersToFinish(pcxt);
@@ -483,16 +485,24 @@ pub fn hnswsq_parallel_build_debug(
             &super::flat_graph::FlatGraph::in_arena(&arena),
             m0 as usize,
         );
+        // Before the context goes away (and the segment with it), the leader may write the
+        // graph out: same bridge and same writer as the single-builder path.
+        if write_out {
+            written = crate::access_method::hnswsq::build::write_out_arena(
+                &index_rel, &params_snapshot, &arena,
+            );
+        }
         pg_sys::DestroyParallelContext(pcxt);
         pg_sys::ExitParallelMode();
         pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         pg_sys::table_close(heap, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         format!(
-            "workers launched={} entered={} failed={} published={} slabs={}/{} checks(published={} no_incoming={} reachable={} self_links={} duplicates={} max_len={}/{}) elapsed_ms={}",
+            "workers launched={} entered={} failed={} published={} written={} slabs={}/{} checks(published={} no_incoming={} reachable={} self_links={} duplicates={} max_len={}/{}) elapsed_ms={}",
             launched,
             entered,
             failed,
             published,
+            written,
             slabs_claimed,
             layout.total_bytes,
             checks.published,

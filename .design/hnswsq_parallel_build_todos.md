@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5q: parallel writeout into a real index | **done** | 100 001 nodes written in 1912 ms total; structure checks clean |
 | **M3 step 5p: 1M sweep, acceptance met** | **done** | 1/2/4 workers = 109.5 / 53.8 / **27.4 s** (target: <=160 s at 4) |
 | M3 step 5o: the parallel build runs | done | 100k rows, 1 worker 6294 ms / 2 workers 2997 ms, graph well formed |
 | M3 step 5n: crash pinned to `index_build_range_scan` | **one call** | stages 1-4 clean with a worker running; 5-7 crash; the delta is the scan |
@@ -1632,6 +1633,40 @@ grow with concurrency, which the single-builder case cannot).
 **What this measurement is not:** the arena is built and validated, then discarded -- there is no
 writeout and no `CREATE INDEX`, so this is the *build* only.  Recall, and therefore whether the
 0.17% connectivity delta matters, is unmeasured until the leader can write the graph out.
+
+### 3j.29 Reproducibility, and the parallel build writes a real index
+
+**Reproducibility of the 4-worker number** (the path had only just started working, so this was
+worth checking): 27 458 ms and 27 502 ms against the first run's 27 384 ms -- within 0.4%.  The
+*structure*, however, is not reproducible and cannot be: `no_incoming` was 1 697 / 1 779 / 1 753
+across those three runs, because which worker wins a backlink race depends on scheduling.  That
+settles a design question rather than raising one: the concurrency acceptance criterion has to be
+tolerance-based (`recall within 0.005`, `no_incoming` within a band), which is how the plan already
+words it, and no fingerprint-style exact gate can apply to a multi-worker build.
+
+**The leader can now write the arena out.**  `build::write_out_arena` drives the *single-builder*
+bridge and writer from a `BuildState` constructed over the arena -- `writeout_graph` (flat graph ->
+`MemGraph`) then `flush_mem_graph` and the meta update -- so a parallel build and a single-builder
+build produce their artifact by the same path, and any difference in the result is a difference in
+the graph rather than in the writer.  The harness takes a `write_out` flag.
+
+Measured on `t100k` (4 workers, into a freshly created `t100k_par_idx`):
+
+```
+workers launched=4 entered=4 failed=false published=100001 written=100001
+  checks(published=100001 no_incoming=338 reachable=99663 self_links=0 duplicates=0 max_len=32/32)
+  elapsed_ms=1912
+```
+
+So the whole thing -- scan, parallel build, writeout -- is 1.9 s for 100k rows, and the index exists
+afterwards.  That is the first time this project has produced an index from a parallel build.
+
+**Next: the recall sweep**, which is the outstanding acceptance item and the only thing that can
+judge whether the `no_incoming` delta (338 nodes here, 1 697 at 1M) matters.  Note the snag that
+cost two attempts: `bench_queries_16` is not `(id, embedding)` -- check `\d bench_queries_16`
+before writing the query, or reuse the harness's own sweep function if it is present in the scratch
+database.  The comparison that matters is the parallel index against the single-builder index on
+the same table and the same ground truth, at the same `ef_search`.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
