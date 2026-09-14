@@ -23,7 +23,8 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
-| **M6/BIGANN: no speedup at dim 128, and 2x slower than single-builder** | **open** | 1 worker 369.6 s = 4 workers 374.7 s vs baseline 179.5 s; scales 3.4x at dim 16 |
+| **M6/BIGANN: no speedup at dim 128, and 2x slower than single-builder** | **open** | 1/2/4 workers = 369.6 / 355.0 / 374.7 s vs baseline 179.5 s |
+| M6/BIGANN: lock elision for a lone worker | **candidate fix, measurement running** | sound (one writer needs no exclusion), compile-verified | 1 worker 369.6 s = 4 workers 374.7 s vs baseline 179.5 s; scales 3.4x at dim 16 |
 | **M6/BIGANN: parallel is 2.1x SLOWER than single-builder** | **open** | 374.7 s vs 179.5 s at 4 workers, while recall is *better* (0.775 vs 0.742 at ef=10) |
 | **M3 step 6a: full hnswsq suite green after the parallel work** | **done** | 122 passed, 0 failed (356 s) |
 | M3 step 5z: recall at 7 workers | **done** | identical to 4 workers (0.6/0.8/0.8/1.0/1.0) with `no_incoming` doubled |
@@ -2197,6 +2198,31 @@ it is a measurement, not a preference: `perf` on the host with one worker, and a
 same build with the arena in private memory (the single-builder path, as a control), would separate
 them.  Neither this nor the recall result changes the *plan's* wording: the target was set from dim-16
 synthetic builds, and on the acceptance dataset it is not met.
+
+### 3j.45 The lock traffic is the fixed cost -- testable, and avoidable for one worker
+
+The worker scan at dim 128 is flat: **1 worker 369.6 s, 2 workers 355.0 s, 4 workers 374.7 s** against
+the single-builder baseline's 179.5 s.  Adding workers does not help; adding *one* worker already costs
+2x.  So the fixed cost is in what a worker does per insert, not in what several of them do to each
+other -- and the most obvious candidate is the lock discipline, because it is the one thing the
+parallel path does on every backlink that the single-builder path does not do at all: O(64) node write
+locks per insert at `ef_construction = 64`, i.e. tens of millions for a 1M build, each with the target
+list re-measured while held (which is why the hold time grows with the vector length).
+
+**Which makes a clean experiment out of an easy fix.**  With exactly one worker there is no exclusion
+to perform, so the worker can take the lock-free path the single-builder build uses.  `BuildParams`
+gained `single_writer` (set when the build asks for <= 1 worker) and the callback chooses
+`Locking::SoleWriter` over `Locking::Locks` accordingly -- sound, because a lone worker *is* the
+graph's only writer.
+
+If the 1-worker time drops from ~370 s to ~180 s, the locks are the fixed cost and the remaining
+question is only why four workers do not recover it (which would then be hold-time contention, the
+second effect in 3j.44).  If it stays at ~370 s, the cost is elsewhere and the next suspect is memory:
+the arena in a dsm segment against the single-builder's private heap.
+
+Measured on the host as this was written; the result lands in the next round.  The change is committed
+*sound but unmeasured* -- unlike the earlier speculative fixes, it needs no behavioural assumption: one
+writer cannot race itself.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

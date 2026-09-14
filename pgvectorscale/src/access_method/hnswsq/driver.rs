@@ -202,6 +202,10 @@ pub struct BuildParams {
     pub backlink_mode: u8,
     /// The LWLock tranche the arena's node locks were initialized with.
     pub tranche: i32,
+    /// True when the build has a single writer, so a worker may take the lock-free path: with one
+    /// worker there is nothing to exclude, and the lock traffic is per backlink -- O(ef_construction)
+    /// per insert -- which is a cost worth not paying when it buys nothing.
+    pub single_writer: bool,
 }
 
 impl BuildParams {
@@ -470,6 +474,7 @@ pub(crate) fn build_index_parallel(
             backfill: 0,
             backlink_mode: 0,
             tranche,
+            single_writer: workers <= 1,
         };
         params_snapshot.publish((*pcxt).toc);
 
@@ -760,6 +765,7 @@ mod tests {
                 backfill: 0,
                 backlink_mode: 0,
                 tranche,
+                single_writer: false,
             }
             .publish((*pcxt).toc);
 

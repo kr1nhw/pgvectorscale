@@ -508,9 +508,15 @@ unsafe extern "C-unwind" fn parallel_insert_callback(
     if stage == 7 {
         return;
     }
-    // SAFETY: the arena (and so its locks) outlives the scan, and this is the only writer of
-    // the nodes it touches that does not hold their lock.
-    let locking = Locking::Locks(unsafe { &*ctx.locks });
+    // A lone worker is the graph's only writer, so it takes the lock-free path -- the same one the
+    // single-builder build uses.  With more than one worker the locks are what exclude them, and
+    // each backlink takes one.
+    let locking = if ctx.params.single_writer {
+        Locking::SoleWriter
+    } else {
+        // SAFETY: the arena (and so its locks) outlives the scan.
+        Locking::Locks(unsafe { &*ctx.locks })
+    };
     flat_insert_at_level(&mut ctx.state, heap_tid, &vec, level, &locking);
 }
 
