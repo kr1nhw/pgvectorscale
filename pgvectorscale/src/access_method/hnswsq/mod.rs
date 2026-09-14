@@ -18,6 +18,7 @@
 //! - pgvector-style concurrent inserts: no global writer lock, one content
 //!   lock at a time, two-phase optimistic neighbor updates.
 
+pub mod arena;
 pub mod build;
 pub mod flat_engine;
 pub mod flat_graph;

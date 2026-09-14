@@ -167,6 +167,32 @@ consumers to it; keep `MemGraph`'s public field access private to the module.
 *Gate:* suite green (61), identical counters for the pinned seed, 100k dim-128
 local build within 2 % of 22.3 s.
 
+**M3 finding that de-risks T1: the flat graph is already offset-addressed.**
+Every access in `FlatGraph` is index arithmetic over flat arrays — `ids[slab * cap +
+k]`, `lens[slab]`, `vectors[id * stride ..]` — with no pointers anywhere.  So the
+DSM port is *not* pointer swizzling: it is (a) making the four arrays (vectors, ids,
+lens, levels/tids/clamped) slices of one `shm_toc` chunk instead of process-local
+`Vec`s, (b) a bump allocator over a fixed byte budget with a reserved margin, and
+(c) the lock array.  Consequences the arena must honour and the prototype must
+already respect:
+
+* **nothing may grow** — the arrays are sized once from the budget, and running out
+  is a *normal* outcome that stops the workers, flushes what exists and continues on
+  the disk path (the existing `spill_to_disk` transition), not an error path;
+* **node data must be published before it is observable**: a worker claims an id
+  from the shared counter and only then writes level/tid/clamped/vector, so readers
+  bound-check against the *graph's* length (the flat search already does) and the
+  arena needs a published-watermark check before trusting a slot's contents;
+* the per-node lock array must never be reallocated while a worker holds a guard,
+  which is why `NodeLocks` has `grow_to` (documented: extend between phases, under
+  the driver's serialization, never under a held guard).
+
+First piece implemented: `arena.rs` — `NodeLocks` with read/write guards where
+`write` counts the current thread's write guards and panics on a second one, so the
+"one target lock at a time" rule that keeps the backlink order acyclic is enforced
+rather than assumed (`std::sync::RwLock` here, LWLock tranches in the arena behind
+the same API).  4 unit tests.
+
 **T1 — Relative-pointer arena (L).**  `HnswArena` in one `shm_toc` chunk: header,
 node slots (level, tid, clamped, `vector_bytes` payload, per-layer list slabs),
 a free/bump cursor guarded by `allocatorLock`, and a reserved margin.  `Rel<T>`
