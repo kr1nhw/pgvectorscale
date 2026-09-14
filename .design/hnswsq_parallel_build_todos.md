@@ -40,6 +40,38 @@ pinned seed, release, same host, unless stated):
 5. **M7**: settle the surviving policy (append/shrink only, or also exact) with the 1M
    measurement, then delete the legacy engine, the adapter and `build_engine`.
 
+## 3g. Same-dataset A/B at 1M: the flat engine is 1.78x faster, with better low-ef recall
+
+Same local 1M dataset (dim 16), pinned seed, release, back to back:
+
+| engine | build | plan (search) | apply (backlinks) | `no_incoming` | recall@10 ef 40 / 160 |
+|---|---|---|---|---|---|
+| legacy (exact re-prune, `list_dists`/`list_masks`) | **174.0 s** | 105.2 s | 50.5 s | 0 | 0.8000 / 1.0000 |
+| flat (append/shrink, ids-only) | **97.8 s** | 73.4 s | 19.4 s | 1 | **1.0000** / 1.0000 |
+
+**1.78x faster single-threaded**, split across both halves: plan 105.2 -> 73.4 s (1.43x,
+the flat layout's locality plus ids-only writes and no backfill) and apply 50.5 -> 19.4 s
+(2.6x).  Recall is *better* at ef 40 (1.0000 vs 0.8000) and equal at ef 160, with
+connectivity equivalent (1 vs 0 nodes without an incoming edge out of a million).
+
+Two things this changes:
+
+* **the parallel-build acceptance math gets easier**: a 97.8 s single-core 1M build at
+  this size means the 4-worker target is plausible without exotic scaling, and the
+  single-core comparison against pgvector (442 s on BIGANN) now favours us by ~4.5x rather
+  than 1.27x -- the BIGANN number still has to be re-measured with the flat engine before
+  that is quoted anywhere;
+* **the apply-half comparison is now dataset-dependent in *both* directions**: flat's apply
+  is 2.6x *cheaper* here (many targets stay unsaturated, so appends dominate) and 1.4x
+  *dearer* on the 100k dim-128 set (tight clusters saturate targets, so every backlink
+  pays the overflow re-measure).  Any claim about the policy's cost has to name the data
+  shape; the phase split in the stats line is what makes that checkable per run.
+
+Also worth noting for the legacy engine's own quality: it backfills unconditionally, and
+the 1M backfill experiment (§3f) showed backfill costing 20 recall points at ef 40 on this
+dataset -- i.e. the flat engine's ef-40 advantage here is plausibly the *legacy* engine's
+backfill being a liability at low search width, not the flat engine being clever.
+
 ## 3f. Backfill decision measured at 1M (local, dim 16) -- keep it OFF
 
 Same harness, 1M rows (the local `t1000000` dataset), pinned seed, release, flat engine
