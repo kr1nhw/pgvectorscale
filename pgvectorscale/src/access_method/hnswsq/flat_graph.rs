@@ -148,7 +148,9 @@ impl FlatGraph {
         }
         self.slab_off.push(self.lens.len() as u32);
         self.lens.resize(self.lens.len() + layers, 0);
-        self.ids.resize(self.lens.len() * self.cap, 0);
+        if self.chunk.is_none() {
+            self.ids.resize(self.lens.len() * self.cap, 0);
+        }
         self.published_flags.push(false);
         Some(id)
     }
@@ -274,8 +276,16 @@ impl FlatGraph {
         );
         let slab = self.slab(id, layer).expect("layer beyond the node's level");
         let base = slab * self.cap;
-        self.ids[base..base + ids.len()].copy_from_slice(ids);
-        self.lens[slab] = ids.len() as u16;
+        let n = ids.len();
+        match self.chunk.as_mut() {
+            Some(chunk) => {
+                chunk.region_u32_mut(self.layout.ids)[base..base + n].copy_from_slice(ids);
+            }
+            None => self.ids[base..base + n].copy_from_slice(ids),
+        }
+        // `lens` is still the length store *and* the slab cursor (`slab_base` counts
+        // slabs through it), so it stays a `Vec` until its own region moves.
+        self.lens[slab] = n as u16;
     }
 
     /// Borrowed view of a node's layer-`layer` list (valid prefix only).
@@ -284,7 +294,11 @@ impl FlatGraph {
         match self.slab(id, layer) {
             Some(slab) => {
                 let base = slab * self.cap;
-                &self.ids[base..base + self.lens[slab] as usize]
+                let n = self.lens[slab] as usize;
+                match &self.chunk {
+                    Some(chunk) => &chunk.region_u32(self.layout.ids)[base..base + n],
+                    None => &self.ids[base..base + n],
+                }
             }
             None => &[],
         }
@@ -693,6 +707,13 @@ mod tests {
         assert!(g.vectors.is_empty(), "no Vec copy alongside the chunk");
 
         // ... and a claimed-but-unpublished node reads as zeros from the chunk.
+        // Slab storage: written and read back through the chunk's ids region.
+        g.set_list(0, 0, &[7, 8, 9]);
+        assert_eq!(g.neighbors(0, 0), &[7, 8, 9]);
+        assert!(g.ids.is_empty(), "no Vec copy of the slab storage either");
+        g.set_list(0, 0, &[5]);
+        assert_eq!(g.neighbors(0, 0), &[5], "shortest list wins, still in the chunk");
+
         let claimed = g.claim_slot(0).expect("room");
         assert_eq!(g.vector(claimed), &[0u8; 8]);
         g.publish(claimed, tid(3), false, &[3u8; 8]);

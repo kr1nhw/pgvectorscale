@@ -494,6 +494,27 @@ fingerprint=30db11c54b7edd31
 checks(published=100000 no_incoming=519 reachable=99477 self_links=0 duplicates=0 max_len=32)
 ```
 
+**Baseline recipe (pin this exactly; the fingerprint is table-specific).**  Table
+`t100kd128u` in `t100kdb` -- *not* `t100kd128` (same 100k/dim-128 shape, different
+rows: that one gives flat `eea4810ef4123d1a` / `no_incoming=498`) and *not* `t100k`
+(dim 16, fully connected: `no_incoming=0`, flat `3794aa11c860aba0`).  The in-memory
+path requires a non-zero build budget, so the GUC line must include
+`maintenance_work_mem`; without it the build silently takes the disk path
+(`disk_mode=true`, `checks(...)` all zero, fingerprint unrelated):
+
+```sql
+SET maintenance_work_mem = '2GB';   -- else disk_mode=true and the gate is meaningless
+SET hnswsq.build_stats = 1;
+SET hnswsq.build_seed = 20240912;
+SET hnswsq.build_engine = 1;        -- 0 = legacy MemGraph, for the side-by-side
+CREATE INDEX <idx> ON t100kd128u USING hnswsq (embedding vector_l2_ops)
+  WITH (storage_layout = 'plain', m = 16, ef_construction = 64);
+```
+
+Legacy baseline on the same table: `e4aaa8fa5d6b7f25`, `no_incoming=384`,
+`reachable=99616`.  Both engines reproduce these exactly on repeated runs, so any
+drift means a real change, either to the graph or to the gate.
+
 So the graph is well formed (no self-links, no duplicates, capacity respected) but
 **0.52% of nodes have no incoming edge at all** -- invisible to every search -- and
 523 nodes are unreachable from the entry.  The recall sweep could not see this: at
