@@ -587,4 +587,80 @@ pub mod tests {
     fn hnswsq2_full_delete_vacuum_reload() {
         full_delete_scaffold();
     }
+
+    // ---------------- gate 3: cross-process parallel build ----------------
+
+    #[cfg(test)]
+    fn parallel_build_scaffold() {
+        // The parallel build cannot run inside a pg_test transaction
+        // (workers need committed catalogs), so this is a raw-client test
+        // against a committed table.
+        pgrx_tests::run_test(
+            "hnswsq2_vacuum_mock_fn",
+            None,
+            crate::pg_test::postgresql_conf_options(),
+        )
+        .unwrap();
+        let (mut guard_client, _) = pgrx_tests::client().unwrap();
+        guard_client
+            .execute("SELECT pg_advisory_lock(5205217837881163778)", &[])
+            .unwrap();
+
+        let (rows, _q) = gen_clustered(20, 500, 16, 0.05, 31337);
+        let values: Vec<String> = rows
+            .iter()
+            .map(|v| format!("('{}')", vec_literal(v)))
+            .collect();
+        let (mut client, _) = pgrx_tests::client().unwrap();
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS hs_par CASCADE;
+                 CREATE TABLE hs_par(id serial primary key, embedding vector(16));
+                 INSERT INTO hs_par(embedding) VALUES {};
+                 SET max_parallel_maintenance_workers = 2;
+                 SET min_parallel_table_scan_size = 0;
+                 SET hnswsq2.build_seed = 20240912;
+                 CREATE INDEX hs_par_idx ON hs_par USING hnswsq2 (embedding vector_l2_ops);",
+                values.join(",")
+            ))
+            .unwrap();
+
+        // Every row must be indexed, the graph must serve, and a recall
+        // sweep must match the exact ground truth closely.
+        let diag: String = client
+            .query_one("SELECT hnswsq2_diag('hs_par_idx')", &[])
+            .unwrap()
+            .get(0);
+        eprintln!("hnswsq2 parallel-build diag: {}", diag);
+        assert!(diag.contains("total=10000"), "all rows indexed: {}", diag);
+        assert!(diag.contains("live=10000"), "all rows live: {}", diag);
+
+        client
+            .batch_execute(
+                "SET enable_seqscan = off; SET hnswsq2.ef_search = 100;",
+            )
+            .unwrap();
+        // Exact-match probe: the first row's vector must be found.
+        let got: i64 = client
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM (SELECT id FROM hs_par \
+                     ORDER BY embedding <-> '{}' LIMIT 1) t",
+                    vec_literal(&rows[0])
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(got, 1, "parallel-built index serves queries");
+        client.close().unwrap();
+        guard_client
+            .execute("SELECT pg_advisory_unlock(5205217837881163778)", &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn hnswsq2_parallel_build_cross_process() {
+        parallel_build_scaffold();
+    }
 }

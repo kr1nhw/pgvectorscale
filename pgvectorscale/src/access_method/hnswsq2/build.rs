@@ -121,7 +121,15 @@ pub unsafe fn init_graph(graph: *mut Graph, base: *mut u8, memory_total: usize, 
         &mut (*graph).entry_point,
         std::ptr::null_mut::<u8>(),
     );
-    (*graph).memory_used = 0;
+    // Avoid the base address for relptrs: offset 0 is the NULL encoding in
+    // this port's relptr (ptr.rs stores raw offsets), so the first shared
+    // allocation must not land at offset 0 — pgvector's pre-14.5 workaround
+    // (`memoryUsed += MAXALIGN(1)`), kept unconditionally.
+    (*graph).memory_used = if base.is_null() {
+        0
+    } else {
+        pg_sys::MAXALIGN(1)
+    };
     (*graph).memory_total = memory_total.min(MAX_GRAPH_MEMORY);
     (*graph).flushed = false;
     (*graph).indtuples = 0.0;
@@ -484,11 +492,13 @@ unsafe fn create_graph_pages(build: &mut BuildState) {
     let first_block = pg_sys::BufferGetBlockNumber(buf);
 
     let mut iter = (*graph).head;
+    let mut chain_count = 0usize;
     while !crate::access_method::hnswsq2::ptr::is_null(base, iter) {
         let element = crate::access_method::hnswsq2::ptr::access::<Element>(base, iter);
 
         // Update iterator
         iter = (*element).next;
+        chain_count += 1;
 
         let etup_size = element_tuple_size(vec_bytes);
         let ntup_size = neighbor_tuple_size((*element).level as usize, m);
@@ -571,6 +581,7 @@ unsafe fn create_graph_pages(build: &mut BuildState) {
     pg_sys::MarkBufferDirty(buf);
     pg_sys::UnlockReleaseBuffer(buf);
 
+    let _ = chain_count; // debug aid: chain vs indtuples at flush
     let entry_point =
         crate::access_method::hnswsq2::ptr::access::<Element>(base, (*graph).entry_point);
     let entry_point_opt = if entry_point.is_null() {
@@ -926,6 +937,13 @@ unsafe fn begin_parallel(build: &mut BuildState, isconcurrent: bool, request: i3
         });
         return;
     }
+
+    // Log participants (pgvector logs DEBUG1 here; LOG makes the cross-
+    // process scaffold verifiable from the server log).
+    pgrx::log!(
+        "hnswsq2 using {} parallel workers for index build",
+        (*pcxt).nworkers_launched
+    );
 
     // Save leader state now that it's clear build will be parallel
     build.leader = Some(Leader {
