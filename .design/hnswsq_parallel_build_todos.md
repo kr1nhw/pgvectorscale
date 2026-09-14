@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5z: recall at 7 workers | **done** | identical to 4 workers (0.6/0.8/0.8/1.0/1.0) with `no_incoming` doubled |
 | M3 step 5y: 8-worker point, sweep complete | **done** | 7 of 8 launched, 23.4 s vs 35.3 s at 4; `no_incoming` 3375 (0.34%) |
 | M4 step: per-worker reporting | **done** | 4 workers: rows sum to 100000, nodes==rows, load spread 0.6% |
 | **M5 step: fall back instead of refusing** | **done** | small memory now warns and builds on the spilling path |
@@ -2043,6 +2044,31 @@ the writeout are a visible fraction), but it is the first measurement of it, and
 proportion to it, which is what a race-based mechanism should look like.  Recall was measured at 4
 workers and did not suffer for it (3j.36); the 7-worker graph has not been checked, and given the
 trend that is the next thing to look at rather than assume.
+
+### 3j.41 Recall does not degrade from 1 to 7 workers
+
+The last round left one thing to check rather than assume: `no_incoming` grows roughly in proportion
+to the worker count (0, 353, 1 572, 3 375), so does recall follow it down.  On `t1000000`, 8 workers
+requested (7 launched), fresh index, `no_incoming=3344 reachable=996656 written=1000000` in 24.0 s:
+
+| ef | 1 worker | 4 workers | 7 workers |
+|---|---|---|---|
+| 10 | 0.400 | 0.600 | 0.600 |
+| 20 | 0.400 | 0.800 | 0.800 |
+| 40 | 1.000 | 0.800 | 0.800 |
+| 80 | 1.000 | 1.000 | 1.000 |
+| 160 | 1.000 | 1.000 | 1.000 |
+
+**Identical to the 4-worker graph at every point**, with `no_incoming` more than doubled.  So the
+connectivity delta keeps growing with concurrency and recall does not move with it -- three
+independent worker counts now agree within the resolution of a 200-query estimate, while the
+single-builder graph differs from all of them in both directions (better at ef 40, worse at 10-20).
+
+That is a useful negative result for the plan: `no_incoming` is a *diagnostic*, not a proxy for
+quality.  It was worth having as a gate when the parallel path was new and unmeasured, but the
+evidence now says the recall gate should stand on its own and `no_incoming` should be reported rather
+than thresholded -- unless the BIGANN data disagrees, which is still unmeasured because the EC2 hosts
+remain unreachable.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
