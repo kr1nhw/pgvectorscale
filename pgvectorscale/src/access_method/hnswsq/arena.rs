@@ -488,6 +488,28 @@ impl SharedArena {
             + nodes * std::mem::size_of::<pgrx::pg_sys::LWLock>()
     }
 
+    /// Sizes of the four allocations [`SharedArena::allocate`] makes, in the order it
+    /// makes them.
+    ///
+    /// The estimator has to see them *separately*: `shm_toc_allocate` aligns **each**
+    /// allocation up to `BUFFERALIGN`, so rounding up the sum instead is short by up to
+    /// eight bytes per region -- which is exactly how the first leader-side test failed,
+    /// with "out of shared memory" from inside `shm_toc.c`.
+    pub fn allocation_sizes(
+        stride: usize,
+        cap: usize,
+        nodes: usize,
+        slabs: usize,
+    ) -> [usize; 4] {
+        let layout = arena_layout(stride, cap, nodes, slabs);
+        [
+            std::mem::size_of::<ArenaHeader>(),
+            std::mem::size_of::<ArenaState>(),
+            layout.total_bytes,
+            nodes * std::mem::size_of::<pgrx::pg_sys::LWLock>(),
+        ]
+    }
+
     /// Leader: allocate the whole arena inside `toc` and initialize its locks.
     ///
     /// # Safety

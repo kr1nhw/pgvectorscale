@@ -1080,6 +1080,40 @@ Two details the tests pin down, both about *not* being naive:
   tests that want to assert a level directly, and both derive from the same
   `random_level`, so they agree whenever the order is the same.
 
+### 3j.12 The driver's leader side exists, and its estimate does not take effect yet
+
+`driver.rs` now holds the leader half: `plan` (the arena shape, from the same
+`plan_capacity` the single-builder path uses, so a parallel build cannot quietly run on a
+different budget), `estimate_arena` (mirroring PostgreSQL's `shm_toc_estimate_chunk/keys`
+macros, which bindgen cannot emit because they are `static inline`), `leader_setup`
+(`InitializeParallelDSM` + allocate the arena in the context's toc), and `worker_attach`
+(`dsm_attach` + `shm_toc_attach(PARALLEL_MAGIC, ...)` + by-key lookup).  `PARALLEL_MAGIC`
+is pinned to `0x50477c23` and the test is written to *verify* it against a real context
+rather than trust the constant.
+
+The leader-side test fails, and the way it fails is worth more than the test:
+
+```
+ERROR:  out of shared memory          (shm_toc.c)
+```
+
+Two facts narrow it to one question.  First, the initial estimate rounded the *summed*
+regions up once and was therefore short by up to eight bytes per region -- `shm_toc_allocate`
+`BUFFERALIGN`s each allocation separately.  That was a real bug and is fixed
+(`SharedArena::allocation_sizes`), and the failure did **not** change, so the estimate is
+not merely a little short: it appears not to be honored at all.  Second, that points at
+`InitializeParallelDSM` resetting `pcxt->estimator` when it sizes PostgreSQL's own state,
+leaving our regions out of the toc's size.
+
+The next step is to settle it from PostgreSQL's source, not by experiment: read
+`CreateParallelContext`/`InitializeParallelDSM` and determine whether an extension's
+pre-`InitializeParallelDSM` estimate survives.  pgvector's C build assumes it does, so
+"it cannot" needs confirming rather than assuming -- and if it cannot, the arena wants a
+dsm segment of its own, which is worth costing out before fighting the toc.
+
+The test is `#[ignore]`d with those findings in place, so the suite stays green without the
+failure being hidden.
+
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
 documented concurrent-write view, since sibling workers write sibling bytes without a

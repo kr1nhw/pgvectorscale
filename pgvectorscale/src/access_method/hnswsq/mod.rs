@@ -20,6 +20,7 @@
 
 pub mod arena;
 pub mod build;
+pub mod driver;
 pub mod flat_engine;
 pub mod flat_graph;
 pub mod graph;
