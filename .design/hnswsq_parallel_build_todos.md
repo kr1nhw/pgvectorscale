@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5c: shared scan descriptor in the toc | done | `table_parallelscan_*`; one descriptor every worker reads |
 | M3 step 5b: build parameters + verified toc magic | done | `BuildParams` round-trips; `PARALLEL_MAGIC` is measured, not remembered |
 | M3 step 5: parallel worker entry, cross-process verified | done | workers load the library, attach the leader's arena, touch the shared cursors |
 | M3 step 4i: deterministic level table | done | `levels.rs`; levels drawn up front so worker scheduling cannot change the graph |
@@ -1174,6 +1175,41 @@ is_validate, blockNum, callback, callback_state, scan)`.  `table_beginscan_paral
 ParallelTableScanDesc)` *is* bound, and `IndexBuildCallback`'s signature is
 `extern "C-unwind" fn(index, tid, values, isnull, tupleIsAlive, state)`.  The shared scan
 descriptor has to be allocated in the toc so every worker sees the same one.
+
+### 3j.15 The shared scan descriptor, and which scan API the worker actually needs
+
+The leader now builds the table scan in the toc: `scan_bytes(heap, snapshot)` (a pure size
+computation, so it can be reserved *before* `InitializeParallelDSM` -- which is why the
+estimate is a separate step at all) and `leader_scan_setup`, which allocates the descriptor,
+`table_parallelscan_initialize`s it, and inserts it under its key.  `scan_descriptor(toc)`
+is the worker's side.  One descriptor for every worker is what makes the parallel scan hand
+out *disjoint* block ranges: workers reading the same object cover the table once instead of
+each scanning all of it.  The snapshot is copied into the descriptor by the initialize call,
+which is why a worker needs nothing but the descriptor to start.
+
+Verified leader-side with a real table and a real snapshot
+(`the_leader_publishes_a_shared_scan_descriptor`, 3 driver tests green).
+
+**A useful simplification for the worker loop.**  The plan was a slot-based scan, but
+`table_scan_getnextslot` is `static inline` in `tableam.h` and therefore not bound -- and it
+turns out not to be needed.  The build wants *values*, and `index_build_range_scan` (bound as
+a `TableAmRoutine` field, with the full signature recorded above) hands them to a callback
+directly.  So the worker scan is:
+
+```
+table_beginscan_parallel(heap, scan_descriptor(toc))
+rd_tableam->index_build_range_scan(table_rel, index_rel, BuildIndexInfo(index_rel),
+                                   allow_sync=false, anyvisible=false, progress=false,
+                                   0, InvalidBlockNumber, callback, state, scan)
+table_endscan(scan)
+```
+
+with each worker building its own `IndexInfo` from the index relation (a palloc'd one cannot
+be shared, and it is deterministic from the relation anyway), and the heap/index relations
+opened from the oids in `BuildParams`.  The callback is
+`extern "C-unwind" fn(index, tid, values, isnull, tupleIsAlive, state)`, which is where the
+vector for `claim_slot`/`plan_flat`/`apply_flat` comes from -- i.e. the next step is the
+insert loop itself, no further ABI discovery expected.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

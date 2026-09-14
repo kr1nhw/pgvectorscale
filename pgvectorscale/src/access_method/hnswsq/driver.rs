@@ -104,8 +104,9 @@ pub unsafe fn estimate_arena(
     for bytes in SharedArena::allocation_sizes(stride, cap, sizing.nodes, sizing.slabs) {
         estimate_chunk(pcxt, bytes);
     }
-    // One key per region the leader allocates: header, state, chunk, locks, parameters.
-    estimate_keys(pcxt, 5);
+    // One key per region the leader allocates: header, state, chunk, locks, parameters,
+    // and (once a relation is open) the shared scan descriptor.
+    estimate_keys(pcxt, 6);
     estimate_chunk(pcxt, std::mem::size_of::<BuildParams>());
 }
 
@@ -220,6 +221,62 @@ impl BuildParams {
     }
 }
 
+/// Key for the shared table-scan descriptor.
+pub const TOC_KEY_SCAN: u64 = 0x686e_7377_7371_2002;
+
+/// Bytes the shared scan descriptor needs, for the estimator.
+///
+/// `table_parallelscan_estimate` only reads the relation and the snapshot, so the leader can
+/// size the segment *before* `InitializeParallelDSM` -- which is the whole reason the
+/// estimate is a separate step at all.
+///
+/// # Safety
+///
+/// `heap` must be an open relation and `snapshot` a registered snapshot.
+pub unsafe fn scan_bytes(heap: pg_sys::Relation, snapshot: pg_sys::Snapshot) -> usize {
+    pg_sys::table_parallelscan_estimate(heap, snapshot)
+}
+
+/// Leader: build the shared scan descriptor in the toc.
+///
+/// One descriptor for every worker: PostgreSQL's parallel scan hands out block ranges
+/// through it, so all of them reading the same object is what makes the workers cover the
+/// table once instead of each scanning all of it.  The snapshot is copied *into* the
+/// descriptor by `table_parallelscan_initialize`, which is why a worker needs nothing but
+/// the descriptor to start scanning.
+///
+/// # Safety
+///
+/// `pcxt` must have been sized with [`estimate_arena`] plus
+/// [`scan_bytes`] for this relation, and `heap` must be an open relation that stays open for
+/// the build.
+pub unsafe fn leader_scan_setup(
+    pcxt: *mut pg_sys::ParallelContext,
+    heap: pg_sys::Relation,
+    snapshot: pg_sys::Snapshot,
+) -> *mut pg_sys::ParallelTableScanDescData {
+    let size = scan_bytes(heap, snapshot);
+    let pscan = pg_sys::shm_toc_allocate((*pcxt).toc, size)
+        .cast::<pg_sys::ParallelTableScanDescData>();
+    pg_sys::table_parallelscan_initialize(heap, pscan.cast(), snapshot);
+    pg_sys::shm_toc_insert((*pcxt).toc, TOC_KEY_SCAN, pscan.cast());
+    pscan
+}
+
+/// Worker (or anyone with the toc): the shared scan descriptor.
+///
+/// # Safety
+///
+/// `toc` must hold a descriptor from [`leader_scan_setup`].
+pub unsafe fn scan_descriptor(
+    toc: *mut pg_sys::shm_toc,
+) -> *mut pg_sys::ParallelTableScanDescData {
+    let pscan = pg_sys::shm_toc_lookup(toc, TOC_KEY_SCAN, false)
+        .cast::<pg_sys::ParallelTableScanDescData>();
+    assert!(!pscan.is_null(), "the leader published no scan descriptor");
+    pscan
+}
+
 /// The entry point PostgreSQL calls in each parallel worker.
 ///
 /// `ParallelWorkerMain` has already attached the segment, restored the GUCs and the
@@ -310,6 +367,60 @@ mod tests {
 
             drop(arena);
             pg_sys::DestroyParallelContext(pcxt);
+        }
+    }
+
+    #[pgrx::pg_test]
+    fn the_leader_publishes_a_shared_scan_descriptor() {
+        // A real table, a real snapshot and a descriptor every worker can read: this is the
+        // object PostgreSQL's parallel scan hands block ranges out through, so all workers
+        // reading the *same* one is what makes them cover the table once rather than each
+        // scanning all of it.  The snapshot is copied into the descriptor by
+        // `table_parallelscan_initialize`, which is why a worker needs nothing else.
+        pgrx::Spi::run("CREATE TABLE driver_scan_test(id int)").unwrap();
+        pgrx::Spi::run(
+            "INSERT INTO driver_scan_test SELECT g FROM generate_series(1, 500) g",
+        )
+        .unwrap();
+        let relid: pg_sys::Oid = pgrx::Spi::get_one("SELECT 'driver_scan_test'::regclass::oid")
+            .unwrap()
+            .unwrap();
+
+        let (stride, cap) = (8usize, 4usize);
+        let sizing = plan(stride, cap, 1 << 20);
+        // SAFETY: one leader-side context; the relation is opened and closed here.
+        unsafe {
+            let heap = pg_sys::table_open(relid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            let snapshot = pg_sys::GetActiveSnapshot();
+            assert!(!snapshot.is_null(), "a scan needs a snapshot");
+
+            let bytes = scan_bytes(heap, snapshot);
+            assert!(
+                bytes >= std::mem::size_of::<pg_sys::ParallelTableScanDescData>(),
+                "the estimate must cover the descriptor itself: {} bytes",
+                bytes
+            );
+
+            let pcxt = pg_sys::CreateParallelContext(
+                LIBRARY.as_ptr().cast_mut().cast::<std::os::raw::c_char>(),
+                c"hnswsq_parallel_build_main".as_ptr().cast_mut(),
+                2,
+            );
+            estimate_arena(pcxt, stride, cap, sizing);
+            // The descriptor is one more allocation, and the estimator is per allocation.
+            estimate_chunk(pcxt, bytes);
+            let (_arena, _layout) = leader_setup(pcxt, stride, cap, sizing, 0);
+
+            let pscan = leader_scan_setup(pcxt, heap, snapshot);
+            assert!(!pscan.is_null(), "the descriptor was allocated");
+            assert_eq!(
+                scan_descriptor((*pcxt).toc),
+                pscan,
+                "a worker finds the same descriptor by key"
+            );
+
+            pg_sys::DestroyParallelContext(pcxt);
+            pg_sys::table_close(heap, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         }
     }
 
