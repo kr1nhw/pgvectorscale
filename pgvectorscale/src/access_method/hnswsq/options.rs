@@ -139,6 +139,16 @@ pub static HNSWSQ_BUILD_SEED: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::n
 /// bookkeeping only.
 pub static HNSWSQ_BACKLINK_MODE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(1);
 
+/// `hnswsq.build_engine`: which in-memory build engine `CREATE INDEX` uses.
+///
+/// 0 (default) = the legacy `MemGraph` engine (exact incremental backlink
+/// re-prune, `list_dists`/`list_masks`); 1 = the new flat engine (flat slabs, ids
+/// only, pgvector-style append/shrink backlinks).  Temporary: it exists so both
+/// engines can be A/B'd in one binary while the new one is brought up, and it
+/// disappears with the legacy engine (see
+/// `.design/hnswsq_parallel_build_todos.md`).
+pub static HNSWSQ_BUILD_ENGINE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
+
 /// `hnswsq.build_workers`: worker threads used for parallel backlink pruning
 /// during an in-memory build (0 = auto).  Purely in-process parallelism over
 /// the in-memory graph; the transactional insert path is unaffected.
@@ -203,6 +213,28 @@ pub unsafe fn init() {
             )
         },
         &HNSWSQ_BACKLINK_MODE,
+        0,
+        1,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("hnswsq.build_engine".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "In-memory build engine (0 = legacy MemGraph, 1 = flat engine)".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Development switch for A/B testing the two in-memory build engines; \
+                 the two can differ slightly in graph quality because their backlink \
+                 policies differ."
+                    .as_pg_cstr(),
+            )
+        },
+        &HNSWSQ_BUILD_ENGINE,
         0,
         1,
         pgrx::GucContext::Userset,

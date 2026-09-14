@@ -149,13 +149,13 @@ pub fn search_layer_flat(
 /// the legacy build's `DistBuf`): candidates are decoded into one flat `f32`
 /// buffer, so the occlusion checks index slices instead of hashing a map.  The
 /// allocation is reused across calls.
-struct FlatPairBuf {
+pub(crate) struct FlatPairBuf {
     dim: usize,
     data: Vec<f32>,
 }
 
 impl FlatPairBuf {
-    fn new(dim: usize) -> Self {
+    pub(crate) fn new(dim: usize) -> Self {
         Self {
             dim,
             data: Vec::new(),

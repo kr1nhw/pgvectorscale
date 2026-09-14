@@ -28,6 +28,8 @@ use crate::access_method::hnswsq::graph::{
     distance_encoded, greedy_descent, random_level, search_layer, ExpandResult, GraphAccess,
     HeapItem, ProbeResult, SearchHit, VisitData,
 };
+use crate::access_method::hnswsq::flat_engine::{apply_flat, plan_flat, FlatPairBuf};
+use crate::access_method::hnswsq::flat_graph::FlatGraph;
 use crate::access_method::hnswsq::insert::{codec_for, insert_vector, InsertCtx};
 use crate::access_method::hnswsq::meta_page::HnswMetaPage;
 use crate::access_method::hnswsq::node::{
@@ -178,6 +180,106 @@ impl GraphAccess for MemGraph {
     }
 }
 
+/// Everything the flat engine needs that is not the codec/parameters: the graph,
+/// its beam-search scratch, and the decode-once pair buffer.
+struct FlatEngineState {
+    graph: FlatGraph,
+    scratch: SearchScratch,
+    buf: FlatPairBuf,
+}
+
+impl FlatEngineState {
+    fn new(stride: usize, cap: usize, dim: usize) -> Self {
+        Self {
+            graph: FlatGraph::new(stride, cap),
+            scratch: SearchScratch::new(),
+            buf: FlatPairBuf::new(dim),
+        }
+    }
+}
+
+/// One row through the flat engine: encode, register the node, plan (beam search
+/// + selection per layer), then apply (publish the node's lists, backlink, entry
+/// promotion).  Mirrors `mem_insert`'s structure so the engines are comparable
+/// step for step.
+fn flat_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
+    if state.stats.enabled {
+        state.stats.nodes += 1;
+    }
+    let level = random_level(state.ml, state.max_level, &mut state.rng);
+    let mut encoded = Vec::with_capacity(state.codec.vector_bytes());
+    let clamped = state.codec.encode_into(vector, &mut encoded);
+    let subject = state.codec.decode(&encoded);
+
+    let (m, m0, efc, dist_type, dist_fn) = (
+        state.m,
+        state.m0,
+        state.ef_construction,
+        state.distance_type,
+        state.dist_fn,
+    );
+    let codec = &state.codec;
+    let FlatEngineState {
+        graph,
+        scratch,
+        buf,
+    } = state.flat.as_mut().expect("flat engine state");
+    let id = graph.len() as u32;
+
+    graph.push_node(level, heap_tid, clamped, &encoded);
+    let plan = plan_flat(
+        codec, dist_type, dist_fn, graph, scratch, buf, id, level, &subject, m, m0, efc,
+    );
+    apply_flat(codec, dist_fn, graph, buf, id, level, plan, m, m0);
+}
+
+/// Materialise the flat graph as a legacy `MemGraph` so the existing writeout and
+/// spill paths run unchanged.
+///
+/// TEMPORARY BRIDGE (measurement aid for M2): the writeout only reads ids, tids,
+/// levels, vectors, clamps and the entry point, all of which exist in both
+/// layouts, but `flush_mem_graph` is written against `MemGraph`.  The arena step
+/// brings a writeout that reads the flat/arena layout directly; until then this
+/// costs one transient copy at writeout time (never in a hot loop) and lets the
+/// two engines be A/B'd end to end.  `list_dists`/`list_masks` get dummies:
+/// nothing reads them after the build's own lists are written, and the flat engine
+/// never produced them.
+fn flat_to_mem(flat: &FlatGraph) -> MemGraph {
+    let mut g = MemGraph::new();
+    for id in 0..flat.len() as u32 {
+        g.push_node(
+            flat.level(id),
+            flat.tid(id),
+            flat.clamped(id),
+            flat.vector(id).to_vec(),
+        );
+    }
+    for id in 0..flat.len() as u32 {
+        for layer in 0..=(flat.level(id) as usize) {
+            let ids: Vec<u32> = flat.neighbors(id, layer).to_vec();
+            let dists = vec![0.0f32; ids.len()];
+            let mut mask = [0u64; LIST_MASK_WORDS];
+            for i in 0..ids.len().min(LIST_MASK_WORDS * 64) {
+                mask[i / 64] |= 1u64 << (i % 64);
+            }
+            g.set_list(id, layer, ids, dists, mask);
+        }
+    }
+    if let Some(entry) = flat.entry() {
+        g.entry = Some(entry);
+        g.entry_level = flat.entry_level();
+    }
+    g
+}
+
+/// Make `state.graph` hold the build that has to be written out, converting from
+/// the flat engine when that is the active one.
+fn writeout_graph(state: &mut BuildState) {
+    if let Some(flat) = state.flat.take() {
+        state.graph = flat_to_mem(&flat.graph);
+    }
+}
+
 /// Pass-2 build state.
 struct BuildState {
     codec: Codec,
@@ -200,6 +302,11 @@ struct BuildState {
     stats: BuildStats,
     /// Reusable search state (epoch marks + heaps) for the memory beam search.
     search_scratch: SearchScratch,
+    /// New flat engine state (`hnswsq.build_engine = 1`), `None` for the legacy
+    /// engine.  Owns its own scratch and pair buffer so the two engines never
+    /// share mutable state, and is taken (converted into the legacy graph) when
+    /// the build has to be written out — see `writeout_graph`.
+    flat: Option<FlatEngineState>,
     /// Test-only reference path: re-run the *full* neighbor-selection
     /// heuristic for every backlink instead of the incremental
     /// [`backlink_prune_mem`].  Used by
@@ -1097,6 +1204,9 @@ pub unsafe extern "C-unwind" fn ambuild(
         meta = HnswMetaPage::fetch(&index_rel);
     }
     let codec = codec_for(&index_rel, &meta);
+    // Captured before `codec` is moved into the state: the flat engine needs the
+    // encoded-vector stride to size its slab arena.
+    let flat_stride = codec.vector_bytes();
 
     // Concurrent builds cannot use the bulk writeout (live inserters would
     // race the page plan); pgvector likewise forces its disk path for CIC.
@@ -1122,6 +1232,11 @@ pub unsafe extern "C-unwind" fn ambuild(
         pair_buf: DistBuf::new(num_dimensions),
         stats: BuildStats::new(),
         search_scratch: SearchScratch::new(),
+        flat: if unsafe { crate::access_method::hnswsq::options::HNSWSQ_BUILD_ENGINE.get() } == 1 {
+            Some(FlatEngineState::new(flat_stride, m0, num_dimensions))
+        } else {
+            None
+        },
         reference_backlinks: false,
         backlink_mode: if unsafe {
             crate::access_method::hnswsq::options::HNSWSQ_BACKLINK_MODE.get()
@@ -1148,6 +1263,7 @@ pub unsafe extern "C-unwind" fn ambuild(
     }
 
     // ---- Flush the residual in-memory graph (single sequential writeout). ----
+    writeout_graph(&mut state);
     let mem_tuples = state.graph.len() as u64;
     if mem_tuples > 0 {
         let t_flush = state.stats.enabled.then(std::time::Instant::now);
@@ -1263,7 +1379,11 @@ unsafe extern "C-unwind" fn build_callback(
     }
 
     state.mem_used += node_cost;
-    mem_insert(state, heap_tid, &vec);
+    if state.flat.is_some() {
+        flat_insert(state, heap_tid, &vec);
+    } else {
+        mem_insert(state, heap_tid, &vec);
+    }
 }
 
 /// Detoast + copy one vector datum.
@@ -1480,6 +1600,7 @@ fn mem_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
 
 /// Flush the in-memory graph to disk and switch the build to disk mode.
 unsafe fn spill_to_disk(index: &PgRelation, state: &mut BuildState) {
+    writeout_graph(state);
     if !state.graph.levels.is_empty() {
         let (entry_ptr, entry_level, insert_page) =
             flush_mem_graph(index, &state.graph, &state.codec, state.m, state.m0);
@@ -1863,6 +1984,7 @@ mod mem_tests {
                 mem_used: 0,
                 graph: MemGraph::new(),
                 pair_buf: DistBuf::new(dim),
+                flat: None,
                 stats: BuildStats::default(),
                 search_scratch: SearchScratch::new(),
                 reference_backlinks: reference,
@@ -1935,6 +2057,7 @@ mod mem_tests {
                 mem_used: 0,
                 graph: MemGraph::new(),
                 pair_buf: DistBuf::new(dim),
+                flat: None,
                 stats: BuildStats::default(),
                 search_scratch: SearchScratch::new(),
                 reference_backlinks: reference,
@@ -2017,6 +2140,7 @@ mod mem_tests {
             mem_used: 0,
             graph: MemGraph::new(),
             pair_buf: DistBuf::new(dim),
+            flat: None,
             stats: BuildStats {
                 enabled: true,
                 ..Default::default()
@@ -2091,6 +2215,7 @@ mod mem_tests {
             mem_used: 0,
             graph: MemGraph::new(),
             pair_buf: DistBuf::new(dim),
+            flat: None,
             stats: BuildStats::default(),
             search_scratch: SearchScratch::new(),
             reference_backlinks: false,
@@ -2198,6 +2323,7 @@ mod mem_tests {
                 mem_used: 0,
                 graph: MemGraph::new(),
                 pair_buf: DistBuf::new(dim),
+                flat: None,
                 stats: BuildStats::default(),
                 search_scratch: SearchScratch::new(),
                 reference_backlinks: reference,
@@ -2296,6 +2422,7 @@ mod mem_tests {
             mem_used: 0,
             graph: MemGraph::new(),
             pair_buf: DistBuf::new(dim),
+            flat: None,
             stats: BuildStats::default(),
             search_scratch: SearchScratch::new(),
             reference_backlinks: false,
