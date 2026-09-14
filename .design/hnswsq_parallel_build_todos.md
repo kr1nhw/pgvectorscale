@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5h: params carry the backlink policy | done | a worker cannot silently build on another policy |
 | M3 step 5g: params carry the dimension; meta-page ordering found | done | worker codec is derivable; leader must write meta before launching |
 | M3 step 5f: level from a raw `ItemPointerData` | done | block hi/lo decoding pinned, incl. blocks > 65535 |
 | M3 step 5e: one insert body, two level sources | done | `flat_insert_at_level` + `level_seed`; gate bit-identical |
@@ -1300,6 +1301,45 @@ Still open for the worker body, and now precisely scoped: the `BuildState` liter
 fields, so growing one from `BuildParams` means reading the remaining ones (`m0`, `stats`,
 `reference_backlinks`, `backlink_mode`, ...) -- mechanical, but it is the next round's first
 move rather than something to guess at.
+
+### 3j.20 The worker's `BuildState`: the full recipe, and the three traps in it
+
+`BuildState` has 21 fields; here is what each becomes for a worker, so the next round is
+assembly rather than investigation:
+
+| field | worker value |
+|---|---|
+| `codec` | `Codec::new(precision, params.num_dimensions)` -- both now in `BuildParams` |
+| `dist_fn` / `distance_type` | from `params.dist_type` |
+| `m`, `m0`, `ef_construction` | from `params` (never re-derived from reloptions) |
+| `ml`, `max_level` | from `params` -- *not* the meta page, which avoids the ordering trap below |
+| `budget_bytes` | the **arena's** byte capacity, not 0 |
+| `mem_used` | 0 |
+| `graph` | `MemGraph::new()` -- unused on the flat path, required by the struct |
+| `pair_buf` | `DistBuf::new(num_dimensions)` |
+| `stats` | `BuildStats::new()` (per worker; merging is M4) |
+| `search_scratch` | `SearchScratch::new()` |
+| `flat` | `Some(FlatEngineState { graph: <the arena's graph>, scratch, buf: FlatPairBuf::new(dim) })` |
+| `reference_backlinks` | `false` |
+| `backlink_mode` | from `params.backlink_mode` |
+| `disk_mode` | `false` -- a worker must never take the disk path |
+| `nrows`, `rng` | 0, seeded from `params.seed` (unused) |
+| `level_seed` | `params.seed` |
+
+Three traps found while deriving that, each now either fixed or recorded:
+
+1. **`backlink_mode` was not in `BuildParams`.**  A worker would therefore have run whatever
+   the default is regardless of the leader's choice -- and on a different policy it builds a
+   *different graph*, which the fingerprint gate would report as an unexplained mismatch
+   rather than as "the worker disagreed about the policy".  It is carried now.
+2. **`budget_bytes` must not be 0.**  The single-builder path uses 0 to mean "go straight to
+   disk", and a worker taking that branch would abandon the arena.  A worker has no byte
+   budget of its own -- the arena's capacity is the limit, and `claim_slot` returning `None`
+   is the real exhaustion signal -- so it gets the arena's size.
+3. **`FlatEngineState` owns its graph, and a worker must not.**  Its `graph` field has to be
+   the arena's shared graph (`FlatGraph::in_arena`), which means constructing the struct
+   literally in `build.rs` (where it lives) rather than calling `FlatEngineState::new`, which
+   would allocate a private graph and quietly build into it.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

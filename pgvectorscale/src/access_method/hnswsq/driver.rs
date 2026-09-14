@@ -195,6 +195,10 @@ pub struct BuildParams {
     pub dist_type: u8,
     pub precision: u8,
     pub backfill: u8,
+    /// Backlink admission policy.  Not cosmetic: a worker on a different policy builds a
+    /// different graph, and the fingerprint gate would report an unexplained mismatch rather
+    /// than "the worker disagreed about the policy".
+    pub backlink_mode: u8,
     /// The LWLock tranche the arena's node locks were initialized with.
     pub tranche: i32,
 }
@@ -534,6 +538,7 @@ mod tests {
                 dist_type: 0,
                 precision: 0,
                 backfill: 0,
+                backlink_mode: 0,
                 tranche: 0,
             };
             params.publish((*pcxt).toc);
