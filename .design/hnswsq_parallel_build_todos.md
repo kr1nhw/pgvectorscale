@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 4i: deterministic level table | done | `levels.rs`; levels drawn up front so worker scheduling cannot change the graph |
 | M3 step 4h: two threads build one shared graph | done | `SharedGraph`; entry-cursor bug found; the whole engine runs concurrently |
 | M3 step 4g: engine runs behind `Locking` | done | `apply_flat` takes `Locking::{SoleWriter, Locks}`; same heuristic either way |
 | M3 step 4f: shared-write + node-lock path | done | `set_list_concurrent`/`set_list_locked`; contention test (no torn lists) |
@@ -994,6 +995,35 @@ Four things this cost, all worth keeping:
 * worker panics lose their message inside a scoped thread (the hook writes to the
   backend's stderr), so each worker catches its own and hands the payload back.  That
   is what turned "a scoped thread panicked" into the two real diagnoses above.
+
+### 3j.9 Deterministic levels for a parallel build (`levels.rs`)
+
+In a single-builder build, "the i-th node" and "the i-th random draw" coincide, so
+drawing a level at insert time is deterministic given the seed.  That stops being true
+with several workers claiming ids concurrently: which worker draws next depends on
+scheduling, so the level stream -- and therefore the graph, and the fingerprint -- would
+change from run to run, and the fingerprint gate could not be used for a parallel build
+at all.
+
+`LevelTable` therefore draws every level up front, in the leader, from the pinned
+`build_seed`: the levels become a function of the row count alone.  It also exposes
+`slabs()` (`sum(level + 1)`, what the arena's slab budget has to cover for those nodes)
+and `extend()`, which *replays* rather than redraws, because a worker may already be
+using the levels already handed out.
+
+The tests pin the properties the driver will rely on: same seed gives the same table and
+a different seed does not; levels stay within `max_level` and keep the geometric shape
+(most nodes level 0, some above); `level(id)` past the table reads 0 rather than
+panicking, which is what a search over a partially claimed arena needs; and
+`extend(n)` equals `draw(n)` for the same seed, so extending cannot invalidate levels
+already in flight.
+
+Note the gap this leaves, deliberately: nothing consumes the table yet.  The
+single-builder path keeps drawing at insert time (bit-identical for the same seed, and
+verified by every fingerprint gate so far), and the driver switches the workers to the
+table.  When it does, the check is that a table-driven build reproduces the
+single-builder fingerprint -- which is only possible *because* the levels are drawn up
+front.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

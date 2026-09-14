@@ -24,6 +24,7 @@ pub mod flat_engine;
 pub mod flat_graph;
 pub mod graph;
 pub mod insert;
+pub mod levels;
 pub mod meta_page;
 pub mod node;
 pub mod options;
