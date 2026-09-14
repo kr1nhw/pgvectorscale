@@ -595,6 +595,37 @@ Three corrections follow, and they matter more than the code change:
 Also worth recording: `max_len == 32 == m0` in both engines, and `self_links == 0`,
 `duplicates == 0` in both, so the structural invariants that *must* hold do hold.
 
+## 3h. BIGANN 1M operating point: three configurations measured (host 121 back up)
+
+Same table (`items_1m`, dim 128), host, pinned seed and release build throughout:
+
+| config | build | plan (search) | apply (backlinks) | `no_incoming` | recall@10 ef 10/20/40/80/160 | p50 ef 160 |
+|---|---|---|---|---|---|---|
+| legacy (exact re-prune, unconditional backfill) | 352 s | 228.3 s | 88.5 s | (n/a on BIGANN) | 78.5 / 87.3 / 94.3 / 97.7 / 99.4 | 2.864 ms |
+| flat, `build_backfill = 0` | **178 s** | 142.2 s | **23.3 s** | 16 | 74.2 / 83.0 / 91.3 / 96.6 / 99.1 | **2.541 ms** |
+| flat, `build_backfill = 1` | 308 s | 163.9 s | 130.8 s | **3** | 76.9 / 87.2 / 93.7 / 97.2 / 99.4 | 2.824 ms |
+
+Three conclusions, all measurable rather than argued:
+
+1. **flat + backfill = 1 dominates the shipped engine**: 1.14x faster (308 vs 352 s) with
+   recall within 0.6 points at every ef and better connectivity (3 vs unknown; 384 was
+   the legacy figure at 100k), i.e. the earlier "legacy is the quality reference" framing
+   no longer holds at the operating point;
+2. **flat + backfill = 0 is the throughput option**: 1.98x faster than legacy (178 s) but
+   3-4 recall points lower at ef 10-40 (74.2 vs 78.5 at ef 10), recovering to within 0.3
+   points by ef 160 -- and it has the *best* query latency (p50 2.541 ms vs 2.864);
+3. **the backfill trade is dataset-dependent in both directions**, now on three datasets:
+   it helps BIGANN dim-128 (+2.7/+4.2/+2.4 at ef 10/20/40 over `bf=0`), helped the hard
+   100k dim-128 set (+9.5 at ef 40), and *hurt* the easy 1M dim-16 set (-20 at ef 40).
+   The default therefore stays 0 (the decided policy, and the throughput choice), with the
+   knob documented as the recall lever for datasets like BIGANN.
+
+For the parallel plan this is the useful part: both flat configurations are well inside
+the 4-worker build target (178 s and 308 s single-core against a <=160 s target at 4
+workers), so the acceptance number is about worker scaling, not about squeezing the
+sequential engine -- and if recall at low ef is the binding constraint, `bf=1` buys it
+back inside the same budget.
+
 ## 4. Test plan and gates
 
 * **Unit:** arena allocation/exhaustion/margin, `Rel<T>` round-trip, lock-order
