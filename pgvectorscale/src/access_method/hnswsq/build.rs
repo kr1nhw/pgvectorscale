@@ -296,10 +296,26 @@ impl FlatEngineState {
 /// capacity is exhausted — the driver then writes out what exists and continues
 /// on the disk path, exactly like the `maintenance_work_mem` transition.
 fn flat_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) -> bool {
+    let level = random_level(state.ml, state.max_level, &mut state.rng);
+    flat_insert_at_level(state, heap_tid, vector, level)
+}
+
+/// The same insert with the level already decided.
+///
+/// A parallel worker cannot draw its level from an RNG stream -- which worker draws next
+/// depends on scheduling, so the level stream, the graph and its fingerprint would all
+/// change run to run.  It derives the level from the row instead
+/// (`levels::level_for_tid`) and comes in through here, which keeps *one* insert body: the
+/// two paths differ only in where the level came from.
+fn flat_insert_at_level(
+    state: &mut BuildState,
+    heap_tid: ItemPointer,
+    vector: &[f32],
+    level: u8,
+) -> bool {
     if state.stats.enabled {
         state.stats.nodes += 1;
     }
-    let level = random_level(state.ml, state.max_level, &mut state.rng);
     let mut encoded = Vec::with_capacity(state.codec.vector_bytes());
     let clamped = state.codec.encode_into(vector, &mut encoded);
     let subject = state.codec.decode(&encoded);
@@ -473,6 +489,11 @@ struct BuildState {
     disk_mode: bool,
     nrows: u64,
     rng: SmallRng,
+    /// The seed levels are derived from when a level is keyed on the row rather than on
+    /// draw order (`levels::level_for_tid`) -- which is what a parallel build needs, since
+    /// which worker draws next is not deterministic.  The single-builder path still draws
+    /// from `rng`, so this value does not affect it.
+    level_seed: u64,
 }
 
 /// Per-phase build timing counters, enabled by `hnswsq.build_stats`.
@@ -1432,6 +1453,7 @@ pub unsafe extern "C-unwind" fn ambuild(
         disk_mode: is_concurrent || budget_bytes == 0,
         nrows: 0,
         rng: crate::access_method::hnswsq::build_rng(),
+        level_seed: crate::access_method::hnswsq::build_seed_value(),
     };
 
     // ---- Pass 2 (or the only pass): stream rows into the builder. ----
@@ -2191,6 +2213,7 @@ mod mem_tests {
                 disk_mode: false,
                 nrows: 0,
                 rng: SmallRng::seed_from_u64(seed),
+                level_seed: seed,
             };
             for (i, v) in rows.iter().enumerate() {
                 mem_insert(&mut state, ItemPointer::new(i as u32 + 1, 1), v);
@@ -2264,6 +2287,7 @@ mod mem_tests {
                 disk_mode: false,
                 nrows: 0,
                 rng: SmallRng::seed_from_u64(7),
+                level_seed: 7,
             }
         };
         let mut reference = mk(true);
@@ -2350,6 +2374,7 @@ mod mem_tests {
             disk_mode: false,
             nrows: 0,
             rng: SmallRng::seed_from_u64(7),
+            level_seed: 7,
         };
         for (i, v) in rows.iter().enumerate() {
             mem_insert(&mut state, ItemPointer::new(i as u32 + 1, 1), v);
@@ -2422,6 +2447,7 @@ mod mem_tests {
             disk_mode: false,
             nrows: 0,
             rng: SmallRng::seed_from_u64(3),
+            level_seed: 3,
         };
         for (i, v) in rows.iter().enumerate() {
             mem_insert(&mut state, ItemPointer::new(i as u32 + 1, 1), v);
@@ -2530,6 +2556,7 @@ mod mem_tests {
                 disk_mode: false,
                 nrows: 0,
                 rng: SmallRng::seed_from_u64(7),
+                level_seed: 7,
             };
             for (i, v) in rows.iter().enumerate() {
                 mem_insert(&mut state, ItemPointer::new(i as u32 + 1, 1), v);
@@ -2629,6 +2656,7 @@ mod mem_tests {
             disk_mode: false,
             nrows: 0,
             rng: SmallRng::seed_from_u64(build_seed),
+            level_seed: build_seed,
         };
         for (i, v) in rows.iter().enumerate() {
             mem_insert(&mut state, ItemPointer::new(i as u32 + 1, 1), v);

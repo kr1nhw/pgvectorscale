@@ -67,6 +67,21 @@ pub(crate) fn lock_suite_for_test() {
 
 /// Build RNG: entropy in production, or the pinned `hnswsq.build_seed` value
 /// (tests set it so builds — and recall assertions — are deterministic).
+/// The seed a build's *levels* are derived from, for the paths that key a level on the row
+/// rather than on draw order (`levels::level_for_tid`).
+///
+/// Entropy mode (`build_seed < 0`) has no seed to report, so one is drawn: the level RNG is
+/// still the entropy-seeded one, and the parallel path always pins a seed through
+/// `BuildParams`, so this is only a value for the field to hold.
+pub(crate) fn build_seed_value() -> u64 {
+    let seed = options::HNSWSQ_BUILD_SEED.get();
+    if seed < 0 {
+        rand::random::<u64>()
+    } else {
+        seed as u64
+    }
+}
+
 pub(crate) fn build_rng() -> rand::rngs::SmallRng {
     use rand::SeedableRng;
     let seed = options::HNSWSQ_BUILD_SEED.get();

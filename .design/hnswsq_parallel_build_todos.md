@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5e: one insert body, two level sources | done | `flat_insert_at_level` + `level_seed`; gate bit-identical |
 | M3 step 5d: post-join entry promotion | done | `promote_best_entry`; workers never promote |
 | M3 step 5c: shared scan descriptor in the toc | done | `table_parallelscan_*`; one descriptor every worker reads |
 | M3 step 5b: build parameters + verified toc magic | done | `BuildParams` round-trips; `PARALLEL_MAGIC` is measured, not remembered |
@@ -1228,6 +1229,29 @@ new test pins, along with the fact that peer handles see the promoted entry (it 
 `ArenaState`, not in one handle's fields).
 
 Verified: 3 driver, 31 flat and 19 arena tests green.
+
+### 3j.17 One insert body, two level sources
+
+The insert loop does not need a new insert path: `flat_insert` already *is* the loop body
+(claim, encode, plan, apply with backlinks, publish).  What the parallel path needs is a
+different **level source**, so `flat_insert` now draws its level from the RNG and delegates
+to `flat_insert_at_level`, which is the whole body.  A worker derives the level from the row
+(`levels::level_for_tid`, seeded from `BuildParams.seed`) and enters through the same
+function -- so the two paths cannot drift apart in anything except where the level came from,
+which matters because the fingerprint gate has to be able to compare them.
+
+`BuildState.level_seed` carries that seed, filled from `build_seed_value()` (the same GUC
+`build_rng` reads; entropy mode draws one, which the parallel path never relies on since the
+driver pins a seed).
+
+Verified: 31 flat tests green and the **gate is bit-identical** -- flat
+`30db11c54b7edd31` / `no_incoming=519`, legacy `e4aaa8fa5d6b7f25` / `384`.  That is the
+correct expectation and the point of the change: the single-builder path still draws from the
+RNG, so this is a behaviour-preserving refactor, and `flat_insert_at_level` is now the seam.
+
+One small lesson from the patch: adding the field by regex hit `SampleState`'s literal as well,
+and the compiler named the line.  Worth a glance at *every* insertion site when a struct
+literal is built by pattern.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
