@@ -116,6 +116,33 @@ impl MemGraph {
         self.list_masks.push(vec![[0u64; LIST_MASK_WORDS]; layers]);
     }
 
+    /// Stable fingerprint of the graph's neighbour lists: nodes in id order,
+    /// layers in ascending order, ids in list order, with a terminator between
+    /// layers.  Iteration order only, so it never depends on hashing.  Used to
+    /// (a) prove a build is deterministic for a given seed independently of
+    /// timing and (b) compare the two engines' graphs directly.
+    fn fingerprint(&self) -> u64 {
+        fn mix(h: &mut u64, x: u64) {
+            for b in x.to_le_bytes() {
+                *h ^= b as u64;
+                *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+        mix(&mut h, self.len() as u64);
+        for node in 0..self.len() {
+            mix(&mut h, self.levels[node] as u64);
+            for layer in 0..(self.levels[node] as usize + 1) {
+                for &id in &self.neighbors[node][layer] {
+                    mix(&mut h, id as u64);
+                }
+                mix(&mut h, u32::MAX as u64); // layer terminator
+            }
+        }
+        mix(&mut h, self.entry.unwrap_or(u32::MAX) as u64);
+        h
+    }
+
     /// Store a computed neighbor list (ids + their distances + heuristic mask).
     fn set_list(&mut self, id: u32, layer: usize, ids: Vec<u32>, dists: Vec<f32>, mask: [u64; 2]) {
         let n = id as usize;
@@ -227,10 +254,22 @@ fn flat_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
     let id = graph.len() as u32;
 
     graph.push_node(level, heap_tid, clamped, &encoded);
+    // Coarse attribution, matching the legacy engine's two halves: the planning
+    // half is beam search + neighbour selection, the apply half is publishing the
+    // node's own lists, the backlinks and entry promotion -- i.e. where the
+    // append/shrink policy's cost lands.
+    let t_plan = state.stats.enabled.then(std::time::Instant::now);
     let plan = plan_flat(
         codec, dist_type, dist_fn, graph, scratch, buf, id, level, &subject, m, m0, efc,
     );
+    if let Some(t) = t_plan {
+        state.stats.search_ns += t.elapsed().as_nanos() as u64;
+    }
+    let t_apply = state.stats.enabled.then(std::time::Instant::now);
     apply_flat(codec, dist_fn, graph, buf, id, level, plan, m, m0);
+    if let Some(t) = t_apply {
+        state.stats.backlink_select_ns += t.elapsed().as_nanos() as u64;
+    }
 }
 
 /// Materialise the flat graph as a legacy `MemGraph` so the existing writeout and
@@ -353,6 +392,11 @@ pub struct BuildStats {
     /// work the search path does per insert).
     pub search_calls: u64,
     pub search_hits: u64,
+    /// Stable fingerprint of the graph that was written out (see
+    /// `MemGraph::fingerprint`).  Two builds with the same seed and engine must
+    /// produce the same value; the two engines are expected to differ, because
+    /// their backlink policies differ.
+    pub graph_fingerprint: u64,
     /// Backlink admission outcome in ranked mode: edges skipped by the cutoff
     /// test, edges admitted, and how many of those needed an overflow prune.
     pub cutoff_skips: u64,
@@ -388,7 +432,7 @@ impl BuildStats {
              search={:.1}ms select={:.1}ms backlink_pairs={:.1}ms backlink_select={:.1}ms \
              flush={:.1}ms accounted_total={:.1}ms fast_entries={} full_entries={} extras_seen={} \
              pair(select)={} pair(backlink)={} pair(extras)={} search_calls={} search_hits={} \
-             cutoff_skips={} ranked_admits={} ranked_prunes={}",
+             cutoff_skips={} ranked_admits={} ranked_prunes={} fingerprint={:016x}",
             self.nodes,
             self.backlink_lists,
             self.pair_dists,
@@ -410,6 +454,7 @@ impl BuildStats {
             self.cutoff_skips,
             self.ranked_admits,
             self.ranked_prunes,
+            self.graph_fingerprint,
         )
     }
 }
@@ -1264,6 +1309,9 @@ pub unsafe extern "C-unwind" fn ambuild(
 
     // ---- Flush the residual in-memory graph (single sequential writeout). ----
     writeout_graph(&mut state);
+    if state.stats.enabled {
+        state.stats.graph_fingerprint = state.graph.fingerprint();
+    }
     let mem_tuples = state.graph.len() as u64;
     if mem_tuples > 0 {
         let t_flush = state.stats.enabled.then(std::time::Instant::now);
