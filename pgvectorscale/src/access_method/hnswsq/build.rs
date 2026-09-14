@@ -229,7 +229,10 @@ impl FlatEngineState {
 /// + selection per layer), then apply (publish the node's lists, backlink, entry
 /// promotion).  Mirrors `mem_insert`'s structure so the engines are comparable
 /// step for step.
-fn flat_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
+/// Returns `false` when the flat graph refused the node because its fixed
+/// capacity is exhausted — the driver then writes out what exists and continues
+/// on the disk path, exactly like the `maintenance_work_mem` transition.
+fn flat_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) -> bool {
     if state.stats.enabled {
         state.stats.nodes += 1;
     }
@@ -253,7 +256,9 @@ fn flat_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
     } = state.flat.as_mut().expect("flat engine state");
     let id = graph.len() as u32;
 
-    graph.push_node(level, heap_tid, clamped, &encoded);
+    if !graph.try_push_node(level, heap_tid, clamped, &encoded) {
+        return false;
+    }
     // Coarse attribution, matching the legacy engine's two halves: the planning
     // half is beam search + neighbour selection, the apply half is publishing the
     // node's own lists, the backlinks and entry promotion -- i.e. where the
@@ -270,6 +275,7 @@ fn flat_insert(state: &mut BuildState, heap_tid: ItemPointer, vector: &[f32]) {
     if let Some(t) = t_apply {
         state.stats.backlink_select_ns += t.elapsed().as_nanos() as u64;
     }
+    true
 }
 
 /// Materialise the flat graph as a legacy `MemGraph` so the existing writeout and
@@ -1428,7 +1434,20 @@ unsafe extern "C-unwind" fn build_callback(
 
     state.mem_used += node_cost;
     if state.flat.is_some() {
-        flat_insert(state, heap_tid, &vec);
+        if !flat_insert(state, heap_tid, &vec) {
+            // The flat graph's fixed capacity is exhausted: write out what it
+            // holds and put this row (and every later one) through the disk
+            // insert path.
+            let index_rel = unsafe { PgRelation::from_pg(index) };
+            unsafe {
+                spill_to_disk(&index_rel, state);
+            }
+            let meta = HnswMetaPage::fetch(&index_rel);
+            let ctx = InsertCtx::from_meta(&index_rel, &meta, &state.codec);
+            unsafe {
+                insert_vector(&ctx, heap_tid, &vec, &mut state.rng);
+            }
+        }
     } else {
         mem_insert(state, heap_tid, &vec);
     }

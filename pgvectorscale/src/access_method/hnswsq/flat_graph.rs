@@ -51,6 +51,12 @@ pub struct FlatGraph {
     lens: Vec<u16>,
     entry: Option<u32>,
     entry_level: usize,
+    /// Fixed budgets for the arena: `usize::MAX` means "grow like a `Vec`" (the
+    /// prototype and the legacy single-backend path), a finite value means the
+    /// backing storage is preallocated and cannot grow — the shape the shared
+    /// chunk needs, where running out is a normal outcome rather than an error.
+    max_nodes: usize,
+    max_slabs: usize,
 }
 
 impl FlatGraph {
@@ -70,7 +76,61 @@ impl FlatGraph {
             lens: Vec::new(),
             entry: None,
             entry_level: 0,
+            max_nodes: usize::MAX,
+            max_slabs: usize::MAX,
         }
+    }
+
+    /// Fixed-capacity graph: at most `max_nodes` nodes and `max_slabs`
+    /// `(node, layer)` lists, with the backing storage preallocated so it can be
+    /// laid out in one shared chunk.  `push_node` then has to go through
+    /// [`FlatGraph::try_push_node`], and `false` from it means "full".
+    pub fn with_limits(stride: usize, cap: usize, max_nodes: usize, max_slabs: usize) -> Self {
+        let mut g = Self::new(stride, cap);
+        g.max_nodes = max_nodes;
+        g.max_slabs = max_slabs;
+        g.levels.reserve_exact(max_nodes);
+        g.tids.reserve_exact(max_nodes);
+        g.clamped.reserve_exact(max_nodes);
+        g.vectors.reserve_exact(max_nodes * stride);
+        g.slab_off.reserve_exact(max_nodes);
+        g.lens.reserve_exact(max_slabs);
+        g.ids.reserve_exact(max_slabs * cap);
+        g
+    }
+
+    /// Register a node if the budgets allow it; `false` leaves the graph
+    /// untouched.  The arena cannot grow, so the driver answers `false` by
+    /// writing out what exists and continuing on the disk path (see
+    /// `spill_to_disk`), exactly like the `maintenance_work_mem` transition.
+    pub fn try_push_node(
+        &mut self,
+        level: u8,
+        tid: ItemPointer,
+        clamped: bool,
+        encoded: &[u8],
+    ) -> bool {
+        let layers = level as usize + 1;
+        if self.len() >= self.max_nodes || self.lens.len() + layers > self.max_slabs {
+            return false;
+        }
+        self.push_node(level, tid, clamped, encoded);
+        true
+    }
+
+    /// Whether either budget is exhausted (always `false` in grow mode).
+    pub fn is_full(&self) -> bool {
+        self.len() >= self.max_nodes || self.lens.len() >= self.max_slabs
+    }
+
+    /// `(slabs used, slab budget)`.
+    pub fn slab_usage(&self) -> (usize, usize) {
+        (self.lens.len(), self.max_slabs)
+    }
+
+    /// `(nodes used, node budget)`.
+    pub fn node_usage(&self) -> (usize, usize) {
+        (self.len(), self.max_nodes)
     }
 
     #[inline]
@@ -291,6 +351,39 @@ mod tests {
         let mut g = FlatGraph::new(4, 2);
         g.push_node(0, tid(1), false, &[0u8; 4]);
         g.set_list(0, 1, &[1]);
+    }
+
+    #[test]
+    fn fixed_capacity_reports_full_instead_of_growing() {
+        // Node budget of one: the second node is refused, the graph is unchanged.
+        let mut g = FlatGraph::with_limits(4, 2, 1, 8);
+        assert!(g.try_push_node(0, tid(1), false, &[0u8; 4]));
+        assert_eq!(g.node_usage(), (1, 1));
+        assert!(g.is_full(), "node budget of one is used up");
+        assert!(!g.try_push_node(0, tid(2), false, &[0u8; 4]));
+        assert_eq!(g.len(), 1);
+
+        // Slab budget of one: a level-1 node needs two slabs, so it is refused
+        // before anything is written; a level-0 node then fits exactly.
+        let mut g = FlatGraph::with_limits(4, 2, 8, 1);
+        assert!(
+            !g.try_push_node(1, tid(1), false, &[0u8; 4]),
+            "a level-1 node needs two slabs"
+        );
+        assert_eq!(g.len(), 0, "a refused push leaves the graph untouched");
+        assert!(g.try_push_node(0, tid(1), false, &[0u8; 4]));
+        assert_eq!(g.slab_usage(), (1, 1));
+        assert!(g.is_full(), "the slab budget is exhausted");
+    }
+
+    #[test]
+    fn grow_mode_never_reports_full() {
+        let mut g = FlatGraph::new(4, 2);
+        for i in 0..10 {
+            assert!(g.try_push_node(0, tid(i + 1), false, &[0u8; 4]));
+        }
+        assert!(!g.is_full());
+        assert_eq!(g.node_usage().1, usize::MAX);
     }
 
     #[test]
