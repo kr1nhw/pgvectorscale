@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| **M3 step 6a: full hnswsq suite green after the parallel work** | **done** | 122 passed, 0 failed (356 s) |
 | M3 step 5z: recall at 7 workers | **done** | identical to 4 workers (0.6/0.8/0.8/1.0/1.0) with `no_incoming` doubled |
 | M3 step 5y: 8-worker point, sweep complete | **done** | 7 of 8 launched, 23.4 s vs 35.3 s at 4; `no_incoming` 3375 (0.34%) |
 | M4 step: per-worker reporting | **done** | 4 workers: rows sum to 100000, nodes==rows, load spread 0.6% |
@@ -2069,6 +2070,44 @@ quality.  It was worth having as a gate when the parallel path was new and unmea
 evidence now says the recall gate should stand on its own and `no_incoming` should be reported rather
 than thresholded -- unless the BIGANN data disagrees, which is still unmeasured because the EC2 hosts
 remain unreachable.
+
+### 3j.42 The full suite, and a broken test build it exposed
+
+The parallel work touched `ambuild`, the insert path, the arena and a new driver, and the last time
+the 95-test integration suite ran was round 26 -- long before any of it.  Running it now:
+
+```
+test result: ok. 122 passed; 0 failed; 1 ignored; 0 measured; 163 filtered out; finished in 356.42s
+```
+
+122 (the module has grown) covering the disk insert path, `CREATE INDEX CONCURRENTLY`, vacuum and the
+transactional interface -- the area the original constraint said not to disturb.  That is the
+evidence for it, rather than the absence of complaints.
+
+**But it did not compile at first**, and that is the finding worth keeping:
+
+```
+error[E0433]: failed to resolve: could not find `arena` in `super`
+  --> driver.rs:719:  super::super::super::arena::register_tranche(...)
+```
+
+Two tests in the driver's test module had **three** `super`s, which resolves past the `hnswsq` module.
+The library builds fine either way, so `cargo pgrx install` -- and every `CREATE INDEX` measurement
+this project has taken -- was unaffected; only the test build was broken.
+
+**The process failure is mine.**  For several rounds I verified with filtered runs
+(`cargo pgrx test pg18 driver`, `flat_`, `hnswsq::arena`) once those were green, and a filtered run
+still has to *compile the whole test crate* -- so it would have failed loudly.  What actually happened
+is that I stopped running any test target at all for a stretch and verified through `psql` and
+`CREATE INDEX` instead, which cannot see a broken test build.  The lesson is not "run more tests" but
+"a green measurement of the product is not evidence that the tests compile" -- and a full-suite run
+belongs in the loop at least once per structural change, not only when a round is set aside for
+verification.
+
+**Also noted:** the one ignored test is `workers_build_a_shared_graph_in_parallel`, quarantined in
+3j.22 because a `#[pg_test]`'s fixtures are uncommitted and a worker's snapshot cannot see them.  The
+`CREATE INDEX` path has since made that test redundant in substance (the same thing is verified
+against real committed tables every round), so it should be deleted rather than left ignored.
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a

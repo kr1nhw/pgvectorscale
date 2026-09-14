@@ -716,7 +716,7 @@ mod tests {
         let cap = m * 2;
         let sizing = plan(stride as usize, cap as usize, 1 << 20);
         assert!(sizing.nodes > 300, "room for the table: {:?}", sizing);
-        let tranche = super::super::super::arena::register_tranche(c"hnswsq_parallel_build_test");
+        let tranche = super::super::arena::register_tranche(c"hnswsq_parallel_build_test");
 
         // SAFETY: leader-side; relations are opened here and closed with the context.
         unsafe {
@@ -825,7 +825,7 @@ mod tests {
                 size,
             )
         };
-        let tranche = super::super::super::arena::register_tranche(c"hnswsq_worker_state_test");
+        let tranche = super::super::arena::register_tranche(c"hnswsq_worker_state_test");
         let (stride, cap, nodes, slabs) = (12u32, 4u32, 16u32, 32u32);
         let arena = unsafe {
             super::super::arena::SharedArena::allocate(
