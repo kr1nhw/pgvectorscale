@@ -512,7 +512,8 @@ pub(crate) unsafe fn parallel_worker_scan(
 ) {
     let lockmode = unsafe { pg_sys::AccessShareLock as pg_sys::LOCKMODE };
     let heap = unsafe { pg_sys::table_open(pg_sys::Oid::from(params.heap_oid), lockmode) };
-    let index = unsafe { pg_sys::table_open(pg_sys::Oid::from(params.index_oid), lockmode) };
+    // An index relation is opened with `index_open`, not `table_open`.
+    let index = unsafe { pg_sys::index_open(pg_sys::Oid::from(params.index_oid), lockmode) };
     // Each worker builds its own IndexInfo: it is palloc'd, so it cannot be shared, and it is
     // a deterministic function of the relation anyway.  It is what tells the scan which
     // column to hand the callback -- i.e. where the vector comes from.
@@ -549,7 +550,7 @@ pub(crate) unsafe fn parallel_worker_scan(
 
     unsafe {
         pg_sys::table_endscan(scan);
-        pg_sys::table_close(index, lockmode);
+        pg_sys::index_close(index, lockmode);
         pg_sys::table_close(heap, lockmode);
     }
 }

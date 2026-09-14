@@ -16,6 +16,7 @@
 
 use pgrx::pg_sys;
 use pgrx::pg_guard;
+use pgrx::pg_extern;
 
 use super::arena::{ArenaLayout, SharedArena, TOC_KEY_CHUNK, TOC_KEY_HEADER};
 use super::flat_graph::{check_lists, plan_capacity, ArenaSizing, FlatGraph};
@@ -355,6 +356,140 @@ pub unsafe extern "C-unwind" fn hnswsq_parallel_build_main(
     arena.state().worker_finished();
 }
 
+/// Run a parallel build against a real (committed) table and report what happened.
+///
+/// This exists because the parallel path cannot be tested from a `#[pg_test]`: the harness
+/// rolls its transaction back, so any table the test creates is invisible to a worker's
+/// snapshot.  A SQL-callable entry point can be pointed at an existing table instead -- and it
+/// is also the vehicle for the worker sweep, which needs to vary `workers` and time the result.
+///
+/// The parameters come from the index itself (its reloptions and meta page) through the same
+/// helpers the single-builder leader uses, so a measurement here is comparable with a
+/// single-builder build of the same index definition.
+///
+/// `dims` is the table's `vector(N)`, and `dist_type` the `DistanceType` discriminant of the
+/// index's opclass -- it has to be the declared metric, or the build measures something other
+/// than what the index was created for.
+///
+/// Returns a one-line summary: rows published, structural checks, elapsed milliseconds, and how
+/// many workers actually ran.
+#[pg_extern]
+pub fn hnswsq_parallel_build_debug(
+    heap_oid: pg_sys::Oid,
+    index_oid: pg_sys::Oid,
+    workers: i32,
+    dims: i32,
+    dist_type: i32,
+    budget_mb: i32,
+) -> String {
+    use pgrx::PgRelation;
+
+    let index_rel = unsafe { PgRelation::open(index_oid) };
+    let options = crate::access_method::hnswsq::options::TSVHnswOptions::from_relation(&index_rel);
+    let precision = options.get_precision();
+    let m = options.get_m() as u32;
+    let m0 = m * 2;
+    let ef_construction = options.get_ef_construction() as u32;
+    let meta = crate::access_method::hnswsq::meta_page::HnswMetaPage::fetch(&index_rel);
+    let dims = dims as u32;
+    let stride = dims * precision.elem_bytes() as u32;
+    // The arena is sized from the caller's budget, exactly as the single-builder path sizes
+    // its in-memory graph: too small and the workers simply stop claiming, which shows up as
+    // fewer published rows rather than as an error.
+    let sizing = plan(
+        stride as usize,
+        m0 as usize,
+        (budget_mb.max(1) as usize) << 20,
+    );
+    let tranche = unsafe { super::arena::register_tranche(c"hnswsq_parallel_debug") };
+
+    let start = std::time::Instant::now();
+    let mut published = 0usize;
+    let mut launched = 0i32;
+    let summary = unsafe {
+        let heap = pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let pcxt = pg_sys::CreateParallelContext(
+            LIBRARY.as_ptr().cast_mut().cast::<std::os::raw::c_char>(),
+            c"hnswsq_parallel_build_main".as_ptr().cast_mut(),
+            workers,
+        );
+        estimate_arena(pcxt, stride as usize, m0 as usize, sizing);
+        estimate_chunk(pcxt, scan_bytes(heap, snapshot));
+        let (arena, layout) =
+            leader_setup(pcxt, stride as usize, m0 as usize, sizing, tranche);
+        leader_scan_setup(pcxt, heap, snapshot);
+
+        // The leader seeds an entry: workers never promote one, and without an entry every
+        // node is born with no edges at all.
+        {
+            let mut seed = super::flat_graph::FlatGraph::in_arena(&arena);
+            if let Some(id) = seed.claim_slot(0) {
+                // A zero vector: the seed exists to give searches somewhere to start, and a
+                // zero encoding is valid for every layout.
+                let encoded = vec![0u8; stride as usize];
+                seed.publish(id, crate::util::ItemPointer::new(1, 1), false, &encoded);
+                let _ = seed.promote_entry(id);
+            }
+        }
+
+        BuildParams {
+            rows: 0,
+            seed: 20240912,
+            heap_oid: u32::from(heap_oid),
+            index_oid: u32::from(index_oid),
+            stride,
+            num_dimensions: dims,
+            cap: m0,
+            m,
+            m0,
+            ef_construction,
+            ml: meta.get_ml(),
+            max_level: meta.get_max_level(),
+            dist_type: dist_type as u8,
+            precision: precision as u8,
+            backfill: 0,
+            backlink_mode: 0,
+            tranche,
+        }
+        .publish((*pcxt).toc);
+
+        pg_sys::LaunchParallelWorkers(pcxt);
+        pg_sys::WaitForParallelWorkersToFinish(pcxt);
+        launched = (*pcxt).nworkers_launched;
+        published = arena.state().watermark();
+        let failed = arena.state().failed();
+        let entered = arena.state().workers_entered();
+        let checks = super::flat_graph::check_lists(
+            &super::flat_graph::FlatGraph::in_arena(&arena),
+            m0 as usize,
+        );
+        pg_sys::DestroyParallelContext(pcxt);
+        pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        pg_sys::table_close(heap, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        format!(
+            "workers launched={} entered={} failed={} published={} slabs={}/{} checks(published={} no_incoming={} reachable={} self_links={} duplicates={} max_len={}/{}) elapsed_ms={}",
+            launched,
+            entered,
+            failed,
+            published,
+            arena.state().claimed().1,
+            layout.total_bytes,
+            checks.published,
+            checks.nodes_without_incoming,
+            checks.reachable_from_entry,
+            checks.self_links,
+            checks.duplicate_links,
+            checks.max_list_len,
+            m0,
+            start.elapsed().as_millis()
+        )
+    };
+    let _ = (published, launched);
+    summary
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
@@ -461,7 +596,7 @@ mod tests {
         let cap = m * 2;
         let sizing = plan(stride as usize, cap as usize, 1 << 20);
         assert!(sizing.nodes > 300, "room for the table: {:?}", sizing);
-        let tranche = super::super::arena::register_tranche(c"hnswsq_parallel_build_test");
+        let tranche = super::super::super::arena::register_tranche(c"hnswsq_parallel_build_test");
 
         // SAFETY: leader-side; relations are opened here and closed with the context.
         unsafe {
@@ -570,7 +705,7 @@ mod tests {
                 size,
             )
         };
-        let tranche = super::super::arena::register_tranche(c"hnswsq_worker_state_test");
+        let tranche = super::super::super::arena::register_tranche(c"hnswsq_worker_state_test");
         let (stride, cap, nodes, slabs) = (12u32, 4u32, 16u32, 32u32);
         let arena = unsafe {
             super::super::arena::SharedArena::allocate(

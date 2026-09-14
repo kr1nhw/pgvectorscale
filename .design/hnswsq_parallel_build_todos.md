@@ -23,6 +23,7 @@ pinned seed, release, same host, unless stated):
 | connectivity control (legacy vs flat) | done | legacy 384 / flat 519 at 100k: a 0.14 pp policy delta, not a defect ⇒ the gate is *relative* (§3e) |
 | backfill knob (`hnswsq.build_backfill`) | done | measured: +51% build, +9.5 recall pts at ef 40 here; decision deferred to 1M BIGANN |
 | M3 storage swap (region by region) | **complete** | all 8 regions in the chunk (`vectors`/`ids`/`lens`/`levels`/`tids`/`clamped`/`published`/`slab_off`); gate bit-identical after each step (§3j) |
+| M3 step 5k: SQL-callable parallel build + first run | **crashes in the worker** | leader-only run is clean (3 ms); worker path segfaults |
 | M3 step 5j: the callback, the scan loop, the wired entry | done (compile-verified) | two workers launched, entered, and reached the relation open |
 | M3 step 5i: `worker_build_state` over the shared arena | done | from `BuildParams` + the arena; `BuildState` is crate-visible |
 | M3 step 5h: params carry the backlink policy | done | a worker cannot silently build on another policy |
@@ -1397,6 +1398,46 @@ the shape required).
 The silver lining is that the error locates the boundary precisely: entry -> parameters ->
 `worker_build_state` -> `parallel_worker_scan` -> relation open all execute in a worker process.
 What remains untested is the scan itself and the inserts it feeds.
+
+### 3j.23 The first parallel build ran, and crashed in the worker
+
+`#[pg_test]` cannot drive this (its transaction is rolled back, so workers cannot see the
+fixtures), so the driver is now reachable from SQL: **`hnswsq_parallel_build_debug(heap_oid,
+index_oid, workers, dims, dist_type, budget_mb)`** runs a whole parallel build against a real
+committed table and returns one line -- rows published, the structural checks, elapsed
+milliseconds, and how many workers actually ran.  It is also the vehicle the worker sweep needs,
+since it takes `workers` as an argument.  (Installing it against an already-created extension
+needs the SQL wrapper made by hand: `CREATE FUNCTION ... AS '$libdir/vectorscale-0.9.0',
+'hnswsq_parallel_build_debug_wrapper'`.)
+
+Results against the scratch cluster's `t100k` + `t100k_idx` (100k rows, dim 16, `m=16`,
+`ef_construction=64`, plain layout):
+
+| workers | result |
+|---|---|
+| 0 | `published=1 slabs=1/67108855 checks(published=1 no_incoming=1 reachable=1 self_links=0 duplicates=0 max_len=0/32) elapsed_ms=3` |
+| 1 | **server crash**, the backend terminated abnormally |
+| 2 | same (the cluster was left in recovery) |
+
+That is a useful split rather than a dead end: **the leader side is sound** -- sizing, allocation,
+entry seeding, toc publishing and the destruction path all complete in 3 ms with a
+well-formed single-node graph -- so the fault is in the worker path, which is the only part that
+had never executed.  Candidates, in the order they should be eliminated:
+
+1. `table_beginscan_parallel(heap, pscan)` in a worker: if the snapshot has to be *serialized*
+   into the descriptor rather than referenced, a worker dereferencing the leader's snapshot is a
+   segfault, and this is the first call that would do it.
+2. `rd_tableam->index_build_range_scan` with the arguments as passed (`anyvisible=false`,
+   `progress=false`, `0..InvalidBlockNumber`).
+3. The callback's `extract_vector(*values)`: it assumes the index's key attribute is the vector,
+   which is true for `t100k_idx` -- but if the scan hands over `values` for a different
+   attribute ordering, this is where it would die.
+
+The cheap bisect is to make the worker stop after (1), then after `BuildIndexInfo`, and so on,
+because the harness already reports how far it got.
+
+**Fix on the way here:** the index relation has to be opened with `index_open`, not `table_open`
+(the leader-side attempt failed loudly with "This operation is not supported for indexes").
 
 Still to come: the driver.  Today `FlatGraph` still owns `nodes_used`/`slabs_used` in
 its own fields, so the next step is pointing it at `ArenaState` (and giving `Chunk` a
