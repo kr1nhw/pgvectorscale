@@ -6,7 +6,7 @@
 # Measures, with both engines built from source in **release** on the same box
 # and the same 1M BIGANN table (`items_1m`, dim 128, m=16, efc=64):
 #
-#   1. hnswsq 1M build (timed, with hnswsq.build_stats) + query sweep + perf profile
+#   1. hnswsq 1M build (timed) + query sweep + perf profile
 #   2. pgvector 1M build at its default parallelism + query sweep + perf profile
 #   3. pgvector 1M build single-backend            (per-core build comparison)
 #   4. pgvector 1M build with 32 workers           (parallel scaling)
@@ -46,12 +46,14 @@ log "indexes before: $(run -Atc "SELECT coalesce(string_agg(indexname, ','), '-'
 run -c "DROP INDEX IF EXISTS items_1m_hnsw; DROP INDEX IF EXISTS items_1m_hnswsq;" >>"$LOG" 2>&1
 log "--- hnswsq 1M build (single backend)"
 T0=$(date +%s)
-run -c "SET maintenance_work_mem = '8GB'; SET hnswsq.build_stats = on;
+run -c "SET maintenance_work_mem = '8GB';
         CREATE INDEX items_1m_hnswsq ON $TABLE USING hnswsq (embedding vector_l2_ops)
         WITH (m = 16, ef_construction = 64, storage_layout = plain);" >>"$LOG" 2>&1
 T1=$(date +%s)
 log "hnswsq build seconds=$((T1 - T0)) size_bytes=$(run -Atc "SELECT pg_relation_size('items_1m_hnswsq')")"
-grep -o "hnswsq build stats:.*" "$LOG" | tail -1 | tee -a "$LOG"
+# The build phase split ("hnswsq build stats: ...") only logs when the
+# extension is built with the pg_test feature; optional, never fatal.
+grep -o "hnswsq build stats:.*" "$LOG" | tail -1 | tee -a "$LOG" || true
 
 log "--- hnswsq query sweep"
 python3 "$BENCH/gap_sweep.py" hnswsq 10,40,160,640 "$TABLE" 100 /tmp/gap_sweep_hnswsq.csv 2>&1 | tee -a "$LOG"

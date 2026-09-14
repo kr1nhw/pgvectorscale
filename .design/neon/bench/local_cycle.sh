@@ -20,8 +20,8 @@
 #   * stale CREATE INDEX backends are killed by PID before the run, so a
 #     leftover build cannot silently double the wall clock;
 #   * the index is dropped and recreated, so page reuse cannot skew the build;
-#   * the build runs with hnswsq.build_stats = on, so the phase split lands next
-#     to the timing;
+#   * the build is timed wall-clock; the optional "hnswsq build stats: ..."
+#     phase split only logs when the extension is built with pg_test;
 #   * build + recall sweep both go into one CSV row, plus a per-run log.
 #
 # Environment: PGPORT (54331), PGUSER ($USER), PSQL_BIN, PGBIN, OUT_CSV
@@ -45,14 +45,6 @@ MAINT_MEM="${MAINT_MEM:-2GB}"
 # in graph quality and recall@10 moves by several points between runs.  Every
 # A/B in the perf notes pins the seed so build time *and* recall are comparable.
 BUILD_SEED="${HNSWSQ_BUILD_SEED_BENCH:-20240912}"
-# Backlink admission policy: 1 = exact incremental re-prune (default),
-# 0 = Lance-style ranked/cutoff list.
-BACKLINK_MODE="${HNSWSQ_BACKLINK_MODE_BENCH:-1}"
-# Build engine: 0 = legacy MemGraph (default), 1 = new flat engine.
-ENGINE="${HNSWSQ_ENGINE_BENCH:-0}"
-# Own-list backfill knob (flat engine only): 0 = heuristic only (decided policy),
-# 1 = closest-pruned backfill.  See .design/hnswsq_parallel_build_todos.md §3d/§0.
-BACKFILL="${HNSWSQ_BACKFILL_BENCH:-0}"
 EF_SWEEP="${HNSWSQ_EF_SWEEP:-10 40 160 640}"
 OUT_CSV="${OUT_CSV:-/tmp/hnswsq_local_cycle.csv}"
 LOG="${LOG:-/tmp/hnswsq_local_$(date +%Y%m%d_%H%M%S)_${LABEL}.log}"
@@ -102,13 +94,9 @@ fi
 
 # ---- 2. drop + rebuild, timed, with stats on -------------------------------
 q -c "DROP INDEX IF EXISTS $IDX;" >>"$LOG" 2>&1
-log "building $IDX (layout=$LAYOUT m=$M efc=$EFC maintenance_work_mem=$MAINT_MEM build_seed=$BUILD_SEED backlink_mode=$BACKLINK_MODE engine=$ENGINE backfill=$BACKFILL)"
+log "building $IDX (layout=$LAYOUT m=$M efc=$EFC maintenance_work_mem=$MAINT_MEM build_seed=$BUILD_SEED)"
 BUILD_START=$(date +%s.%N)
-q -c "SET maintenance_work_mem = '$MAINT_MEM'; SET hnswsq.build_stats = on;
-      SET hnswsq.build_seed = $BUILD_SEED;
-      SET hnswsq.build_backlink_mode = $BACKLINK_MODE;
-      SET hnswsq.build_engine = $ENGINE;
-      SET hnswsq.build_backfill = $BACKFILL;
+q -c "SET maintenance_work_mem = '$MAINT_MEM'; SET hnswsq.build_seed = $BUILD_SEED;
       CREATE INDEX $IDX ON $TABLE USING hnswsq (embedding vector_l2_ops)
       WITH (storage_layout = '$LAYOUT', m = $M, ef_construction = $EFC);" >>"$LOG" 2>&1
 BUILD_RC=$?
@@ -118,7 +106,7 @@ if [ $BUILD_RC -ne 0 ]; then
     log "FATAL: CREATE INDEX failed (rc=$BUILD_RC), see $LOG"
     exit 1
 fi
-STATS=$(grep -o "hnswsq build stats:.*" "$LOG" | tail -1)
+STATS=$(grep -o "hnswsq build stats:.*" "$LOG" | tail -1 || true)
 log "build ${BUILD_S}s ${STATS}"
 
 SIZE=$(qn -c "SELECT pg_relation_size('$IDX');")

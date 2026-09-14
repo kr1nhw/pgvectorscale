@@ -14,8 +14,8 @@
 #   * stale CREATE INDEX backends are killed BY PID before the run — a leftover
 #     build silently doubles the wall clock and invalidates the numbers;
 #   * the index is dropped and recreated, so page reuse cannot skew the build;
-#   * the build runs with hnswsq.build_stats = on, so the phase split is
-#     recorded next to the timing;
+#   * the build is timed wall-clock; the optional "hnswsq build stats: ..."
+#     phase split only logs when the extension is built with pg_test;
 #   * build + sweep + insert all land in one CSV row per run, plus a full log.
 #
 # Environment: PGPORT (54329), PGUSER (pgtest), PGDATABASE, PSQL_BIN,
@@ -95,7 +95,7 @@ run_psql -c "DROP INDEX IF EXISTS $IDX;" >/dev/null 2>&1
 if [ "$ENGINE" = hnswsq ]; then
   DDL="CREATE INDEX $IDX ON $TABLE USING hnswsq (embedding vector_l2_ops)
        WITH (m=16, ef_construction=64, storage_layout=$LAYOUT);"
-  PRE="SET maintenance_work_mem = '8GB'; SET hnswsq.build_stats = on;"
+  PRE="SET maintenance_work_mem = '8GB';"
 else
   DDL="CREATE INDEX $IDX ON $TABLE USING hnsw (embedding vector_l2_ops)
        WITH (m=16, ef_construction=64);"
@@ -111,7 +111,7 @@ if [ $RC -ne 0 ]; then
   log "FATAL: build failed (see $LOG)"
   exit 1
 fi
-STATS=$(grep -o "hnswsq build stats.*" "$LOG" | tail -1 | tr -d '\r')
+STATS=$(grep -o "hnswsq build stats.*" "$LOG" | tail -1 | tr -d '\r' || true)
 SIZE=$(run_psql -At -c "SELECT pg_relation_size('$IDX');" 2>/dev/null)
 log "build_s=$BUILD_S size_bytes=$SIZE"
 [ -n "$STATS" ] && log "$STATS"

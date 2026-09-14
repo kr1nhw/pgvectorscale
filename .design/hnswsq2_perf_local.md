@@ -76,7 +76,27 @@ The buffer-pin machinery is the cost for both engines; per-pin costs match
    pointers) removes the per-candidate malloc.
 3. **Heap preallocation** — `BinaryHeap::with_capacity(ef + 1)` for C/W.
 
-## 5. Caveats
+## 5. Storage layouts (IO efficiency)
+
+Same `ab2` dataset, `m=16, efc=64`, `build_seed=20240912`, release build:
+
+| layout | index size | bytes/vec | vs plain | query ms (ef=160, warm) |
+|---|---|---|---|---|
+| plain | 81,928,192 | 819 | 1.00x | 1.35 |
+| ieeefp16 | 51,306,496 | 513 | 0.63x | 1.65 |
+| ieeefp8 | 37,584,896 | 376 | 0.46x | 2.52 |
+| f8 (sq8) | 37,593,088 | 376 | 0.46x | 1.47 |
+
+Quantized queries cost 1.1-1.9x plain at ef=160 (the scan materializes the
+encoded vectors of admitted candidates for the lower-bound emission — the
+sanctioned divergence; the pgvector reference never materializes in a scan —
+plus the `xs_recheckorderby` path pulls a few extra tuples). The graph also
+differs per layout (neighbor selection runs on quantized distances), which
+moves the expansion count a bit. The vector-byte ratios approach 0.5x/0.25x
+as dim grows; at dim 128 the fixed per-node overhead (tuple headers + ~192 B
+of layer-0 neighbor TIDs) dominates the remainder.
+
+## 6. Caveats
 
 - **Degenerate tables**: a table of 100k *identical* vectors (the original
   `ab` scratch table) is a pure tie-class pathology; both engines' behavior
