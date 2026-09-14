@@ -57,6 +57,13 @@ pub struct FlatGraph {
     /// chunk needs, where running out is a normal outcome rather than an error.
     max_nodes: usize,
     max_slabs: usize,
+    /// Per node: has its level/tid/clamped/vector been written yet?
+    published_flags: Vec<bool>,
+    /// Every id below this watermark is published.  In the parallel build a worker
+    /// claims an id from the shared counter and only then writes the node, so a
+    /// peer that observes the id must skip it: readers bound-check against this
+    /// watermark, never against the claim counter (`len`).
+    watermark: usize,
 }
 
 impl FlatGraph {
@@ -78,6 +85,8 @@ impl FlatGraph {
             entry_level: 0,
             max_nodes: usize::MAX,
             max_slabs: usize::MAX,
+            published_flags: Vec::new(),
+            watermark: 0,
         }
     }
 
@@ -96,7 +105,55 @@ impl FlatGraph {
         g.slab_off.reserve_exact(max_nodes);
         g.lens.reserve_exact(max_slabs);
         g.ids.reserve_exact(max_slabs * cap);
+        g.published_flags.reserve_exact(max_nodes);
         g
+    }
+
+    /// Number of nodes every part of whose data is written.  Equal to `len()` in
+    /// the single-threaded prototype and the legacy path; smaller while workers
+    /// hold claimed-but-unwritten slots in the arena.
+    #[inline]
+    pub fn watermark(&self) -> usize {
+        self.watermark
+    }
+
+    /// Reserve a node id and its slabs without writing any data.  The slot stays
+    /// invisible to readers (see [`FlatGraph::watermark`]) until
+    /// [`FlatGraph::publish`] completes it.  `None` when the budgets are
+    /// exhausted — the driver then spills, exactly as for `try_push_node`.
+    pub fn claim_slot(&mut self, level: u8) -> Option<u32> {
+        let layers = level as usize + 1;
+        if self.len() >= self.max_nodes || self.lens.len() + layers > self.max_slabs {
+            return None;
+        }
+        let id = self.len() as u32;
+        self.levels.push(level);
+        self.tids.push(ItemPointer::new_invalid());
+        self.clamped.push(false);
+        self.vectors.resize(self.vectors.len() + self.stride, 0);
+        self.slab_off.push(self.lens.len() as u32);
+        self.lens.resize(self.lens.len() + layers, 0);
+        self.ids.resize(self.lens.len() * self.cap, 0);
+        self.published_flags.push(false);
+        Some(id)
+    }
+
+    /// Write a claimed node's data and publish it.  Publication is what makes the
+    /// node observable; the watermark advances only through the contiguous
+    /// published prefix, so several workers completing out of order is fine.
+    pub fn publish(&mut self, id: u32, tid: ItemPointer, clamped: bool, encoded: &[u8]) {
+        assert_eq!(encoded.len(), self.stride, "encoded vector must match stride");
+        let i = id as usize;
+        assert!(i < self.len(), "publish of an unclaimed id");
+        assert!(!self.published_flags[i], "node {} published twice", id);
+        self.tids[i] = tid;
+        self.clamped[i] = clamped;
+        let start = i * self.stride;
+        self.vectors[start..start + self.stride].copy_from_slice(encoded);
+        self.published_flags[i] = true;
+        while self.watermark < self.published_flags.len() && self.published_flags[self.watermark] {
+            self.watermark += 1;
+        }
     }
 
     /// Register a node if the budgets allow it; `false` leaves the graph
@@ -176,23 +233,12 @@ impl FlatGraph {
     /// order (`id == self.len()` before the call), which keeps the writeout's
     /// id → page/offset mapping and the level stream deterministic.
     pub fn push_node(&mut self, level: u8, tid: ItemPointer, clamped: bool, encoded: &[u8]) {
-        assert_eq!(
-            encoded.len(),
-            self.stride,
-            "encoded vector length must equal the codec's stride"
-        );
-        let layers = level as usize + 1;
-        let node = self.len() as u32;
-        self.levels.push(level);
-        self.tids.push(tid);
-        self.clamped.push(clamped);
-        self.vectors.extend_from_slice(encoded);
-        self.slab_off
-            .push(self.lens.len() as u32); // next slab index == this node's base
-        self.lens.resize(self.lens.len() + layers, 0);
-        self.ids.resize(self.lens.len() * self.cap, 0);
+        let id = self
+            .claim_slot(level)
+            .expect("graph capacity exhausted (use try_push_node, or claim/publish)");
+        self.publish(id, tid, clamped, encoded);
         debug_assert_eq!(self.slab_off.len(), self.levels.len());
-        debug_assert!(self.slab_base(node).is_some());
+        debug_assert!(self.slab_base(id).is_some());
     }
 
     /// Replace a node's layer-`layer` list with `ids` (ids only: the policy lives
@@ -284,6 +330,8 @@ impl FlatGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access_method::distance::{distance_l2, DistanceType};
+    use crate::access_method::hnswsq::quantize::Codec;
 
     fn tid(n: u32) -> ItemPointer {
         ItemPointer::new(n, 1)
@@ -351,6 +399,63 @@ mod tests {
         let mut g = FlatGraph::new(4, 2);
         g.push_node(0, tid(1), false, &[0u8; 4]);
         g.set_list(0, 1, &[1]);
+    }
+
+    #[test]
+    fn push_node_publishes_immediately() {
+        let mut g = FlatGraph::new(4, 2);
+        g.push_node(0, tid(1), false, &[0u8; 4]);
+        g.push_node(0, tid(2), false, &[0u8; 4]);
+        assert_eq!(g.watermark(), g.len(), "single-threaded pushes publish at once");
+    }
+
+    #[test]
+    fn watermark_advances_only_through_the_contiguous_prefix() {
+        let mut g = FlatGraph::new(4, 2);
+        for i in 0..3 {
+            assert_eq!(g.claim_slot(0), Some(i));
+        }
+        assert_eq!((g.len(), g.watermark()), (3, 0), "nothing written yet");
+        g.publish(1, tid(2), false, &[1u8; 4]);
+        assert_eq!(g.watermark(), 0, "id 0 is still unwritten");
+        g.publish(2, tid(3), false, &[2u8; 4]);
+        assert_eq!(g.watermark(), 0, "the hole at id 0 still blocks the watermark");
+        g.publish(0, tid(1), false, &[3u8; 4]);
+        assert_eq!(g.watermark(), 3, "the prefix is complete now");
+    }
+
+    #[test]
+    fn claimed_but_unpublished_nodes_are_invisible_to_the_search() {
+        use crate::access_method::hnswsq::build::SearchScratch;
+        use crate::access_method::hnswsq::flat_engine::search_layer_flat;
+        use crate::access_method::hnswsq::quantize::HnswPrecision;
+
+        let codec = Codec::new(HnswPrecision::Plain, 2);
+        let mut g = FlatGraph::new(codec.vector_bytes(), 4);
+        for (i, p) in [[0.0f32, 0.0], [1.0, 0.0]].iter().enumerate() {
+            g.push_node(0, tid(i as u32 + 1), false, &codec.encode(&p.to_vec()));
+        }
+        // A third node is claimed (so it has an id and slabs) but not written:
+        // it must not be reachable, and addressing it must not panic.
+        let claimed = g.claim_slot(0).expect("room for a third node");
+        assert_eq!(claimed, 2);
+        assert_eq!(g.watermark(), 2);
+        g.set_list(0, 0, &[1, claimed]); // even linked from a live node
+        g.set_list(1, 0, &[0]);
+
+        let mut scratch = SearchScratch::new();
+        let hits = search_layer_flat(
+            &codec,
+            DistanceType::L2,
+            &[0.0, 0.0],
+            &g,
+            &[(distance_l2(&[0.0, 0.0], &[0.0, 0.0]), 0)],
+            8,
+            0,
+            &mut scratch,
+        );
+        let ids: Vec<u32> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec![0, 1], "the claimed node is skipped, not indexed");
     }
 
     #[test]

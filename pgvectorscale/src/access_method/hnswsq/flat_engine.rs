@@ -67,7 +67,7 @@ pub fn search_layer_flat(
         // so a stale entry id (or, later, an id a parallel worker has claimed
         // from the shared counter but not yet initialised) would otherwise index
         // past the graph.  Same guard as in the neighbour loop below.
-        if i >= g.len() || i >= visited_epoch.len() || visited_epoch[i] == epoch {
+        if i >= g.watermark() || i >= visited_epoch.len() || visited_epoch[i] == epoch {
             continue;
         }
         visited_epoch[i] = epoch;
@@ -102,7 +102,7 @@ pub fn search_layer_flat(
         for k in 0..list.len() {
             let nb = list[k];
             let ni = nb as usize;
-            if ni >= g.len() || ni >= visited_epoch.len() || visited_epoch[ni] == epoch {
+            if ni >= g.watermark() || ni >= visited_epoch.len() || visited_epoch[ni] == epoch {
                 continue;
             }
             visited_epoch[ni] = epoch;
@@ -260,7 +260,7 @@ pub fn greedy_descent_flat(
             let list = g.neighbors(cur.1, layer);
             for k in 0..list.len() {
                 let nb = list[k];
-                if nb as usize >= g.len() {
+                if nb as usize >= g.watermark() {
                     continue;
                 }
                 let d = distance_encoded(codec, dist_type, query, g.vector(nb));
