@@ -1,7 +1,11 @@
 # hnswsq — the HNSW index access method with reduced-precision storage
 
 `hnswsq` is this repository's HNSW (hierarchical navigable small world) index
-over pgvector `vector` columns, with **four node-vector storage layouts**:
+over pgvector `vector` columns, with **four node-vector storage layouts**. The
+graph core is a **function-for-function Rust port of pgvector's HNSW**
+(build, insert, scan, vacuum, relptr addressing, the same on-disk tuple
+format); this repository's contribution is the reduced-precision layouts and
+the scan contract that goes with them:
 
 | `storage_layout` | format | bytes/dim | size vs plain | training |
 |---|---|---|---|---|
@@ -73,6 +77,9 @@ GUC:
 | GUC | range | default | meaning |
 |---|---|---|---|
 | `hnswsq.ef_search` | 1 – 1000 | 40 | layer-0 search width — the main recall/speed dial; must be ≥ the query LIMIT for full recall |
+| `hnswsq.iterative_scan` | `off` / `relaxed` / `strict` | `relaxed` | pgvector-style iterative scan: a full search up front (`off`), or emit from the first batch and resume from discarded candidates on demand (`relaxed`; `strict` additionally forces non-decreasing distances) |
+| `hnswsq.max_scan_tuples` | −1 – INT_MAX | −1 (unbounded) | cap on tuples one scan may visit before falling back to the discarded heap; −1 disables |
+| `hnswsq.build_seed` | −1 – INT_MAX | −1 (entropy) | seeds the level RNG; pin it to make two builds' graphs (and timings) comparable |
 
 ```sql
 SET enable_seqscan = off;   -- force the index on small tables
@@ -151,16 +158,16 @@ out of the box (standard callbacks, no reloption tuning required).
 ## 7. Limitations
 
 - Single `vector` column only (no label filtering, no multi-column indexes).
-- No `amgetbitmap`; no iterative scan for WHERE-filtered queries (a pgvector
-  0.8 feature) — `ef_search` bounds the candidate set.
-- Builds are single-backend by default.  `hnswsq.build_workers = N` runs the
-  in-memory build on N worker processes instead (see §11); the older batched
-  plan/apply parallel design remains rejected — it cost connectivity and recall
-  because a searching node must see in-flight inserts.
+- No `amgetbitmap`.  The iterative scan (§3) bounds memory like pgvector's,
+  with the same tuple/memory caps.
+- Builds parallelize through PostgreSQL's **standard** parallel index-build
+  machinery (`plan_create_index_workers`, capped by
+  `max_parallel_maintenance_workers`) — no custom GUC, see §11.
 - The parallel path has no mid-build spill, so it needs
-  `maintenance_work_mem` to hold the whole graph: too little and the build
-  either falls back to the single-builder path (when the row count is known) or
-  fails with a message saying so.  The single-builder path spills instead.
+  `maintenance_work_mem` to hold the whole graph: when the budget runs out
+  mid-build, the pages built so far are flushed to disk and the remaining
+  rows flow through the regular disk insert path (NOTICE logged, build takes
+  significantly longer — the same fallback pgvector has).
 - `ieeefp8`'s accuracy assumes in-range data (±448); out-of-range components
   clamp (cosine-normalized data is unaffected).
 - As with any approximate index, crash windows are transactional: a crash
@@ -178,10 +185,11 @@ out of the box (standard callbacks, no reloption tuning required).
 
 ## 9. Testing
 
-The full hnswsq test suite (60 tests: recall matrix across the four storage
-layouts and three distance types, incremental builds, transaction rollback,
-planner behavior, dimension limits, NULLs, REINDEX, vacuum lifecycle, and
-page-packing extremes) runs with:
+The full hnswsq test suite (54 tests: types/pages layout, recall matrix across
+the four storage layouts and three distance types, incremental builds,
+transaction rollback, planner behavior, dimension limits, NULLs, REINDEX, GUCs,
+SQ8 clamp behavior, size ratios, one-node-per-page packing, vacuum lifecycle,
+and the cross-process parallel-build scaffold) runs with:
 
 ```bash
 cd pgvectorscale && RUST_TEST_THREADS=1 cargo pgrx test pg18 hnswsq
@@ -206,120 +214,80 @@ INSERT/SELECT/DELETE/VACUUM, quantized layouts) is in
 `CREATE EXTENSION vector; CREATE EXTENSION vectorscale;` and
 `DB_HOST/DB_PORT/DB_USER/DB_NAME` pointing at it.
 
-## 10. Build performance notes
+## 10. Build performance
 
-The in-memory build path carries four optimizations, each measured against the
-revision before it (details, counters and A/B tables in
-`.design/hnswsq_perf_analysis.md`):
+The port is a faithful translation of pgvector's build (`.design/hnswsq2_port.md`
+lists the sanctioned divergences — deterministic `BinaryHeap` candidates with a
+packed-TID tie-break instead of pairing heaps, a reimplemented relptr, codec-based
+distances, a caller-owned scratch instead of reset contexts, and the SQ8
+calibration chain written before the parallel phase). The retired engine's
+bespoke in-memory machinery (`search_layer_mem`, `DistBuf`, the incremental
+backlink re-prune) is gone with it.
 
-- **Decode-free distance kernels** (`Codec::distance_encoded_direct`):
-  distances are accumulated directly over the encoded bytes (f32/f16/fp8/sq8)
-  with no per-call scratch decode copy; semantics match the SIMD kernels
-  exactly (L2 is squared-sum, IP is negative — `<#>` ordering — and cosine
-  is `1 − Σq·v` clamped at zero).
-- **Exact incremental backlink re-prune** (`backlink_prune_mem`): the existing
-  neighbor list is itself the output of the selection heuristic, so an incoming
-  backlink only *adds* occlusion relations.  Entries before the new node keep
-  their recorded status (a per-list mask marks heuristic-accepted entries vs
-  ones re-added by the closest-pruned backfill) and entries after it need one
-  new check instead of a full heuristic re-run.  The result is bit-identical to
-  re-running the full heuristic, asserted on randomized graphs and on whole
-  builds after every insert.
-- **Memory-graph beam search** (`search_layer_mem`): epoch-stamped visited /
-  expanded mark arrays instead of per-search hash sets, borrowed neighbor
-  slices instead of clones, and heaps plus marks reused across the layered
-  searches of one insert (5.1x on the search phase; asserted to return exactly
-  the same hits, in the same order, as the generic disk-path search).
-- **Decode-once distance buffer** (`DistBuf`) instead of a build-scoped
-  `HashMap<(u32,u32),f32>`: both pair-heavy loops work on a small id set per
-  call, so each vector is decoded once into a flat `f32` buffer and pairs are
-  evaluated straight through the SIMD distance kernels — no hashing and no
-  random access into a ~100MB table (12.3x on own-list selection, 4.7x on
-  backlink admission).
+Measured builds, **release builds**, `m=16`, `ef_construction=64`:
 
-Measured builds (`m=16`, `ef_construction=64`, `maintenance_work_mem=2GB`,
-release profile, single-threaded, pinned build seed, 200-cluster dim-16 data;
-dim 128 dominates the decode cost, see the 1M row):
+| dataset | box | hnswsq | pgvector | ratio |
+|---|---|---|---|---|
+| 100k × 128 i.i.d., mwm 2GB | local (Apple M4 Pro, PG 18) | **6.9 s** | 7.5 s | **0.92x** |
+| 1M BIGANN dim 128, mwm 8GB, 4 workers | 121.37.117.106 (32 vCPU, PG 17.11) | **59 s** | 102 s | **0.58x** |
+| 1M BIGANN, single backend | 121.37.117.106 | – | 446 s | – |
+| 1M BIGANN, 32 workers | 121.37.117.106 | – | 64 s | – |
 
-| rows | wall | search | backlink admission | selection | flush |
-|---|---|---|---|---|---|
-| 100k | 12.5 s | 6.07 s | 4.96 s | 0.32 s | 0.38 s |
-| 300k | 45.4 s | 25.4 s | 15.2 s | 0.97 s | 0.77 s |
-| 1M | 183 s | 110 s | 51 s | 3.3 s | 3.5 s |
+Index size on the 1M table: hnswsq **819 B/vec** vs pgvector **832 B/vec**
+(−1.6%).  Query sweep on the same table (mean ms, LIMIT 10, 100 queries):
+0.696 / 1.151 / 2.445 / 6.609 at ef 10/40/160/640 vs pgvector
+0.618 / 1.115 / 2.491 / 6.982 — **0.95–0.98x at ef ≥ 160**.  Recall@10:
+99.3% vs 99.2% at ef 160, 100.0% for both at ef 640.  Full numbers and both
+engines' `perf` profiles (both buffer-manager-bound: PinBuffer /
+`load_element_impl` / LWLockRelease dominate) in
+`.design/neon/bench/RESULTS-HNSWSQ.md`; the local-methodology A/B and the
+storage-layout size/latency table are in `.design/hnswsq2_perf_local.md`.
 
-and on 1M BIGANN (dim 128, 32-vCPU cloud box, release) the same build went from
-538 s to **352 s** once the distance path stopped decoding element-by-element
-(`search` 389.9 s -> 228.3 s).
-
-For calibration: the same 100k build took 36.3 s before the decode-once buffer
-and 439 s in a debug build.  **Always benchmark a release build**: `cargo pgrx
-test` installs a debug build of the extension over the release one, which makes
-every build roughly 25x slower (`local_cycle.sh`/`cycle.sh` now refuse to run
-against a debug `.so`).  The remaining single-builder cost is graph traversal
-(`search`) plus the entries that cannot take the O(1) backlink fast path — which
-is what the parallel build (§11) attacks.
-`.design/neon/bench/RESULTS-HNSWSQ.md` has the cross-engine comparisons
-(recall parity within ±1%, index size parity within +4%).
+**Always benchmark a release build**: `cargo pgrx test` installs a debug build
+of the extension over the release one, which makes every build roughly 25x
+slower and silently invalidated a whole analysis pass (the bench scripts now
+refuse to run against a debug `.so`).
 
 ## 11. Parallel builds
 
-`hnswsq.build_workers = N` (N > 0) builds the in-memory graph on N worker
-processes.  Workers scan disjoint block ranges of the heap into one shared
-arena; each insert searches the shared graph and takes the target node's lock to
-add a backlink, so a searching node sees in-flight inserts.  The leader seeds
-nothing, writes the graph out with the same writer the single-builder path uses,
-and promotes the entry point after the workers stop.
+Builds parallelize through PostgreSQL's standard parallel `CREATE INDEX`
+machinery — pgvector's shared-arena design, ported: workers scan disjoint
+block ranges into one `shm_toc`-allocated graph arena, each insert searches
+the shared graph under per-element LWLocks (a searching node sees in-flight
+inserts), the entry point is handed over with pgvector's entry-lock/wait-lock
+protocol, and the leader joins the scan itself before flushing the graph.
 
 ```sql
-SET maintenance_work_mem = '2GB';   -- must hold the whole graph: no mid-build spill
-SET hnswsq.build_workers = 4;
+SET maintenance_work_mem = '8GB';   -- must hold the whole graph: no mid-build spill
+-- workers come from the server's standard pool:
+SHOW max_parallel_maintenance_workers;
+
 CREATE INDEX ON items USING hnswsq (embedding vector_l2_ops)
     WITH (storage_layout = 'plain', m = 16, ef_construction = 64);
 ```
 
-Measured on 1M rows, dim 16, `m=16`, `ef_construction=64`, fresh index for every
-point, on a 12-core machine (release build):
+Measured on the 1M BIGANN box (32 vCPU, release, same server settings for both
+engines):
 
-| workers requested | launched | wall | vs 1 worker |
-|---|---|---|---|
-| 1 | 1 | 109.5 s | 1.00x |
-| 2 | 2 | 53.8 s | 2.03x |
-| 4 | 4 | 27.4-35.3 s | 3.1-4.0x |
-| 8 | 7 | 23.4 s | 4.68x |
+| engine | workers | wall |
+|---|---|---|
+| hnswsq | 4 (server default) | **59 s** |
+| pgvector | 4 (server default) | 102 s |
+| pgvector | 1 | 446 s |
+| pgvector | 32 | 64 s |
 
-Scaling flattens after about four workers: the insert path has a serial component
-(the claim cursor, the published watermark, and the node locks) and these builds
-are short enough that start-up and the writeout are a visible fraction.  Note
-that "workers requested" is not "workers launched" — PostgreSQL's worker pool has
-other consumers (`max_worker_processes`), so read the timing with the count the
-build reports.
-
-Recall is not affected by the worker count.  Against the single-builder build on
-the same data and ground truth (200 queries, recall@10):
-
-| `ef_search` | 1 worker | 4 workers | 7 workers |
-|---|---|---|---|
-| 10 | 0.400 | 0.600 | 0.600 |
-| 20 | 0.400 | 0.800 | 0.800 |
-| 40 | 1.000 | 0.800 | 0.800 |
-| 80 | 1.000 | 1.000 | 1.000 |
-| 160 | 1.000 | 1.000 | 1.000 |
-
-The graphs differ — concurrent insertion places edges differently, and neither is
-uniformly better — but recall does not degrade as workers are added.  What *does*
-grow with the worker count is the number of nodes with no incoming edge (0 at 1
-worker, 353 at 2, 1572 at 4, 3344 at 7, i.e. 0.33% at 7): that is a race-based
-effect and worth watching, but it has not shown up in recall.
+The cross-process path is exercised by the test suite (parallel-build scaffold)
+and was A/B-verified against the single-builder path during the port; recall
+does not degrade with the worker count.
 
 Constraints worth knowing:
 
 - Not used for `CREATE INDEX CONCURRENTLY`: live inserters would race the bulk
-  writeout, exactly as they do on the single-builder path, so concurrent builds
-  stay on the disk path.
+  writeout, exactly as on the single-builder path, so concurrent builds stay on
+  the disk path.
 - No mid-build spill (see §7): size `maintenance_work_mem` for the whole graph,
-  or let the build fall back.
+  or let the build fall back to the disk insert path.
 - A worker that fails, or an arena that fills, fails the build rather than
   writing a partial graph.
-- `workers = 0` (the default) is the single-builder path and is unaffected by any
-  of this; it produces a bit-identical graph to builds from before the parallel
-  work.
+- "Workers launched" is capped by `max_parallel_maintenance_workers` and the
+  standard worker pool — read the timing with the count the build reports.
