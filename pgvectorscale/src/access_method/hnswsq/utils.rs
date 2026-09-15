@@ -676,12 +676,16 @@ pub unsafe fn load_element_from_tuple(
 /// `hnswsq.sq8_distance` GUC selects one of the integer forms (see
 /// `smoke.rs`).  The query is quantized once per search; every candidate
 /// distance then uses pure integer arithmetic.
-pub fn sq8_query_state(support: &Support, q: &[f32]) -> Option<Sq8QueryState> {
-    use crate::access_method::hnswsq::options::{HNSW_SQ8_DISTANCE, Sq8DistanceMode};
+pub fn sq8_query_state(
+    support: &Support,
+    q: &[f32],
+    mode: crate::access_method::hnswsq::options::Sq8DistanceMode,
+) -> Option<Sq8QueryState> {
+    use crate::access_method::hnswsq::options::Sq8DistanceMode;
     if support.precision != HnswPrecision::Sq8 || support.dist_type != DistanceType::L2 {
         return None;
     }
-    match HNSW_SQ8_DISTANCE.get() {
+    match mode {
         Sq8DistanceMode::Scalar => None,
         Sq8DistanceMode::Pairwise => Some(support.codec.sq8_query_state(q, true)),
     }
@@ -697,9 +701,7 @@ pub unsafe fn encoded_distance(
     qstate: Option<&Sq8QueryState>,
 ) -> f32 {
     match qstate {
-        Some(Sq8QueryState::Pairwise(qhat)) => {
-            support.codec.distance_l2_sq8_pairwise(qhat, bytes) as f32
-        }
+        Some(Sq8QueryState::Pairwise(qhat)) => support.codec.distance_l2_sq8_pairwise(qhat, bytes),
         None => support.distance(q, bytes),
     }
 }
@@ -1694,6 +1696,7 @@ pub unsafe fn find_element_neighbors(
     decode: &mut Vec<f32>,
     pair_scratch: &mut Vec<f32>,
     visited: &mut Visited,
+    sq8_mode: crate::access_method::hnswsq::options::Sq8DistanceMode,
 ) {
     let mut level = (*element).level as usize;
     let skip_element = if existing { Some(element) } else { None };
@@ -1710,8 +1713,10 @@ pub unsafe fn find_element_neighbors(
     support.codec.decode_into(value, decode.as_mut_slice());
 
     // SQ8: quantize the decoded query once; every search distance below is
-    // then pure integer arithmetic (see sq8_query_state).
-    let qstate = sq8_query_state(support, decode.as_slice());
+    // then pure integer arithmetic (see sq8_query_state).  The mode comes
+    // from the caller: the parallel build passes the leader's GUC value
+    // through shared memory (workers do not see the leader's session GUCs).
+    let qstate = sq8_query_state(support, decode.as_slice(), sq8_mode);
 
     // Precompute hash
     if in_memory {

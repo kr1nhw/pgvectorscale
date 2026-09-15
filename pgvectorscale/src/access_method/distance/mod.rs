@@ -171,6 +171,30 @@ pub fn distance_l2_f16_scalar(q: &[f32], v: &[u8]) -> f32 {
     acc
 }
 
+/// Scale-weighted pairwise SQ8 distance: `SUM w_i * (qhat - code)^2` with
+/// `w = scale^2` per dimension.
+#[inline]
+pub fn distance_l2_sq8_pairwise(qhat: &[i16], code: &[u8], w: &[f32]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_sq8_pairwise_x86(qhat, code, w);
+    }
+    #[allow(unreachable_code)]
+    distance_l2_sq8_pairwise_scalar(qhat, code, w)
+}
+
+#[inline]
+pub fn distance_l2_sq8_pairwise_scalar(qhat: &[i16], code: &[u8], w: &[f32]) -> f32 {
+    debug_assert_eq!(qhat.len(), code.len());
+    debug_assert_eq!(qhat.len(), w.len());
+    let mut acc = 0.0f32;
+    for i in 0..qhat.len() {
+        let d = (qhat[i] - code[i] as i16) as f32;
+        acc += w[i] * d * d;
+    }
+    acc
+}
+
 #[inline]
 pub fn distance_inner_product_f16_scalar(q: &[f32], v: &[u8]) -> f32 {
     debug_assert_eq!(q.len() * 2, v.len());

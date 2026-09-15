@@ -91,7 +91,15 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
     };
 
     // SQ8: quantize the query once for the whole scan (see sq8_query_state).
-    state.qstate = q.map(|q| crate::access_method::hnswsq::utils::sq8_query_state(&state.support, q)).flatten();
+    state.qstate = q
+        .map(|q| {
+            crate::access_method::hnswsq::utils::sq8_query_state(
+                &state.support,
+                q,
+                crate::access_method::hnswsq::options::HNSW_SQ8_DISTANCE.get(),
+            )
+        })
+        .flatten();
 
     let mut ep = vec![entry_candidate(
         std::ptr::null_mut(),

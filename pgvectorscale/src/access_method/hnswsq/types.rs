@@ -266,6 +266,9 @@ pub struct Shared {
     pub workersdonecv: pg_sys::ConditionVariable,
     pub mutex: pg_sys::slock_t,
     pub nparticipantsdone: i32,
+    /// The SQ8 distance mode the leader's session selected (workers are
+    /// separate processes and do not see the leader's GUC settings).
+    pub sq8_distance_mode: i32,
     pub reltuples: f64,
     pub graph: Graph,
 }

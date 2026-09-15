@@ -200,6 +200,46 @@ unsafe fn f16x8_to_f32(h: core::arch::x86_64::__m128i) -> core::arch::x86_64::__
     _mm256_castsi256_ps(bits)
 }
 
+/// Scale-weighted pairwise SQ8: `SUM w * (qhat - code)^2`, 8 lanes/step
+/// (i16 widening + integer sub + f32 square/FMA).
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn distance_l2_sq8_pairwise_x86(qhat: &[i16], code: &[u8], w: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+
+    let n = qhat.len();
+    debug_assert_eq!(n, code.len());
+    debug_assert_eq!(n, w.len());
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let qh = _mm_loadu_si128(qhat.as_ptr().add(i).cast()); // 8 x i16
+        let qh32 = _mm256_cvtepi16_epi32(qh);
+        let c = _mm_cvtsi64_si128(u64::from_le_bytes([
+            code[i],
+            code[i + 1],
+            code[i + 2],
+            code[i + 3],
+            code[i + 4],
+            code[i + 5],
+            code[i + 6],
+            code[i + 7],
+        ]) as i64);
+        let c32 = _mm256_cvtepu8_epi32(c);
+        let d = _mm256_sub_epi32(qh32, c32);
+        let df = _mm256_cvtepi32_ps(d);
+        let wv = _mm256_loadu_ps(w.as_ptr().add(i));
+        acc = _mm256_fmadd_ps(wv, _mm256_mul_ps(df, df), acc);
+        i += 8;
+    }
+    let mut total = horizontal_sum_8(acc);
+    while i < n {
+        let d = (qhat[i] - code[i] as i16) as f32;
+        total += w[i] * d * d;
+        i += 1;
+    }
+    total
+}
+
 /// Sum the 8 lanes of an AVX register.
 #[target_feature(enable = "avx2")]
 #[inline]

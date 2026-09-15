@@ -68,6 +68,9 @@ pub struct BuildState {
     pub index_info: *mut pg_sys::IndexInfo,
     pub m: usize,
     pub ef_construction: usize,
+    /// The leader's SQ8 distance mode; the parallel build shares it with
+    /// workers through `Shared` (worker processes do not see GUC SETs).
+    pub sq8_mode: crate::access_method::hnswsq::options::Sq8DistanceMode,
     pub dimensions: usize,
     pub support: Support,
     pub precision: HnswPrecision,
@@ -299,6 +302,7 @@ unsafe fn insert_tuple_in_memory(build: &mut BuildState, element: *mut Element) 
         &mut build.decode,
         &mut build.pair_scratch,
         &mut build.visited,
+        build.sq8_mode,
     );
 
     #[cfg(any(test, feature = "pg_test"))]
@@ -844,11 +848,15 @@ pub unsafe extern "C-unwind" fn hnswsq_parallel_build_main(
     // codec comes from the (already written) metapage and calibration chain.
     let support = init_support(index);
     debug_assert_eq!(get_precision(index), support.precision);
+    let sq8_mode = crate::access_method::hnswsq::options::Sq8DistanceMode::from_i32(
+        (*shared).sq8_distance_mode,
+    );
     let mut build = init_build_state(
         Some(heap),
         index,
         pg_sys::BuildIndexInfo(index),
         support.codec.clone(),
+        sq8_mode,
     );
     build.graph_ptr = &mut (*shared).graph;
     build.base = area;
@@ -972,6 +980,10 @@ unsafe fn begin_parallel(build: &mut BuildState, isconcurrent: bool, request: i3
         (*pcxt).nworkers_launched
     );
 
+    // Workers are separate processes: hand the leader's SQ8 distance mode
+    // to them through the shared area.
+    (*shared).sq8_distance_mode = build.sq8_mode.as_i32();
+
     // Save leader state now that it's clear build will be parallel
     build.leader = Some(Leader {
         pcxt,
@@ -1070,6 +1082,7 @@ pub unsafe fn init_build_state(
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
     codec: Codec,
+    sq8_mode: crate::access_method::hnswsq::options::Sq8DistanceMode,
 ) -> Box<BuildState> {
     let index_rel = PgRelation::from_pg(index);
     let options = Hnsw2Options::from_relation(&index_rel);
@@ -1114,6 +1127,7 @@ pub unsafe fn init_build_state(
         index_info,
         m,
         ef_construction,
+        sq8_mode,
         dimensions,
         support: Support {
             dist_type,
@@ -1282,7 +1296,8 @@ unsafe fn build_index(
         Codec::new(precision, dimensions)
     };
 
-    let mut build = init_build_state(heap, index, index_info, codec);
+    let sq8_mode = crate::access_method::hnswsq::options::HNSW_SQ8_DISTANCE.get();
+    let mut build = init_build_state(heap, index, index_info, codec, sq8_mode);
 
     build_graph(&mut build);
 

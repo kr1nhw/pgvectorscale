@@ -82,8 +82,8 @@ pub static HNSW_BUILD_SEED: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new
     pgrx::PostgresGucEnum, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default,
 )]
 pub enum Sq8DistanceMode {
-    #[default]
     Scalar,
+    #[default]
     Pairwise,
 }
 
@@ -94,10 +94,17 @@ impl Sq8DistanceMode {
             Sq8DistanceMode::Pairwise => 1,
         }
     }
+
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            1 => Sq8DistanceMode::Pairwise,
+            _ => Sq8DistanceMode::Scalar,
+        }
+    }
 }
 
 pub static HNSW_SQ8_DISTANCE: pgrx::GucSetting<Sq8DistanceMode> =
-    pgrx::GucSetting::<Sq8DistanceMode>::new(Sq8DistanceMode::Scalar);
+    pgrx::GucSetting::<Sq8DistanceMode>::new(Sq8DistanceMode::Pairwise);
 
 // DO NOT derive Clone for this struct. The storage layout string comes at the
 // end and wouldn't be copied properly.

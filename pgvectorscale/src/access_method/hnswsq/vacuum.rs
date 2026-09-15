@@ -255,6 +255,7 @@ unsafe fn repair_graph_element(
         &mut vac.decode,
         &mut vac.pair_scratch,
         &mut vac.visited,
+        crate::access_method::hnswsq::options::HNSW_SQ8_DISTANCE.get(),
     );
 
     // Update neighbor tuple (before getting the page, to minimize locking)

@@ -213,6 +213,9 @@ pub struct Codec {
     sq8_inv_scales: Vec<f32>,
     /// SQ8 only: per-dimension `(max - min) / 255`.
     sq8_scales: Vec<f32>,
+    /// SQ8 only: `sq8_scales` squared — the per-dimension weights of the
+    /// weighted pairwise distance.
+    sq8_scales2: Vec<f32>,
 }
 
 impl Codec {
@@ -229,6 +232,7 @@ impl Codec {
             sq8_maxs: Vec::new(),
             sq8_inv_scales: Vec::new(),
             sq8_scales: Vec::new(),
+            sq8_scales2: Vec::new(),
         }
     }
 
@@ -247,6 +251,7 @@ impl Codec {
             // decode to mins[d].
         }
 
+        let scales2: Vec<f32> = scales.iter().map(|s| s * s).collect();
         Self {
             precision: HnswPrecision::Sq8,
             dim,
@@ -254,6 +259,7 @@ impl Codec {
             sq8_maxs: calib.maxs.clone(),
             sq8_inv_scales: inv_scales,
             sq8_scales: scales,
+            sq8_scales2: scales2,
         }
     }
 
@@ -383,18 +389,22 @@ impl Codec {
         Sq8QueryState::Pairwise(qhat)
     }
 
-    /// The pairwise form: `SUM (qhat - code)^2` in i32 (ordering is exact;
-    /// the caller widens to f32 for the heaps).
+    /// The pairwise form, scale-weighted: `SUM scale_i^2 (qhat - code)^2`.
+    /// `scale_i^2 * (qhat - code)^2` is the squared difference of the DECODED
+    /// values, so this reproduces the scalar decode distance's ranking while
+    /// keeping the query-quantized integer form (Lance's stored-norm dot and
+    /// Milvus's per-dimension LUTs preserve the same scale weights; the
+    /// unweighted variant measured ~4 pts recall loss on uneven-scale data).
+    /// Dispatches to the vectorized kernels where available.
     #[inline]
-    pub fn distance_l2_sq8_pairwise(&self, qhat: &[i16], bytes: &[u8]) -> i32 {
+    pub fn distance_l2_sq8_pairwise(&self, qhat: &[i16], bytes: &[u8]) -> f32 {
         debug_assert_eq!(qhat.len(), self.dim);
         debug_assert_eq!(bytes.len(), self.dim);
-        let mut acc = 0i32;
-        for i in 0..self.dim {
-            let d = qhat[i] - bytes[i] as i16;
-            acc += d as i32 * d as i32;
-        }
-        acc
+        crate::access_method::distance::distance_l2_sq8_pairwise(
+            qhat,
+            bytes,
+            &self.sq8_scales2,
+        )
     }
 
 

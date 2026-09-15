@@ -474,7 +474,11 @@ unsafe fn load_elements_for_insert(
     let na = array.as_mut_ptr().cast::<NeighborArray>();
     // SQ8: quantize the query once; the neighbor distances below are integer
     // arithmetic (see sq8_query_state).
-    let qstate = sq8_query_state(support, q);
+    let qstate = sq8_query_state(
+        support,
+        q,
+        crate::access_method::hnswsq::options::HNSW_SQ8_DISTANCE.get(),
+    );
     for i in 0..(*na).length as usize {
         let hc = &mut *neighbor_items(na).add(i);
         let element =
@@ -921,6 +925,7 @@ pub unsafe fn insert_tuple_on_disk(
         .as_deref_mut()
         .map(|e| e as *mut Element);
     with_insert_scratch(support.codec.dim(), m, ef_construction, |s| {
+        let sq8_mode = crate::access_method::hnswsq::options::HNSW_SQ8_DISTANCE.get();
         find_element_neighbors(
             std::ptr::null_mut(),
             element,
@@ -934,6 +939,7 @@ pub unsafe fn insert_tuple_on_disk(
             &mut s.decode,
             &mut s.pair,
             &mut s.visited,
+            sq8_mode,
         );
 
         // Update graph on disk
