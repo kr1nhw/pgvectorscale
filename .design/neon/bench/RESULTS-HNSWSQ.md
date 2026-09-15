@@ -4,23 +4,65 @@ Dataset: BIGANN 1M rows, dim 128, first 100 queries, exact top-10 ground truth
 (`items_1m` / `gt_1m`).  Both engines: `m=16`, `ef_construction=64`,
 `maintenance_work_mem=8GB`.  hnswsq index: `storage_layout=plain`.
 
-Both engines are **release builds** on the same box and the same table, measured
-back to back with `.design/neon/bench/cycle.sh` (which kills stale builds by PID,
-drops and recreates the index, and records build time + stats + sweep in one
-row).  This replaces the earlier 100k/113 comparison, whose hnswsq side was a
-*debug* build of the extension — see "History" at the bottom.
+## Re-run 2026-09-15: the ported engine (this repo's Rust hnswsq)
 
-## Build + size
+Run with `.design/neon/bench/gap_study.sh` after syncing this repo to the box
+and installing the release build (see `RE-RUN-121.md`). The numbers below
+**replace** everything under "History" for the port.
+
+### Build + size (1M rows)
+
+| engine | workers | seconds | size_bytes | bytes/vector |
+|--------|---------|---------|------------|--------------|
+| hnswsq (port) | 4 (server default) | **59** | 819,216,384 | 819 (-1.6%) |
+| pgvector hnsw | 4 (server default) | 102 | 832,241,664 | 832 |
+| pgvector hnsw | 1 | 446 | 831,995,904 | 832 |
+| pgvector hnsw | 32 | 64 | 832,184,320 | 832 |
+
+The port's parallel build lands at 59s — 1.7x faster than pgvector at the same
+worker count and 7.6x faster than pgvector single-backend. Index is 1.6%
+smaller than pgvector's.
+
+### Query sweep (mean ms per query, 100 queries, warm)
+
+| ef | hnswsq LIMIT10 | hnswsq drain | pgvector LIMIT10 | pgvector drain | ratio (LIMIT 10) |
+|----|---------------:|-------------:|-----------------:|---------------:|-----------------:|
+| 10 | 0.696 | 0.771 | 0.618 | 0.724 | 1.13x |
+| 40 | 1.151 | 1.279 | 1.115 | 1.214 | 1.03x |
+| 160 | 2.445 | 2.781 | 2.491 | 2.858 | **0.98x** |
+| 640 | 6.609 | 7.405 | 6.982 | 7.948 | **0.95x** |
+
+At ef ≥ 160 the port is faster than pgvector; the ef=10 gap is the fixed
+per-scan pgrx FFI overhead. Perf profiles (in `/tmp/gap_study.log`) show both
+engines buffer-manager-bound: hnswsq's top symbols are PinBuffer 25% /
+`load_element_impl` 21% / LWLockRelease 19%; pgvector's are PinBuffer 23% /
+LWLockRelease 19% / `HnswLoadElementImpl` 17%.
+
+### Recall@10 (vs `gt_1m`)
+
+| ef | hnswsq | pgvector |
+|----|--------|----------|
+| 160 | **0.993** | 0.992 |
+| 640 | **1.000** | 1.000 |
+
+---
+
+## History — the retired engine (pre-port, same box)
+
+Both engines were **release builds** on the same box and the same table,
+measured back to back with `.design/neon/bench/cycle.sh`. This replaced an
+earlier 100k/113 comparison whose hnswsq side was a *debug* build of the
+extension — see the bottom of this file.
+
+### Build + size (old engine)
 
 | engine | build_s | size_bytes | bytes/vector |
 |--------|---------|------------|--------------|
 | pgvector hnsw | 105 | 832,184,320 | 832 |
-| hnswsq plain | **517** | 861,921,280 | 862 (+3.6%) |
+| hnswsq plain (retired engine) | **517** | 861,921,280 | 862 (+3.6%) |
 
-hnswsq is single-backend; pgvector's C build parallelizes across the box.  The
-gap is parallelism, not algorithm — measured on the same box with both engines
-in release and `max_parallel_maintenance_workers` varied (see
-`.design/hnswsq_vs_pgvector_gap.md`):
+The retired engine was single-backend; pgvector's C build parallelized across
+the box.  The gap was parallelism, not algorithm:
 
 | build | workers | seconds |
 |---|---|---|

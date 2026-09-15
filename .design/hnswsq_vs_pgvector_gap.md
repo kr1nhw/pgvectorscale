@@ -1,5 +1,12 @@
 # hnswsq vs pgvector-hnsw: where the remaining gap comes from
 
+> **Superseded (2026-09-15)**: this analysis is about the *retired* engine.
+> The ported engine's re-run on the same box closes the gap — builds 59s vs
+> pgvector 102s at 4 workers, queries 0.95-0.98x pgvector at ef 160/640,
+> recall@10 99.3% vs 99.2% at ef 160. See
+> `.design/neon/bench/RESULTS-HNSWSQ.md` (new top section). The per-symbol
+> breakdowns below remain useful history.
+
 Measured on 121.37.117.106 (32 vCPU, PG 17.11), same table (`items_1m`, BIGANN
 1M rows, dim 128), same index parameters (`m=16, ef_construction=64`,
 `maintenance_work_mem=8GB`), **both engines release builds**, same session, with

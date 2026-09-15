@@ -89,12 +89,17 @@ def sweep(ef, limit):
 
 
 print("engine,ef,limit,queries,mean_ms,p50_ms,blocks_mean,index_rows_mean,index_rows_max")
+out = open(out_csv, "w")
+out.write("engine,ef,limit,queries,mean_ms,p50_ms,blocks_mean,index_rows_mean,index_rows_max\n")
 for ef in efs:
     for limit in (10, 100000):
         times, blocks, rows = sweep(ef, limit)
-        print(
+        line = (
             f"{engine},{ef},{limit},{len(times)},{statistics.mean(times):.3f},"
             f"{statistics.median(times):.3f},{statistics.mean(blocks):.1f},"
             f"{statistics.mean(rows):.1f},{max(rows)}"
         )
+        print(line)
+        out.write(line + "\n")
         sys.stdout.flush()
+out.close()

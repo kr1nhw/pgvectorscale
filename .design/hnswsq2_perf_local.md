@@ -1,5 +1,11 @@
 # hnswsq (Rust port) vs pgvector — local A/B, plain layout
 
+> **Host-121 re-run done (2026-09-15)**: on the 1M BIGANN box the ported engine
+> builds in **59s vs pgvector's 102s** at 4 workers, queries at **0.95-0.98x**
+> pgvector at ef 160/640, and recall@10 is 99.3% vs 99.2% at ef 160. Full
+> numbers: `.design/neon/bench/RESULTS-HNSWSQ.md` (new top section). This file
+> remains the local-methodology reference.
+
 Measured on the manual dev cluster (PostgreSQL 18.4, Homebrew, aarch64 macOS,
 Apple M4 Pro), `postgres -D /tmp/hnswsq2db -p 54329 -k /tmp/pgtestk`, extension
 installed at `/opt/homebrew/lib/postgresql@18/vectorscale-0.9.0.dylib`,
