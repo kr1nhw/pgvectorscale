@@ -105,6 +105,17 @@ Notes:
   fp16's halved memory traffic now shows up as advertised: queries and
   inserts at parity with plain at half the index size; the build keeps a
   1.5x factor from the conversion uop and the quantized graph's structure.
+- **E4M3 pruning (exponent-first compare)**: measured feasibility for
+  insert/build.  Local fp8 build profile (aarch64, 120k x 128): the search
+  (`find_element_neighbors`) is 81% of insert time; the pairwise-comparison
+  phases (`update_connection`/`check_element_closer`/`select_neighbors`) are
+  ~19%, and they compute distance ACCUMULATIONS (q vs each candidate), not
+  elementwise vector comparisons — there is no dominance comparison to
+  prune in the hot loop.  The primitive itself is cheap (first element
+  decides 96% of pairs, ~1.8 ns/pair branchy; see smoke.rs), so an
+  algorithmic change (dominance-based candidate rejection in
+  select_neighbors) would be bounded by that ~19% share.  Verdict:
+  not worthwhile for the current algorithm.
 - **Insert caveat**: this box's PostgreSQL is pgrx's debug build
   (`--enable-cassert -DRANDOMIZE_ALLOCATED_MEMORY=1` — every palloc'd byte
   is junk-filled), which taxes the port's higher palloc volume.  On a
