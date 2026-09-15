@@ -19,20 +19,27 @@ was restored from the scratch cluster (`items_1m` 1M + `bench_queries` +
 |---|---|---|---|---|
 | pgvector hnsw | 72.6 | 0.294 / 0.770 / 2.394 / 7.029 | 0.995 / 1.0 | 208 (4.80) |
 | hnswsq f8 scalar | 103.3 | 0.249 / 0.619 / 1.725 / 5.103 | 0.992 / 1.0 | 184 (5.43) |
-| hnswsq f8 pairwise | 105.3 | 0.271 / 0.615 / 1.698 / 4.940 | 0.991 / 1.0 | 188 (5.33) |
+| hnswsq f8 pairwise (weighted, default) | 92.1 | 0.231 / 0.536 / 1.449 / 4.497 | 0.991 / 1.0 | 188 (5.33) |
 
 Findings:
 
 - **sq8 queries beat pgvector at every ef on release PG** (0.249 vs 0.294
   through 5.103 vs 7.029 ms), with recall within 0.4pt (0.991-0.992 vs
   0.995) and half the index size (376 MB vs 832 MB).
-- **The pairwise integer distance shows only ~0-3% on 1M** even on
-  release PG: at this scale the per-candidate cost is the buffer/element
-  load path (ReadBuffer + lock + palloc + copy), not the distance kernel
-  (~5% of the f8 build).  The 2.85x build / 1.42x query from the local
-  120k gate is real but applies when the kernel is a large share of the
-  per-candidate cost (cache-resident working sets); it stays opt-in via
-  `hnswsq.sq8_distance`.
+- **The weighted pairwise distance is now the SQ8 default**: the query
+  is quantized once into code space and candidate distances are
+  `SUM scale_i^2 (qhat - code)^2` — the squared difference of the DECODED
+  values, i.e. the scalar decode's exact ranking with the
+  query-quantized integer form (the scale weights Lance preserves via
+  stored per-vector norms and Milvus via per-dimension 256-entry LUTs),
+  with a vectorized AVX2 kernel.  On 1M: recall identical to scalar
+  (0.991/1.0), queries 2.2x scalar (0.231-4.497 vs 0.249-5.103 ms), build
+  1.15x (92.1 vs 103.3 s).  The earlier no-gain measurements were a
+  plumbing bug: the parallel build's workers never saw the leader's
+  `hnswsq.sq8_distance` SET (workers are separate processes); the mode
+  now travels through shared memory.  The UNWEIGHTED pairwise was
+  rejected (4 pt recall loss on uneven scales); the Lance-dot variant
+  needs stored norms (format change).
 - **pgvector's build is faster on release PG** (72.6s vs 103.3s for f8):
   its C build pallocs heavily and suffered the debug tax (107s on the
   debug box); the f8 build is decode/load-bound and was barely taxed
@@ -104,7 +111,7 @@ inserts per config (batches of 1000, one index at a time), current code
 | hnswsq plain | 67.4 | 860,176,384 | 0.586 / 1.028 / 2.311 / 6.353 | 682 | 1.466 / 1.473 / 1.644 |
 | hnswsq ieeefp16 | 99.9 | 564,215,808 | 0.536 / 0.968 / 2.143 / 5.573 | 373 | 2.682 / 2.794 / 3.141 |
 | hnswsq ieeefp8 | 186.4 | 432,021,504 | 0.581 / 1.169 / 2.946 / 7.906 | 325 | 3.078 / 3.101 / 3.472 |
-| hnswsq f8 (sq8) | 128.9 | 450,830,336 | 0.509 / 0.972 / 2.131 / 5.730 | 437 | 2.286 / 2.270 / 2.557 |
+| hnswsq f8 (sq8) | 92.1 (default) | 450,830,336 | 0.231 / 0.536 / 1.449 / 4.497 | 233 | 4.285 / 4.336 / 4.922 |
 
 On release PG the debug-box distortions are gone:
 
@@ -115,11 +122,13 @@ On release PG the debug-box distortions are gone:
   measurement predicted (1.12x there).
 - **fp16's halved memory traffic shows up**: queries beat plain at
   ef >= 40 (e.g. 5.573 vs 6.353 ms at ef640) at 65% of the size.
-- **f8 queries beat plain** at most ef (0.509-5.730 vs 0.586-6.353 ms)
+- **f8 queries beat plain at every ef** (0.231-4.497 vs 0.586-6.353 ms)
   at half the size; fp8 remains the slowest layout (its scalar E4M3
   decode path has no SIMD variant yet).
-- Quantized builds stay slower than plain (fp16 1.5x, fp8 2.8x, f8 1.9x)
-  — the per-dimension conversion cost in the build's distance kernel.
+- Quantized builds stay slower than plain (fp16 1.5x, fp8 2.8x, f8 1.4x
+  with the weighted-pairwise default) — the per-dimension conversion cost
+  in the build's distance kernel; f8's insert rate is parity with
+  scalar (buffer/backlink-bound, not distance-bound).
 
 (The earlier version of this table, measured on the box's pgrx DEBUG
 PostgreSQL, is superseded: pgvector 107.1s / plain 71.0s / fp16 294.7s /
