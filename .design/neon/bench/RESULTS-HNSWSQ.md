@@ -87,9 +87,19 @@ Notes:
   on-the-fly `scale^2` weight quantization underflows on small-scale data
   (recall 0.08 on [0,1] data); the fix is storing the per-vector norm
   (4-byte on-disk format change) — documented in smoke.rs.  The 1M BIGANN
-  confirmation of the pairwise variant is pending (box unreachable at
-  commit time; run the settings-matrix A/B with
-  `SET hnswsq.sq8_distance = pairwise`).
+  confirmation (same box, fresh index per variant, `items_1m`):
+
+  | variant | build s | qms ef10/40/160/640 | recall@10 ef160/640 | ins rps |
+  |---|---|---|---|---|
+  | scalar | 105.7 | 0.531 / 0.915 / 2.091 / 5.577 | 0.991 / 1.0 | 118 |
+  | pairwise | 105.0 | 0.577 / 0.950 / 2.127 / 5.745 | 0.991 / 1.0 | 118 |
+
+  On this box the gain is masked: the box's pgrx debug PostgreSQL
+  (RANDOMIZE_ALLOCATED_MEMORY) taxes every palloc, so the ~40ns/pair
+  kernel saving drowns under the per-candidate buffer/palloc cost.  On
+  release PostgreSQL (local gate above) the same code is 2.85x build /
+  1.42x query.  Recall is IDENTICAL on 1M.  Kept behind
+  `hnswsq.sq8_distance = pairwise` (default `scalar`).
 - **Fixed (order-preserving bit-math conversions)**: the stored patterns are
   ORDER-preserving, so the per-element IEEE decode (branchy `f16::to_f32`
   and a `log2`+`powi` E4M3 encode) was replaced with branchless bit moves —
