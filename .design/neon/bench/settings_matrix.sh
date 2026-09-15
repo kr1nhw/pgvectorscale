@@ -14,7 +14,8 @@
 # Results: CSV on stdout and /tmp/settings_matrix.csv
 set -uo pipefail
 
-PSQL=/root/.pgrx-hnswsq/17.11/pgrx-install/bin/psql
+PSQL="${PSQL:-/root/.pgrx-hnswsq/17.11/pgrx-install/bin/psql}"
+PORT="${PORT:-54330}"
 BENCH="$(cd "$(dirname "$0")" && pwd)"
 TABLE=items_1m
 EFS="10 40 160 640"
@@ -25,8 +26,8 @@ OUT_CSV=/tmp/settings_matrix.csv
 STAGING=/tmp/insert_staging.txt
 BCONF=0
 
-q() { sudo -u pgtest "$PSQL" -h 127.0.0.1 -p 54330 -U pgtest -d postgres -X -q -At -v ON_ERROR_STOP=1 "$@"; }
-qin() { sudo -u pgtest "$PSQL" -h 127.0.0.1 -p 54330 -U pgtest -d postgres -X -q -At -v ON_ERROR_STOP=1; }
+q() { sudo -u pgtest "$PSQL" -h 127.0.0.1 -p "$PORT" -U pgtest -d postgres -X -q -At -v ON_ERROR_STOP=1 "$@"; }
+qin() { sudo -u pgtest "$PSQL" -h 127.0.0.1 -p "$PORT" -U pgtest -d postgres -X -q -At -v ON_ERROR_STOP=1; }
 
 # ---- 0. staging: 5 x INSERT_N fresh vectors from the 100M base file -------
 python3 - "$STAGING" "$INSERT_N" <<'PY'

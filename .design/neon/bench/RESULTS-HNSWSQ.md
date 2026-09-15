@@ -92,84 +92,39 @@ down at low ef and equal or better from ef 160.)
 
 ## Settings matrix (build / query latency / insert throughput)
 
-`settings_matrix.sh` on the same box (`items_1m`, m=16, efc=64, mwm 8GB,
-50k fresh inserts per config, batches of 1000, one index at a time):
+Measured on the **release PostgreSQL 17.11** cluster on the same box
+(port 54331; see the "Release-PostgreSQL re-run" section below for how
+it was built), `items_1m`, m=16, efc=64, mwm 8GB, 4 workers, 50k fresh
+inserts per config (batches of 1000, one index at a time), current code
+(bit-math fp conversions + pairwise option left at its `scalar` default):
 
-| config | build_s | size_bytes | qms ef10/40/160/640 (LIMIT 10) | ins rows/s | ins row_ms mean/p50/p99 |
+| config | build s | size_bytes | qms ef10/40/160/640 (LIMIT 10) | ins rows/s | ins row_ms mean/p50/p99 |
 |---|---|---|---|---|---|
-| pgvector | 107.1 | 873,848,832 | 0.686 / 1.160 / 2.543 / 7.135 | 867 | 1.154 / 1.156 / 1.280 |
-| hnswsq plain | 71.0 | 901,136,384 | 0.644 / 1.122 / 2.429 / 6.511 | 271 | 3.683 / 3.695 / 3.957 |
-| hnswsq ieeefp16 | 294.7 | 589,881,344 | 0.750 / 1.473 / 3.335 / 8.838 | 127 | 7.885 / 8.064 / 8.860 |
-| hnswsq ieeefp8 | 740.9 | 450,805,760 | 1.108 / 2.216 / 5.960 / 16.926 | 81 | 12.402 / 12.275 / 14.643 |
-| hnswsq f8 (sq8) | 134.6 | 469,606,400 | 0.589 / 1.112 / 2.342 / 6.049 | 253 | 3.947 / 3.923 / 4.306 |
+| pgvector | 66.1 | 832,274,432 | 0.597 / 1.003 / 2.244 / 6.499 | 695 | 1.439 / 1.443 / 1.627 |
+| hnswsq plain | 67.4 | 860,176,384 | 0.586 / 1.028 / 2.311 / 6.353 | 682 | 1.466 / 1.473 / 1.644 |
+| hnswsq ieeefp16 | 99.9 | 564,215,808 | 0.536 / 0.968 / 2.143 / 5.573 | 373 | 2.682 / 2.794 / 3.141 |
+| hnswsq ieeefp8 | 186.4 | 432,021,504 | 0.581 / 1.169 / 2.946 / 7.906 | 325 | 3.078 / 3.101 / 3.472 |
+| hnswsq f8 (sq8) | 128.9 | 450,830,336 | 0.509 / 0.972 / 2.131 / 5.730 | 437 | 2.286 / 2.270 / 2.557 |
 
-Notes:
+On release PG the debug-box distortions are gone:
 
-- Query latency: `plain` and `f8` beat pgvector at ef ≥ 40.
-- **SQ8 integer pairwise distance (user proposal, gated)**: the query is
-  quantized once into code space (`hnswsq.sq8_distance = pairwise`, default
-  stays `scalar`) and every candidate distance is `SUM (qhat - code)^2` in
-  pure i32 — no decode, no scale terms, robust at any data scale.  Local
-  gate (120k x 128, release PG, fresh index per variant):
+- **plain reaches parity everywhere**: build 67.4 vs 66.1s, queries
+  equal, inserts 682 vs 695 rows/s (1.47 vs 1.44 ms/row) — the earlier
+  3.2x insert gap was the debug PG's RANDOMIZE_ALLOCATED_MEMORY tax on
+  the port's higher palloc volume, exactly as the local release-PG
+  measurement predicted (1.12x there).
+- **fp16's halved memory traffic shows up**: queries beat plain at
+  ef >= 40 (e.g. 5.573 vs 6.353 ms at ef640) at 65% of the size.
+- **f8 queries beat plain** at most ef (0.509-5.730 vs 0.586-6.353 ms)
+  at half the size; fp8 remains the slowest layout (its scalar E4M3
+  decode path has no SIMD variant yet).
+- Quantized builds stay slower than plain (fp16 1.5x, fp8 2.8x, f8 1.9x)
+  — the per-dimension conversion cost in the build's distance kernel.
 
-  | variant | build s | query ms ef160/ef640 | recall@10 ef160/ef640 |
-  |---|---|---|---|
-  | scalar | 17.4 | 1.78 / 6.07 | 0.735 / 1.0 |
-  | pairwise | **6.1 (2.85x)** | **1.25 / 4.28 (1.42x)** | 0.729 / 1.0 |
-
-  The emission path recomputes the decoded distance per emitted tuple for
-  the lower-bound proof (the integer distance is a different quantity).
-  The Lance-style dot variant was prototyped but NOT committed: its
-  on-the-fly `scale^2` weight quantization underflows on small-scale data
-  (recall 0.08 on [0,1] data); the fix is storing the per-vector norm
-  (4-byte on-disk format change) — documented in smoke.rs.  The 1M BIGANN
-  confirmation (same box, fresh index per variant, `items_1m`):
-
-  | variant | build s | qms ef10/40/160/640 | recall@10 ef160/640 | ins rps |
-  |---|---|---|---|---|
-  | scalar | 105.7 | 0.531 / 0.915 / 2.091 / 5.577 | 0.991 / 1.0 | 118 |
-  | pairwise | 105.0 | 0.577 / 0.950 / 2.127 / 5.745 | 0.991 / 1.0 | 118 |
-
-  On this box the gain is masked: the box's pgrx debug PostgreSQL
-  (RANDOMIZE_ALLOCATED_MEMORY) taxes every palloc, so the ~40ns/pair
-  kernel saving drowns under the per-candidate buffer/palloc cost.  On
-  release PostgreSQL (local gate above) the same code is 2.85x build /
-  1.42x query.  Recall is IDENTICAL on 1M.  Kept behind
-  `hnswsq.sq8_distance = pairwise` (default `scalar`).
-- **Fixed (order-preserving bit-math conversions)**: the stored patterns are
-  ORDER-preserving, so the per-element IEEE decode (branchy `f16::to_f32`
-  and a `log2`+`powi` E4M3 encode) was replaced with branchless bit moves —
-  vectorized (integer SIMD, plus a runtime F16C `vcvtph2ps` path on x86) in
-  `distance_x86.rs`.  Re-measured on the same box (1.6M rows):
-
-  | metric | plain | fp16 before -> after | fp8 before -> after |
-  |---|---|---|---|
-  | build (s) | 101 | 295 -> **155** (1.53x) | 741 -> **282** (2.8x) |
-  | query ef640 (ms) | 6.5 | 8.8 -> **6.0** (parity) | 16.9 -> – |
-  | inserts (rps) | 271 | 127 -> **262** (parity) | 81 -> – |
-
-  fp16's halved memory traffic now shows up as advertised: queries and
-  inserts at parity with plain at half the index size; the build keeps a
-  1.5x factor from the conversion uop and the quantized graph's structure.
-- **E4M3 pruning (exponent-first compare)**: measured feasibility for
-  insert/build.  Local fp8 build profile (aarch64, 120k x 128): the search
-  (`find_element_neighbors`) is 81% of insert time; the pairwise-comparison
-  phases (`update_connection`/`check_element_closer`/`select_neighbors`) are
-  ~19%, and they compute distance ACCUMULATIONS (q vs each candidate), not
-  elementwise vector comparisons — there is no dominance comparison to
-  prune in the hot loop.  The primitive itself is cheap (first element
-  decides 96% of pairs, ~1.8 ns/pair branchy; see smoke.rs), so an
-  algorithmic change (dominance-based candidate rejection in
-  select_neighbors) would be bounded by that ~19% share.  Verdict:
-  not worthwhile for the current algorithm.
-- **Insert caveat**: this box's PostgreSQL is pgrx's debug build
-  (`--enable-cassert -DRANDOMIZE_ALLOCATED_MEMORY=1` — every palloc'd byte
-  is junk-filled), which taxes the port's higher palloc volume.  On a
-  release PostgreSQL (Apple M4 Pro, PG 18 Homebrew, same methodology)
-  inserts measure **pgvector 1.06 ms/row vs hnswsq plain 1.19 ms/row
-  (1.12x)** — at parity.  The per-insert scratch reuse (backend-local
-  arena + visited + buffers) removes the per-row 64 KiB arena calloc and
-  per-neighbor Boxes.
+(The earlier version of this table, measured on the box's pgrx DEBUG
+PostgreSQL, is superseded: pgvector 107.1s / plain 71.0s / fp16 294.7s /
+fp8 740.9s / f8 134.6s builds and 867/271/127/81/253 insert rates
+reflected the debug-palloc tax, not the engine.)
 
 ---
 

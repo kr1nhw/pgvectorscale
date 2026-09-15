@@ -18,8 +18,8 @@ import statistics
 import subprocess
 import sys
 
-PSQL = "/root/.pgrx-hnswsq/17.11/pgrx-install/bin/psql"
-CONN = ["-h", "127.0.0.1", "-p", "54330", "-U", "pgtest", "-d", "postgres", "-X", "-q", "-At"]
+PSQL = os.environ.get("PSQL", "/root/.pgrx-hnswsq/17.11/pgrx-install/bin/psql")
+CONN = ["-h", "127.0.0.1", "-p", os.environ.get("PORT", "54330"), "-U", "pgtest", "-d", "postgres", "-X", "-q", "-At"]
 
 engine = sys.argv[1] if len(sys.argv) > 1 else "hnswsq"
 efs = [int(x) for x in (sys.argv[2] if len(sys.argv) > 2 else "10,40,160,640").split(",")]
