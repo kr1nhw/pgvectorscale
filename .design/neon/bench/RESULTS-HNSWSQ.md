@@ -4,6 +4,42 @@ Dataset: BIGANN 1M rows, dim 128, first 100 queries, exact top-10 ground truth
 (`items_1m` / `gt_1m`).  Both engines: `m=16`, `ef_construction=64`,
 `maintenance_work_mem=8GB`.  hnswsq index: `storage_layout=plain`.
 
+## Release-PostgreSQL re-run (2026-09-15, same box)
+
+The box's default cluster runs pgrx's DEBUG PostgreSQL
+(`--enable-cassert -DRANDOMIZE_ALLOCATED_MEMORY=1`), which taxes every
+palloc and distorts absolute numbers.  A **release PostgreSQL 17.11** was
+built from the same source tree on the box (`/root/pg17-rel-src`,
+prefix `/root/pg17-release`, port 54331), with pgvector 0.8.6 rebuilt
+against it and the pgrx-built release extension installed; the dataset
+was restored from the scratch cluster (`items_1m` 1M + `bench_queries` +
+`gt_1m`).
+
+| config | build s | qms ef10/40/160/640 (ms) | recall@10 ef160/640 | ins rps (ms/row) |
+|---|---|---|---|---|
+| pgvector hnsw | 72.6 | 0.294 / 0.770 / 2.394 / 7.029 | 0.995 / 1.0 | 208 (4.80) |
+| hnswsq f8 scalar | 103.3 | 0.249 / 0.619 / 1.725 / 5.103 | 0.992 / 1.0 | 184 (5.43) |
+| hnswsq f8 pairwise | 105.3 | 0.271 / 0.615 / 1.698 / 4.940 | 0.991 / 1.0 | 188 (5.33) |
+
+Findings:
+
+- **sq8 queries beat pgvector at every ef on release PG** (0.249 vs 0.294
+  through 5.103 vs 7.029 ms), with recall within 0.4pt (0.991-0.992 vs
+  0.995) and half the index size (376 MB vs 832 MB).
+- **The pairwise integer distance shows only ~0-3% on 1M** even on
+  release PG: at this scale the per-candidate cost is the buffer/element
+  load path (ReadBuffer + lock + palloc + copy), not the distance kernel
+  (~5% of the f8 build).  The 2.85x build / 1.42x query from the local
+  120k gate is real but applies when the kernel is a large share of the
+  per-candidate cost (cache-resident working sets); it stays opt-in via
+  `hnswsq.sq8_distance`.
+- **pgvector's build is faster on release PG** (72.6s vs 103.3s for f8):
+  its C build pallocs heavily and suffered the debug tax (107s on the
+  debug box); the f8 build is decode/load-bound and was barely taxed
+  (105.7s debug vs 103.3s release).  Build parity for f8 remains the
+  open item; `plain` hnswsq built in 71s on the debug box vs pgvector's
+  107s there.
+
 ## Re-run 2026-09-15: the ported engine (this repo's Rust hnswsq)
 
 Run with `.design/neon/bench/gap_study.sh` after syncing this repo to the box
