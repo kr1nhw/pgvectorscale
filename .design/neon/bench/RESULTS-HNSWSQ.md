@@ -40,10 +40,19 @@ LWLockRelease 19% / `HnswLoadElementImpl` 17%.
 
 ### Recall@10 (vs `gt_1m`)
 
-| ef | hnswsq | pgvector |
-|----|--------|----------|
-| 160 | **0.993** | 0.992 |
-| 640 | **1.000** | 1.000 |
+| ef | pgvector | hnswsq plain | hnswsq ieeefp16 | hnswsq ieeefp8 | hnswsq f8/sq8 |
+|----|----------|--------------|-----------------|----------------|---------------|
+| 10 | 0.772 | 0.784 | 0.784 | 0.709 | 0.786 |
+| 20 | 0.882 | 0.884 | 0.884 | 0.876 | 0.880 |
+| 40 | 0.943 | 0.940 | 0.940 | 0.929 | 0.943 |
+| 80 | 0.976 | 0.977 | 0.976 | 0.969 | 0.978 |
+| 160 | 0.992 | 0.993 | 0.992 | 0.995 | 0.991 |
+| 320 | 0.999 | 0.999 | 0.999 | 1.000 | 0.998 |
+| 640 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+
+(reproducible via `.design/neon/bench/recall_sweep.sh`; `plain`, `ieeefp16`
+and `f8` track pgvector within ±1pt over the whole range, `ieeefp8` is ~1pt
+down at low ef and equal or better from ef 160.)
 
 ---
 

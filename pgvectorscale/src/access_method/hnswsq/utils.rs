@@ -77,10 +77,16 @@ pub unsafe fn get_precision(index: pg_sys::Relation) -> HnswPrecision {
     opts.get_precision()
 }
 
-/// The sample-size reloption (SQ8 calibration).
+/// The sample-size reloption (SQ8 calibration).  0 means "auto" (the
+/// reloption default): the reservoir uses `DEFAULT_SAMPLE_SIZE`.
 pub unsafe fn get_sample_size(index: pg_sys::Relation) -> usize {
     let opts = Hnsw2Options::from_relation(&PgRelation::from_pg(index));
-    opts.sample_size as usize
+    let s = opts.sample_size as usize;
+    if s == 0 {
+        crate::access_method::hnswsq::options::DEFAULT_SAMPLE_SIZE
+    } else {
+        s
+    }
 }
 
 // ---------------------------------------------------------------------------

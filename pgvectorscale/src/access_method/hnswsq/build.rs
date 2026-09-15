@@ -410,6 +410,9 @@ unsafe fn insert_tuple(
     let level = build_level(build.seed, build.ml, build.max_level, *heaptid);
     let allocator = allocator(build);
     let element = init_element(base, heaptid, build.m, level, &allocator);
+    // Record whether the encoding saturated (the scan must emit -inf, not a
+    // bound, for saturated vectors).
+    (*element).clamped = clamped as u8;
     let value_ptr = allocator.alloc(value_size);
 
     // We have now allocated the space needed for the element, so we don't
