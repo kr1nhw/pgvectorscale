@@ -408,39 +408,32 @@ pub unsafe fn add_element_on_disk(
 // GetUpdateIndex / UpdateNeighborOnDisk / HnswUpdateNeighborsOnDisk)
 // ---------------------------------------------------------------------------
 
-/// An owned neighbor array + the elements its candidates point into
-/// (pgvector `HnswLoadNeighbors` pallocs both in the caller's update context;
-/// the Boxes keep the pointers valid for the lifetime of this struct).
-pub struct LoadedNeighbors {
-    pub array: Vec<u8>,
-    pub elements: Vec<Box<Element>>,
-}
-
-impl LoadedNeighbors {
-    fn header(&mut self) -> *mut NeighborArray {
-        self.array.as_mut_ptr().cast()
-    }
-}
-
-/// `HnswLoadNeighbors` (hnswinsert.c).
-pub unsafe fn load_neighbors(
+/// Load the layer's neighbor TIDs and materialize each neighbor's element
+/// into the caller's scratch buffers (pgvector `HnswLoadNeighbors` pallocs
+/// both per call; the insert scratch reuses them across inserts).  Returns
+/// the number of neighbors, or -1 when the neighbor tuple could not be read
+/// (the caller treats that as an empty list).  On success `array` holds a
+/// [`NeighborArray`] whose candidates' `element` pointers live in `elements`.
+unsafe fn load_neighbors_into(
     element: *mut Element,
     index: pg_sys::Relation,
     m: usize,
     lm: usize,
     lc: usize,
-) -> LoadedNeighbors {
-    let mut loaded = LoadedNeighbors {
-        array: vec![0u8; neighbor_array_size(lm)],
-        elements: Vec::with_capacity(lm),
-    };
-    let na = loaded.header();
+    array: &mut Vec<u8>,
+    tids: &mut Vec<pg_sys::ItemPointerData>,
+    elements: &mut ElementArena,
+) -> i32 {
+    array.clear();
+    array.resize(neighbor_array_size(lm), 0);
+    let na = array.as_mut_ptr().cast::<NeighborArray>();
     (*na).length = 0;
     (*na).closer_set = false;
 
-    let mut tids = vec![pg_sys::ItemPointerData::default(); lm];
-    if !load_neighbor_tids(element, &mut tids, index, m, lm, lc) {
-        return loaded;
+    tids.clear();
+    tids.resize(lm, pg_sys::ItemPointerData::default());
+    if !load_neighbor_tids(element, tids, index, m, lm, lc) {
+        return -1;
     }
 
     for tid in tids.iter().take(lm) {
@@ -450,16 +443,12 @@ pub unsafe fn load_neighbors(
         }
         let offno = ip_offset(tid);
 
-        let mut e = init_element_from_block(blkno, offno);
+        let eptr = elements.alloc();
+        init_element_at(eptr, blkno, offno);
         let mut hp = crate::access_method::hnswsq::ptr::HnswPtr {
             ptr: std::ptr::null_mut(),
         };
-        crate::access_method::hnswsq::ptr::store(
-            std::ptr::null_mut(),
-            &mut hp,
-            e.as_mut() as *mut Element,
-        );
-        loaded.elements.push(e);
+        crate::access_method::hnswsq::ptr::store(std::ptr::null_mut(), &mut hp, eptr);
 
         let items = neighbor_items(na).add((*na).length as usize);
         *items = Candidate {
@@ -470,19 +459,19 @@ pub unsafe fn load_neighbors(
         (*na).length += 1;
     }
 
-    loaded
+    (*na).length as i32
 }
 
 /// `LoadElementsForInsert` (hnswinsert.c): materialize each neighbor's value
 /// and distance; stop at the first element being deleted (returning its
 /// index).
 unsafe fn load_elements_for_insert(
-    loaded: &mut LoadedNeighbors,
+    array: &mut Vec<u8>,
     q: &[f32],
     index: pg_sys::Relation,
     support: &Support,
 ) -> i32 {
-    let na = loaded.header();
+    let na = array.as_mut_ptr().cast::<NeighborArray>();
     for i in 0..(*na).length as usize {
         let hc = &mut *neighbor_items(na).add(i);
         let element =
@@ -523,15 +512,28 @@ unsafe fn get_update_index(
     vec_bytes: usize,
     pair_scratch: &mut Vec<f32>,
     decode: &mut Vec<f32>,
+    na_array: &mut Vec<u8>,
+    na_tids: &mut Vec<pg_sys::ItemPointerData>,
+    na_elements: &mut ElementArena,
 ) -> i32 {
     let mut idx: i32;
 
     // Get latest neighbors since they may have changed. Do not lock yet since
     // selecting neighbors can take time. Could use optimistic locking to
     // retry if another update occurs before getting exclusive lock.
-    let mut loaded = load_neighbors(element, index, m, lm, lc);
+    let len = load_neighbors_into(
+        element,
+        index,
+        m,
+        lm,
+        lc,
+        na_array,
+        na_tids,
+        na_elements,
+    );
+    let na = na_array.as_mut_ptr().cast::<NeighborArray>();
 
-    if (*loaded.header()).length < lm as u32 {
+    if len < 0 || (*na).length < lm as u32 {
         idx = -2;
     } else {
         // q = the target element's value (materialized during the search)
@@ -540,12 +542,12 @@ unsafe fn get_update_index(
         decode.resize(support.codec.dim(), 0.0);
         support.codec.decode_into(q_bytes, decode.as_mut_slice());
 
-        idx = load_elements_for_insert(&mut loaded, decode.as_slice(), index, support);
+        idx = load_elements_for_insert(na_array, decode.as_slice(), index, support);
 
         if idx == -1 {
             update_connection(
                 std::ptr::null_mut(),
-                loaded.header(),
+                na,
                 new_element,
                 distance,
                 lm,
@@ -671,10 +673,13 @@ pub unsafe fn update_neighbors_on_disk(
     e: *mut Element,
     m: usize,
     building: bool,
+    pair_scratch: &mut Vec<f32>,
+    decode: &mut Vec<f32>,
+    na_array: &mut Vec<u8>,
+    na_tids: &mut Vec<pg_sys::ItemPointerData>,
+    na_elements: &mut ElementArena,
 ) {
     let vec_bytes = support.codec.vector_bytes();
-    let mut pair_scratch = vec![0.0f32; support.codec.dim()];
-    let mut decode = vec![0.0f32; support.codec.dim()];
 
     for lc in (0..=(*e).level as usize).rev() {
         let lm = get_layer_m(m, lc);
@@ -694,8 +699,11 @@ pub unsafe fn update_neighbors_on_disk(
                 index,
                 support,
                 vec_bytes,
-                &mut pair_scratch,
-                &mut decode,
+                pair_scratch,
+                decode,
+                na_array,
+                na_tids,
+                na_elements,
             );
 
             // New element was not selected as a neighbor
@@ -716,6 +724,11 @@ unsafe fn update_graph_on_disk(
     m: usize,
     entry_point: Option<&Element>,
     building: bool,
+    pair_scratch: &mut Vec<f32>,
+    decode: &mut Vec<f32>,
+    na_array: &mut Vec<u8>,
+    na_tids: &mut Vec<pg_sys::ItemPointerData>,
+    na_elements: &mut ElementArena,
 ) {
     let mut new_insert_page = pg_sys::InvalidBlockNumber;
 
@@ -742,7 +755,18 @@ unsafe fn update_graph_on_disk(
     }
 
     // Update neighbors
-    update_neighbors_on_disk(index, support, element, m, building);
+    update_neighbors_on_disk(
+        index,
+        support,
+        element,
+        m,
+        building,
+        pair_scratch,
+        decode,
+        na_array,
+        na_tids,
+        na_elements,
+    );
 
     // Update entry point if needed
     if entry_point.is_none() || (*element).level > entry_point.unwrap().level {
@@ -759,6 +783,74 @@ unsafe fn update_graph_on_disk(
 // ---------------------------------------------------------------------------
 // Insert entry points (hnswinsert.c: HnswInsertTupleOnDisk / hnswinsert)
 // ---------------------------------------------------------------------------
+
+/// Backend-local scratch reused across inserts.  A fresh `SearchScratch`
+/// (including its 64 KiB zeroed arena chunk), visited table, decode/pair
+/// buffers, and the neighbor-loading buffers per insert was the dominant
+/// insert cost (the same per-candidate allocation pattern the scan path
+/// fixed with its arena).  Postgres backends are single-threaded, so a
+/// thread-local is safe; the scratch is re-sized when the index's
+/// dim/m/ef_construction differ from the cached one.
+struct InsertScratch {
+    search: SearchScratch,
+    decode: Vec<f32>,
+    pair: Vec<f32>,
+    visited: Visited,
+    na_array: Vec<u8>,
+    na_tids: Vec<pg_sys::ItemPointerData>,
+    na_elements: ElementArena,
+    dim: usize,
+    m: usize,
+    ef: usize,
+}
+
+thread_local! {
+    static INSERT_SCRATCH: std::cell::RefCell<Option<InsertScratch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_insert_scratch(
+    dim: usize,
+    m: usize,
+    ef: usize,
+    f: impl FnOnce(&mut InsertScratch),
+) {
+    INSERT_SCRATCH.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        let needs_init = match opt.as_ref() {
+            None => true,
+            Some(s) => s.dim != dim || s.m != m || s.ef != ef,
+        };
+        if needs_init {
+            let mut s = InsertScratch {
+                search: SearchScratch::new(m),
+                decode: Vec::new(),
+                pair: Vec::new(),
+                visited: Visited::new(ef * m * 2),
+                na_array: Vec::new(),
+                na_tids: Vec::new(),
+                na_elements: ElementArena::new(),
+                dim,
+                m,
+                ef,
+            };
+            s.decode.resize(dim, 0.0);
+            s.pair.resize(dim, 0.0);
+            *opt = Some(s);
+        }
+        let s = opt.as_mut().unwrap();
+        // Reuse the buffers; drop anything the previous insert left behind.
+        s.visited.clear();
+        s.search.unvisited.clear();
+        s.search.tids.clear();
+        s.search.local.clear();
+        s.search.elements.reset();
+        s.na_array.clear();
+        s.na_tids.clear();
+        s.na_elements.reset();
+        f(s);
+    });
+}
 
 /// `HnswInsertTupleOnDisk` (hnswinsert.c): insert one already-encoded vector.
 /// `building` skips WAL (the build's on-disk phase).  `clamped` records
@@ -816,32 +908,45 @@ pub unsafe fn insert_tuple_on_disk(
         entry_locked = true;
     }
 
-    // Find neighbors for element
+    // Find neighbors for element, then update the graph on disk — on the
+    // backend-local scratch (per-insert allocation of the search scratch,
+    // its 64 KiB arena chunk, the visited table, and the neighbor-loading
+    // buffers was the dominant insert cost).
     let ef_construction = get_ef_construction(index);
-    let mut scratch = SearchScratch::new(m);
-    let mut decode = vec![0.0f32; support.codec.dim()];
-    let mut pair_scratch = vec![0.0f32; support.codec.dim()];
-    let mut visited = Visited::new(ef_construction * m * 2);
     let entry_ptr = entry
         .as_deref_mut()
         .map(|e| e as *mut Element);
-    find_element_neighbors(
-        std::ptr::null_mut(),
-        element,
-        entry_ptr,
-        Some(index),
-        support,
-        m,
-        ef_construction,
-        false,
-        &mut scratch,
-        &mut decode,
-        &mut pair_scratch,
-        &mut visited,
-    );
+    with_insert_scratch(support.codec.dim(), m, ef_construction, |s| {
+        find_element_neighbors(
+            std::ptr::null_mut(),
+            element,
+            entry_ptr,
+            Some(index),
+            support,
+            m,
+            ef_construction,
+            false,
+            &mut s.search,
+            &mut s.decode,
+            &mut s.pair,
+            &mut s.visited,
+        );
 
-    // Update graph on disk
-    update_graph_on_disk(index, support, element, m, entry.as_deref(), building);
+        // Update graph on disk
+        update_graph_on_disk(
+            index,
+            support,
+            element,
+            m,
+            entry.as_deref(),
+            building,
+            &mut s.pair,
+            &mut s.decode,
+            &mut s.na_array,
+            &mut s.na_tids,
+            &mut s.na_elements,
+        );
+    });
 
     // Release lock
     pg_sys::UnlockPage(index, UPDATE_LOCK_PAGE, lockmode);

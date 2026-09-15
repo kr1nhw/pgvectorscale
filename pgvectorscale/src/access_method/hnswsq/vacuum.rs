@@ -293,8 +293,25 @@ unsafe fn repair_graph_element(
     pg_sys::GenericXLogFinish(state);
     pg_sys::UnlockReleaseBuffer(buf);
 
-    // Update neighbors
-    update_neighbors_on_disk(index, support, element, m, false);
+    // Update neighbors (vacuum-local scratch: this is per repaired element,
+    // not the per-row insert hot path)
+    let mut pair_scratch = vec![0.0f32; support.codec.dim()];
+    let mut decode = vec![0.0f32; support.codec.dim()];
+    let mut na_array: Vec<u8> = Vec::new();
+    let mut na_tids: Vec<pg_sys::ItemPointerData> = Vec::new();
+    let mut na_elements = ElementArena::new();
+    update_neighbors_on_disk(
+        index,
+        support,
+        element,
+        m,
+        false,
+        &mut pair_scratch,
+        &mut decode,
+        &mut na_array,
+        &mut na_tids,
+        &mut na_elements,
+    );
 }
 
 /// `RepairGraphEntryPoint` (hnswvacuum.c).

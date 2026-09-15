@@ -1077,6 +1077,22 @@ impl ElementArena {
         self.next = ELEMENT_ARENA_CHUNK;
         self.len = 0;
     }
+
+    /// Rewind for reuse: keep one chunk's worth of arena memory and start
+    /// allocating from its beginning again (all previously returned pointers
+    /// are dead).  The insert path calls this per insert instead of
+    /// reallocating a 64 KiB chunk every row.
+    pub fn reset(&mut self) {
+        if self.chunks.is_empty() {
+            // Never allocated: leave the bump positioned so the next alloc
+            // creates the first chunk.
+            self.next = ELEMENT_ARENA_CHUNK;
+        } else {
+            self.chunks.truncate(1);
+            self.next = 0;
+        }
+        self.len = 0;
+    }
 }
 
 impl Drop for ElementArena {

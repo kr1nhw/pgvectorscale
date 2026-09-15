@@ -54,6 +54,35 @@ LWLockRelease 19% / `HnswLoadElementImpl` 17%.
 and `f8` track pgvector within ±1pt over the whole range, `ieeefp8` is ~1pt
 down at low ef and equal or better from ef 160.)
 
+## Settings matrix (build / query latency / insert throughput)
+
+`settings_matrix.sh` on the same box (`items_1m`, m=16, efc=64, mwm 8GB,
+50k fresh inserts per config, batches of 1000, one index at a time):
+
+| config | build_s | size_bytes | qms ef10/40/160/640 (LIMIT 10) | ins rows/s | ins row_ms mean/p50/p99 |
+|---|---|---|---|---|---|
+| pgvector | 107.1 | 873,848,832 | 0.686 / 1.160 / 2.543 / 7.135 | 867 | 1.154 / 1.156 / 1.280 |
+| hnswsq plain | 71.0 | 901,136,384 | 0.644 / 1.122 / 2.429 / 6.511 | 271 | 3.683 / 3.695 / 3.957 |
+| hnswsq ieeefp16 | 294.7 | 589,881,344 | 0.750 / 1.473 / 3.335 / 8.838 | 127 | 7.885 / 8.064 / 8.860 |
+| hnswsq ieeefp8 | 740.9 | 450,805,760 | 1.108 / 2.216 / 5.960 / 16.926 | 81 | 12.402 / 12.275 / 14.643 |
+| hnswsq f8 (sq8) | 134.6 | 469,606,400 | 0.589 / 1.112 / 2.342 / 6.049 | 253 | 3.947 / 3.923 / 4.306 |
+
+Notes:
+
+- Query latency: `plain` and `f8` beat pgvector at ef ≥ 40; `ieeefp8`'s
+  scalar E4M3 decode costs ~2.4x plain across the board.
+- Quantized builds are dominated by the scalar per-dimension decode in the
+  distance kernel (fp16 4.2x, fp8 10.4x the plain build); pgvector has no
+  comparable layout.
+- **Insert caveat**: this box's PostgreSQL is pgrx's debug build
+  (`--enable-cassert -DRANDOMIZE_ALLOCATED_MEMORY=1` — every palloc'd byte
+  is junk-filled), which taxes the port's higher palloc volume.  On a
+  release PostgreSQL (Apple M4 Pro, PG 18 Homebrew, same methodology)
+  inserts measure **pgvector 1.06 ms/row vs hnswsq plain 1.19 ms/row
+  (1.12x)** — at parity.  The per-insert scratch reuse (backend-local
+  arena + visited + buffers) removes the per-row 64 KiB arena calloc and
+  per-neighbor Boxes.
+
 ---
 
 ## History — the retired engine (pre-port, same box)
