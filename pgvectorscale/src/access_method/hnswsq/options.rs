@@ -75,6 +75,30 @@ pub const HNSW_SCAN_MEM_MULTIPLIER: f64 = 1.0;
 /// (tests set it so builds — and recall assertions — are deterministic).
 pub static HNSW_BUILD_SEED: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(-1);
 
+/// SQ8 distance implementation (the smoke-gun A/B switch; see
+/// `smoke.rs`): the scalar decode path, the pairwise-integer form, or the
+/// Lance-style integer dot.
+#[derive(
+    pgrx::PostgresGucEnum, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default,
+)]
+pub enum Sq8DistanceMode {
+    #[default]
+    Scalar,
+    Pairwise,
+}
+
+impl Sq8DistanceMode {
+    pub fn as_i32(self) -> i32 {
+        match self {
+            Sq8DistanceMode::Scalar => 0,
+            Sq8DistanceMode::Pairwise => 1,
+        }
+    }
+}
+
+pub static HNSW_SQ8_DISTANCE: pgrx::GucSetting<Sq8DistanceMode> =
+    pgrx::GucSetting::<Sq8DistanceMode>::new(Sq8DistanceMode::Scalar);
+
 // DO NOT derive Clone for this struct. The storage layout string comes at the
 // end and wouldn't be copied properly.
 #[derive(Debug, PartialEq)]
@@ -207,6 +231,15 @@ pub unsafe fn init() {
         &HNSW_BUILD_SEED,
         -1,
         i32::MAX,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_enum_guc(
+        c"hnswsq.sq8_distance",
+        c"SQ8 distance implementation (scalar, pairwise)",
+        c"The integer forms quantize the query once and compute candidate distances with integer arithmetic (see smoke.rs); the A/B switch for the 1M gate experiment.",
+        &HNSW_SQ8_DISTANCE,
         pgrx::GucContext::Userset,
         pgrx::GucFlags::default(),
     );

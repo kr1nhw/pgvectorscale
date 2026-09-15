@@ -24,7 +24,7 @@ use pgrx::pg_sys;
 use pgrx::*;
 
 use crate::access_method::distance::{self as kernels, DistanceType};
-use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision, Sq8Calibration};
+use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision, Sq8Calibration, Sq8QueryState};
 use crate::access_method::hnswsq::options::Hnsw2Options;
 use crate::access_method::hnswsq::ptr::HnswPtr;
 use crate::access_method::hnswsq::types::*;
@@ -672,6 +672,38 @@ pub unsafe fn load_element_from_tuple(
 /// which is how the search path avoids allocating for non-admitted
 /// candidates.  Returns the materialized element pointer.
 ///
+/// Per-search SQ8 query state: `None` unless the index is SQ8 + L2 and the
+/// `hnswsq.sq8_distance` GUC selects one of the integer forms (see
+/// `smoke.rs`).  The query is quantized once per search; every candidate
+/// distance then uses pure integer arithmetic.
+pub fn sq8_query_state(support: &Support, q: &[f32]) -> Option<Sq8QueryState> {
+    use crate::access_method::hnswsq::options::{HNSW_SQ8_DISTANCE, Sq8DistanceMode};
+    if support.precision != HnswPrecision::Sq8 || support.dist_type != DistanceType::L2 {
+        return None;
+    }
+    match HNSW_SQ8_DISTANCE.get() {
+        Sq8DistanceMode::Scalar => None,
+        Sq8DistanceMode::Pairwise => Some(support.codec.sq8_query_state(q, true)),
+    }
+}
+
+/// Distance from `q` to the encoded `bytes`, using the per-search SQ8 state
+/// when one is present (the scalar codec path otherwise).
+#[inline]
+pub unsafe fn encoded_distance(
+    support: &Support,
+    q: &[f32],
+    bytes: &[u8],
+    qstate: Option<&Sq8QueryState>,
+) -> f32 {
+    match qstate {
+        Some(Sq8QueryState::Pairwise(qhat)) => {
+            support.codec.distance_l2_sq8_pairwise(qhat, bytes) as f32
+        }
+        None => support.distance(q, bytes),
+    }
+}
+
 /// # Safety
 /// Exactly one of `element`/`store` must be Some; the preallocated element
 /// must be caller-owned.
@@ -685,6 +717,7 @@ pub unsafe fn load_element_impl(
     support: &Support,
     load_vec: bool,
     max_distance: Option<f32>,
+    qstate: Option<&Sq8QueryState>,
     element: Option<*mut Element>,
     store: Option<&mut ElementArena>,
 ) -> Option<*mut Element> {
@@ -713,7 +746,7 @@ pub unsafe fn load_element_impl(
                     etup.cast::<u8>().add(ELEMENT_TUPLE_VECTOR_OFFSET),
                     vec_bytes,
                 );
-                support.distance(q, bytes)
+                encoded_distance(support, q, bytes, qstate)
             }
         };
     }
@@ -758,6 +791,7 @@ pub unsafe fn load_element(
     support: &Support,
     load_vec: bool,
     max_distance: Option<f32>,
+    qstate: Option<&Sq8QueryState>,
 ) {
     let _ = load_element_impl(
         (*element).blkno,
@@ -768,6 +802,7 @@ pub unsafe fn load_element(
         support,
         load_vec,
         max_distance,
+        qstate,
         Some(element),
         None,
     );
@@ -824,10 +859,13 @@ pub unsafe fn get_element_distance(
     element: *mut Element,
     q: &[f32],
     support: &Support,
+    qstate: Option<&Sq8QueryState>,
 ) -> f32 {
-    support.distance(
+    encoded_distance(
+        support,
         q,
         get_value(base, element, support.codec.vector_bytes()),
+        qstate,
     )
 }
 
@@ -839,9 +877,10 @@ pub unsafe fn entry_candidate(
     index: Option<pg_sys::Relation>,
     support: &Support,
     load_vec: bool,
+    qstate: Option<&Sq8QueryState>,
 ) -> SearchCandidate {
     let distance = match index {
-        None => get_element_distance(base, entry_point, q.unwrap_or(&[]), support),
+        None => get_element_distance(base, entry_point, q.unwrap_or(&[]), support, qstate),
         Some(index) => {
             let mut distance = 0.0f32;
             load_element(
@@ -852,6 +891,7 @@ pub unsafe fn entry_candidate(
                 support,
                 load_vec,
                 None,
+                qstate,
             );
             distance
         }
@@ -1151,6 +1191,7 @@ pub unsafe fn search_layer(
     init_visited: bool,
     mut tuples: Option<&mut i64>,
     scratch: &mut SearchScratch,
+    qstate: Option<&Sq8QueryState>,
 ) -> Vec<SearchCandidate> {
     let mut w: Vec<SearchCandidate> = Vec::new();
     let mut c: CandidateHeap = CandidateHeap::with_capacity(ef + 1);
@@ -1244,7 +1285,8 @@ pub unsafe fn search_layer(
             match (u, index) {
                 (Unvisited::Element(hp), None) => {
                     e_element = crate::access_method::hnswsq::ptr::access::<Element>(base, hp);
-                    e_distance = get_element_distance(base, e_element, q.unwrap_or(&[]), support);
+                    e_distance =
+                        get_element_distance(base, e_element, q.unwrap_or(&[]), support, qstate);
                     #[cfg(any(test, feature = "pg_test"))]
                     {
                         n_probes += 1;
@@ -1272,6 +1314,7 @@ pub unsafe fn search_layer(
                         support,
                         inserting,
                         max_d,
+                        qstate,
                         None,
                         Some(&mut scratch.elements),
                     ) else {
@@ -1666,6 +1709,10 @@ pub unsafe fn find_element_neighbors(
     pair_scratch.resize(support.codec.dim(), 0.0);
     support.codec.decode_into(value, decode.as_mut_slice());
 
+    // SQ8: quantize the decoded query once; every search distance below is
+    // then pure integer arithmetic (see sq8_query_state).
+    let qstate = sq8_query_state(support, decode.as_slice());
+
     // Precompute hash
     if in_memory {
         precompute_hash(base, element);
@@ -1684,6 +1731,7 @@ pub unsafe fn find_element_neighbors(
         index,
         support,
         true,
+        qstate.as_ref(),
     )];
     let mut entry_level = (*entry_point).level as usize;
 
@@ -1705,6 +1753,7 @@ pub unsafe fn find_element_neighbors(
             true,
             None,
             scratch,
+            qstate.as_ref(),
         );
         ep = w;
     }
@@ -1740,6 +1789,7 @@ pub unsafe fn find_element_neighbors(
             true,
             None,
             scratch,
+            qstate.as_ref(),
         );
 
         // Convert search candidates to candidates

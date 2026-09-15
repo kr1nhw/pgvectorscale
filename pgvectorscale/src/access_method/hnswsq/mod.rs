@@ -262,6 +262,7 @@ fn hnswsq_diag(index: PgRelation) -> String {
                     &support,
                     true,
                     None,
+                    None,
                     Some(&mut *elem),
                     None,
                 );

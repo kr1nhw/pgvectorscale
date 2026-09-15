@@ -39,6 +39,9 @@ pub struct ScanState {
     pub discarded: Option<CandidateHeap>,
     /// Decoded + normalized query; empty = null query (no results).
     pub q: Vec<f32>,
+    /// SQ8 per-query integer distance state (see `sq8_query_state`);
+    /// recomputed in `get_scan_items` from `q`.
+    pub qstate: Option<quantize::Sq8QueryState>,
     pub m: usize,
     pub tuples: i64,
     pub previous_distance: f64,
@@ -87,6 +90,9 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
         Some(state.q.as_slice())
     };
 
+    // SQ8: quantize the query once for the whole scan (see sq8_query_state).
+    state.qstate = q.map(|q| crate::access_method::hnswsq::utils::sq8_query_state(&state.support, q)).flatten();
+
     let mut ep = vec![entry_candidate(
         std::ptr::null_mut(),
         entry_ptr,
@@ -94,6 +100,7 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
         Some(index),
         &state.support,
         load_vec,
+        state.qstate.as_ref(),
     )];
     let entry_level = (*entry_ptr).level as usize;
 
@@ -116,6 +123,7 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
             true,
             None,
             &mut state.scratch,
+            state.qstate.as_ref(),
         );
         ep = w;
     }
@@ -142,6 +150,7 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
         true,
         Some(&mut state.tuples),
         &mut state.scratch,
+        state.qstate.as_ref(),
     );
     if state.discarded.is_some() {
         state.discarded = Some(discarded);
@@ -189,6 +198,7 @@ unsafe fn resume_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> V
         false,
         Some(&mut state.tuples),
         &mut state.scratch,
+        state.qstate.as_ref(),
     )
 }
 
@@ -236,7 +246,36 @@ unsafe fn emit_distance(state: &ScanState, sc: &SearchCandidate) -> f64 {
     let sq8_half_norm = state.support.codec.sq8_scale_norm() / 2.0;
     let e = rel_err * rel_margin * norm_v + sq8_half_norm;
     let slack = 1e-4 * (1.0 + state.norm_q * norm_v);
-    let d = sc.distance;
+
+    // The search distance may come from an integer-distance form
+    // (hnswsq.sq8_distance) whose quantity differs from the operator's
+    // distance over the decoded vector; the lower-bound proof below needs
+    // the true decoded distance, so recompute it per emitted tuple (a scan
+    // emits only ~LIMIT tuples — cheap).
+    let d = match state.support.dist_type {
+        DistanceType::L2 => {
+            let mut acc = 0.0f32;
+            for i in 0..state.support.codec.dim() {
+                let diff = state.q[i] - decoded[i];
+                acc += diff * diff;
+            }
+            acc
+        }
+        DistanceType::Cosine => {
+            let mut dot = 0.0f32;
+            for i in 0..state.support.codec.dim() {
+                dot += state.q[i] * decoded[i];
+            }
+            (1.0 - dot).max(0.0)
+        }
+        DistanceType::InnerProduct => {
+            let mut dot = 0.0f32;
+            for i in 0..state.support.codec.dim() {
+                dot += state.q[i] * decoded[i];
+            }
+            -dot
+        }
+    };
 
     if (*element).clamped != 0 {
         // Encoding saturated components: no finite lower bound is provable.
@@ -294,6 +333,7 @@ pub unsafe extern "C-unwind" fn ambeginscan(
         visited: Visited::new(1000 * m * 2),
         discarded: None,
         q: Vec::new(),
+        qstate: None,
         m,
         tuples: 0,
         previous_distance: f64::NEG_INFINITY,

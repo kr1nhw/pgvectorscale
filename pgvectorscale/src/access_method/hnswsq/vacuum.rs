@@ -344,7 +344,7 @@ unsafe fn repair_graph_entry_point(vac: &mut VacuumState) {
 
         if !highest.is_null() {
             // Load element
-            load_element(highest, None, None, vac.index, &vac.support, true, None);
+            load_element(highest, None, None, vac.index, &vac.support, true, None, None);
 
             // Repair if needed
             if needs_updated(vac, highest) {
@@ -390,6 +390,7 @@ unsafe fn repair_graph_entry_point(vac: &mut VacuumState) {
                 vac.index,
                 &vac.support,
                 true,
+                None,
                 None,
             );
 

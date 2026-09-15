@@ -472,6 +472,9 @@ unsafe fn load_elements_for_insert(
     support: &Support,
 ) -> i32 {
     let na = array.as_mut_ptr().cast::<NeighborArray>();
+    // SQ8: quantize the query once; the neighbor distances below are integer
+    // arithmetic (see sq8_query_state).
+    let qstate = sq8_query_state(support, q);
     for i in 0..(*na).length as usize {
         let hc = &mut *neighbor_items(na).add(i);
         let element =
@@ -485,6 +488,7 @@ unsafe fn load_elements_for_insert(
             support,
             true,
             None,
+            qstate.as_ref(),
         );
         hc.distance = distance;
 

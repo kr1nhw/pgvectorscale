@@ -13,6 +13,7 @@ Keeps the same connection for all queries in a configuration so per-backend
 startup cost does not dominate; `enable_seqscan = off` forces the ANN index.
 """
 import json
+import os
 import statistics
 import subprocess
 import sys
@@ -66,6 +67,12 @@ def scan_stats(plan):
 
 def sweep(ef, limit):
     stmts = ["SET enable_seqscan = off;", f"SET {guc} = {ef};"]
+    # EXTRA_SETS: additional SET statements (e.g. hnswsq.sq8_distance) for
+    # experiment runs.
+    for extra in os.environ.get("EXTRA_SETS", "").split(";"):
+        extra = extra.strip()
+        if extra:
+            stmts.append(f"SET {extra};")
     for qid in range(nq):
         stmts.append(
             f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM {table} "

@@ -70,6 +70,26 @@ down at low ef and equal or better from ef 160.)
 Notes:
 
 - Query latency: `plain` and `f8` beat pgvector at ef ≥ 40.
+- **SQ8 integer pairwise distance (user proposal, gated)**: the query is
+  quantized once into code space (`hnswsq.sq8_distance = pairwise`, default
+  stays `scalar`) and every candidate distance is `SUM (qhat - code)^2` in
+  pure i32 — no decode, no scale terms, robust at any data scale.  Local
+  gate (120k x 128, release PG, fresh index per variant):
+
+  | variant | build s | query ms ef160/ef640 | recall@10 ef160/ef640 |
+  |---|---|---|---|
+  | scalar | 17.4 | 1.78 / 6.07 | 0.735 / 1.0 |
+  | pairwise | **6.1 (2.85x)** | **1.25 / 4.28 (1.42x)** | 0.729 / 1.0 |
+
+  The emission path recomputes the decoded distance per emitted tuple for
+  the lower-bound proof (the integer distance is a different quantity).
+  The Lance-style dot variant was prototyped but NOT committed: its
+  on-the-fly `scale^2` weight quantization underflows on small-scale data
+  (recall 0.08 on [0,1] data); the fix is storing the per-vector norm
+  (4-byte on-disk format change) — documented in smoke.rs.  The 1M BIGANN
+  confirmation of the pairwise variant is pending (box unreachable at
+  commit time; run the settings-matrix A/B with
+  `SET hnswsq.sq8_distance = pairwise`).
 - **Fixed (order-preserving bit-math conversions)**: the stored patterns are
   ORDER-preserving, so the per-element IEEE decode (branchy `f16::to_f32`
   and a `log2`+`powi` E4M3 encode) was replaced with branchless bit moves —

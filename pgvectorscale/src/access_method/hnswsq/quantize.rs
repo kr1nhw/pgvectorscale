@@ -54,6 +54,13 @@ pub enum HnswPrecision {
     IeeeFp8 = 3,
 }
 
+/// Per-query SQ8 distance state (see [`Codec::sq8_query_state`]).
+pub enum Sq8QueryState {
+    /// The pairwise form: `qhat = round((q - min) * inv_scale)`, and
+    /// `d = SUM (qhat - code)^2`.
+    Pairwise(Vec<i16>),
+}
+
 impl HnswPrecision {
     pub fn from_u8(value: u8) -> Self {
         match value {
@@ -239,6 +246,7 @@ impl Codec {
             // else: degenerate constant dimension → inv_scale 0 → q = 0 →
             // decode to mins[d].
         }
+
         Self {
             precision: HnswPrecision::Sq8,
             dim,
@@ -357,6 +365,39 @@ impl Codec {
         self.decode_into(bytes, &mut out);
         out
     }
+
+    // -----------------------------------------------------------------------
+    // SQ8 integer distances (the smoke-gun winners; see smoke.rs)
+    // -----------------------------------------------------------------------
+
+    /// Build the per-query state for the integer pairwise distance: the query
+    /// is quantized ONCE into code space; every candidate distance is then
+    /// pure integer arithmetic.
+    pub fn sq8_query_state(&self, q: &[f32], _pairwise: bool) -> Sq8QueryState {
+        debug_assert_eq!(self.precision, HnswPrecision::Sq8);
+        let mut qhat = Vec::with_capacity(self.dim);
+        for i in 0..self.dim {
+            let s = (q[i] - self.sq8_mins[i]) * self.sq8_inv_scales[i];
+            qhat.push(s.round().clamp(0.0, 255.0) as i16);
+        }
+        Sq8QueryState::Pairwise(qhat)
+    }
+
+    /// The pairwise form: `SUM (qhat - code)^2` in i32 (ordering is exact;
+    /// the caller widens to f32 for the heaps).
+    #[inline]
+    pub fn distance_l2_sq8_pairwise(&self, qhat: &[i16], bytes: &[u8]) -> i32 {
+        debug_assert_eq!(qhat.len(), self.dim);
+        debug_assert_eq!(bytes.len(), self.dim);
+        let mut acc = 0i32;
+        for i in 0..self.dim {
+            let d = qhat[i] - bytes[i] as i16;
+            acc += d as i32 * d as i32;
+        }
+        acc
+    }
+
+
 
     /// Compute `distance(query, bytes)` directly over the encoded byte
     /// representation, without the decode-into-scratch copy.  Matches the
