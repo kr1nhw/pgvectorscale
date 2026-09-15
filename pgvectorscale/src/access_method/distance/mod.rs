@@ -116,6 +116,72 @@ pub fn distance_l2_unoptimized(a: &[f32], b: &[f32]) -> f32 {
     norm
 }
 
+// ---------------------------------------------------------------------------
+// Distances against fp16 (binary16) stored vectors.  The binary16 bit pattern
+// is ORDER-preserving, so f16 -> f32 is field moves on the pattern (no IEEE
+// decode machinery); the accumulation is the same SIMD FMA as the f32 kernels.
+// ---------------------------------------------------------------------------
+
+/// Branchless f16 -> f32: the normal case is a few integer ops; subnormals and
+/// inf/nan take the exact slow path (essentially never on real data).
+#[inline]
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h as u32 & 0x8000) << 16;
+    let abs = h as u32 & 0x7FFF;
+    let exp = abs >> 10;
+    if exp == 0 || exp == 31 {
+        // subnormal / inf / nan
+        return half::f16::from_bits(h).to_f32();
+    }
+    // exp - 15 + 127 = exp + 112
+    f32::from_bits(sign | ((exp + 112) << 23) | ((abs & 0x3FF) << 13))
+}
+
+/// L2 squared between the f32 query and an f16 vector (little-endian bytes).
+#[inline]
+pub fn distance_l2_f16(q: &[f32], v: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_f16_x86(q, v);
+    }
+    #[allow(unreachable_code)]
+    distance_l2_f16_scalar(q, v)
+}
+
+/// Dot product between the f32 query and an f16 vector (little-endian bytes).
+#[inline]
+pub fn distance_inner_product_f16(q: &[f32], v: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_inner_product_f16_x86(q, v);
+    }
+    #[allow(unreachable_code)]
+    distance_inner_product_f16_scalar(q, v)
+}
+
+#[inline]
+pub fn distance_l2_f16_scalar(q: &[f32], v: &[u8]) -> f32 {
+    debug_assert_eq!(q.len() * 2, v.len());
+    let mut acc = 0.0f32;
+    for i in 0..q.len() {
+        let x = f16_to_f32(u16::from_le_bytes([v[2 * i], v[2 * i + 1]]));
+        let d = q[i] - x;
+        acc += d * d;
+    }
+    acc
+}
+
+#[inline]
+pub fn distance_inner_product_f16_scalar(q: &[f32], v: &[u8]) -> f32 {
+    debug_assert_eq!(q.len() * 2, v.len());
+    let mut acc = 0.0f32;
+    for i in 0..q.len() {
+        let x = f16_to_f32(u16::from_le_bytes([v[2 * i], v[2 * i + 1]]));
+        acc += q[i] * x;
+    }
+    acc
+}
+
 /* PQ computes distances on subsegments that have few dimensions (e.g. 6). This function optimizes that.
 * We optimize by telling the compiler exactly how long the slices are. This allows the compiler to figure
 * out SIMD optimizations. Look at the benchmark results. */

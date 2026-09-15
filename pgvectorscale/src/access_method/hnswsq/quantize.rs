@@ -288,7 +288,8 @@ impl Codec {
                     if x.abs() > FP16_MAX {
                         clamped = true;
                     }
-                    out.extend_from_slice(&f16::from_f32(x.clamp(-FP16_MAX, FP16_MAX)).to_le_bytes());
+                    let x = x.clamp(-FP16_MAX, FP16_MAX);
+                    out.extend_from_slice(&f32_to_f16(x).to_le_bytes());
                 }
             }
             HnswPrecision::IeeeFp8 => {
@@ -332,7 +333,9 @@ impl Codec {
             }
             HnswPrecision::IeeeFp16 => {
                 for (d, chunk) in bytes.chunks_exact(2).enumerate() {
-                    out[d] = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+                    out[d] = crate::access_method::distance::f16_to_f32(u16::from_le_bytes([
+                        chunk[0], chunk[1],
+                    ]));
                 }
             }
             HnswPrecision::IeeeFp8 => {
@@ -434,21 +437,15 @@ impl Codec {
                     }
                 }
             }
-            HnswPrecision::IeeeFp16 => match dist_type {
-                DistanceType::L2 => {
-                    for i in 0..dim {
-                        let x = f16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]).to_f32();
-                        let d = query[i] - x;
-                        acc += d * d;
-                    }
-                }
-                _ => {
-                    for i in 0..dim {
-                        let x = f16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]).to_f32();
-                        acc += query[i] * x;
-                    }
-                }
-            },
+            HnswPrecision::IeeeFp16 => {
+                // The stored pattern is order-preserving: convert with bit
+                // moves (vectorized in the kernels), not per-element IEEE
+                // decode.  Cosine/IP share the dot-product kernel.
+                return match dist_type {
+                    DistanceType::L2 => kernels::distance_l2_f16(query, bytes),
+                    _ => finish(kernels::distance_inner_product_f16(query, bytes), dist_type),
+                };
+            }
             HnswPrecision::IeeeFp8 => match dist_type {
                 DistanceType::L2 => {
                     for i in 0..dim {
@@ -532,54 +529,100 @@ fn round_half_even(t: f32) -> u32 {
     (f + if up { 1.0 } else { 0.0 }) as u32
 }
 
-/// Encode a finite, pre-clamped (|x| <= 448) f32 as an E4M3 byte.
+/// Encode a finite, pre-clamped (|x| <= 65504) f32 as a binary16.  The f16
+/// pattern is order-preserving, so the normal case is bit moves (round the
+/// 13 dropped fraction bits to nearest-even; a mantissa carry propagates
+/// into the exponent field through bit 10).  Values in the f16 subnormal
+/// range take the exact slow path.
+#[inline]
+pub fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = (bits >> 23) & 0xFF;
+    let mant = bits & 0x7FFFFF;
+    if !(113..=142).contains(&exp) {
+        // f16 subnormal range (|x| < 2^-14) or zero — exact slow path
+        return half::f16::from_f32(x).to_bits();
+    }
+    let kept = (mant >> 13) & 0x3FF;
+    let rest = mant & 0x1FFF;
+    let round_up = (rest > 0x1000) || (rest == 0x1000 && (kept & 1) == 1);
+    let m = kept + round_up as u32; // 0..=0x400; the carry hits exponent bit 10
+    sign | (((exp - 112) as u16) << 10) | (m as u16)
+}
+
+/// Encode a finite, pre-clamped (|x| <= 448) f32 as an E4M3 byte.  The E4M3
+/// pattern is order-preserving, so the encode is bit moves on the f32 fields
+/// (no log2/powi); subnormals take the slow path.
 pub fn f32_to_e4m3(x: f32) -> u8 {
     if x == 0.0 {
         // Preserve -0.0 (harmless; keeps the sign bit semantics of the format).
         return if x.is_sign_negative() { 0x80 } else { 0x00 };
     }
-    let sign: u8 = if x < 0.0 { 1 } else { 0 };
-    let a = x.abs().min(FP8_E4M3_MAX);
+    let bits = x.to_bits();
+    let sign = ((bits >> 24) & 0x80) as u8;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7FFFFF;
+    let e = exp - 127;
 
-    // Binade from log2; an off-by-one floor is self-correcting because the
-    // mantissa quotient then hits q = 16 and re-promotes to the next binade.
-    let mut e = a.log2().floor() as i32;
     if e < -6 {
         // Subnormal: value = q * 2^-9, q in 0..=8 (q = 8 is the minimal
         // normal 2^-6, whose encoding 0b0000_1000 is contiguous).
+        let a = x.abs();
         let q = round_half_even(a * 512.0);
-        return (sign << 7) | q.min(8) as u8;
+        return sign | (q.min(8) as u8);
     }
-    // Normal: value = q * 2^(e-3), q in 8..=15 (16 promotes).
-    let step = 2f64.powi(e - 3) as f32; // exact power of two
-    let mut q = round_half_even(a / step);
-    if q >= 16 {
-        e += 1;
-        q = 8;
+
+    // Normal: value = (1 + m/8) * 2^e; the E4M3 exponent field is e + 7 and
+    // the mantissa keeps 3 of the 23 fraction bits (round-to-nearest-even).
+    let m3_top = ((mant >> 20) & 0x7) as i32;
+    let rest = mant & 0xFFFFF;
+    let round_up = (rest > 0x80000) || (rest == 0x80000 && (m3_top & 1) == 1);
+    let mut m3 = m3_top + round_up as i32; // 0..=8
+    let mut ef = e + 7; // 1..=15
+    if m3 == 8 {
+        // Rounded up into the next binade: 1 + 8/8 = 2
+        m3 = 0;
+        ef += 1;
     }
-    if e > 8 {
-        // Saturate to max finite (only reachable via rounding at the top).
-        return (sign << 7) | 0x7E;
+    if ef > 15 || (ef == 15 && m3 >= 7) {
+        // Saturate to max finite 0x7E (the caller pre-clamps; only reachable
+        // via rounding at the top of the range).
+        return sign | 0x7E;
     }
-    let exp_field = (e + 7) as u8; // bias 7
-    (sign << 7) | (exp_field << 3) | (q - 8) as u8
+    sign | ((ef as u8) << 3) | (m3 as u8)
 }
 
 /// Decode an E4M3 byte to f32.  The NaN encoding (0x7F/0xFF) decodes to 0.0
 /// defensively: our encoder never produces it (inputs are sanitized finite),
 /// and a finite fallback keeps distances well-defined on corrupted data.
+/// E4M3 (OCP FP8) -> f32.  The E4M3 pattern is order-preserving too, so the
+/// normal case is bit moves (sign / exp+bias / mantissa fields); subnormals
+/// and the NaN encoding take the exact slow path.
+/// Defensively, the NaN encoding returns 0.0: our encoder never produces it
+/// (inputs are sanitized), and a finite fallback keeps distances
+/// well-defined on corrupted data.
+#[inline]
 pub fn e4m3_to_f32(b: u8) -> f32 {
-    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
-    let exp = ((b >> 3) & 0xF) as i32;
-    let man = (b & 0x7) as i32;
-    let v = if exp == 0 {
-        man as f32 * 2.0f32.powi(-9) // subnormal (0x00/0x80 → ±0)
-    } else if exp == 0xF && man == 7 {
-        return 0.0; // NaN encoding → defensive 0
-    } else {
-        (8 + man) as f32 * 2.0f32.powi(exp - 10)
-    };
-    sign * v
+    let bits = b as u32;
+    let sign = (bits & 0x80) << 24;
+    let exp = (bits >> 3) & 0xF;
+    let man = bits & 0x7;
+    if exp == 0 || (exp == 0xF && man == 7) {
+        // subnormal (0x00/0x80 -> ±0) or NaN encoding -> defensive 0
+        return if exp == 0 {
+            let v = man as f32 * 2.0f32.powi(-9);
+            if sign == 0 {
+                v
+            } else {
+                -v
+            }
+        } else {
+            0.0
+        };
+    }
+    // normal: (1 + man/8) * 2^(exp - 7) -> f32 exp field = exp + 120
+    f32::from_bits(sign | ((exp + 120) << 23) | (man << 20))
 }
 
 #[cfg(test)]

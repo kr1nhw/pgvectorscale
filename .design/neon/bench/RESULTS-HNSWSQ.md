@@ -69,11 +69,22 @@ down at low ef and equal or better from ef 160.)
 
 Notes:
 
-- Query latency: `plain` and `f8` beat pgvector at ef ≥ 40; `ieeefp8`'s
-  scalar E4M3 decode costs ~2.4x plain across the board.
-- Quantized builds are dominated by the scalar per-dimension decode in the
-  distance kernel (fp16 4.2x, fp8 10.4x the plain build); pgvector has no
-  comparable layout.
+- Query latency: `plain` and `f8` beat pgvector at ef ≥ 40.
+- **Fixed (order-preserving bit-math conversions)**: the stored patterns are
+  ORDER-preserving, so the per-element IEEE decode (branchy `f16::to_f32`
+  and a `log2`+`powi` E4M3 encode) was replaced with branchless bit moves —
+  vectorized (integer SIMD, plus a runtime F16C `vcvtph2ps` path on x86) in
+  `distance_x86.rs`.  Re-measured on the same box (1.6M rows):
+
+  | metric | plain | fp16 before -> after | fp8 before -> after |
+  |---|---|---|---|
+  | build (s) | 101 | 295 -> **155** (1.53x) | 741 -> **282** (2.8x) |
+  | query ef640 (ms) | 6.5 | 8.8 -> **6.0** (parity) | 16.9 -> – |
+  | inserts (rps) | 271 | 127 -> **262** (parity) | 81 -> – |
+
+  fp16's halved memory traffic now shows up as advertised: queries and
+  inserts at parity with plain at half the index size; the build keeps a
+  1.5x factor from the conversion uop and the quantized graph's structure.
 - **Insert caveat**: this box's PostgreSQL is pgrx's debug build
   (`--enable-cassert -DRANDOMIZE_ALLOCATED_MEMORY=1` — every palloc'd byte
   is junk-filled), which taxes the port's higher palloc volume.  On a
