@@ -12,6 +12,8 @@ pub mod options;
 pub mod ptr;
 pub mod quantize;
 pub mod scan;
+#[cfg(test)]
+mod smoke;
 pub mod types;
 pub mod utils;
 pub mod vacuum;
