@@ -47,11 +47,16 @@ Findings:
   open item; `plain` hnswsq built in 71s on the debug box vs pgvector's
   107s there.
 
-## Re-run 2026-09-15: the ported engine (this repo's Rust hnswsq)
+## Re-run 2026-09-15 (measured on the box's pgrx DEBUG PostgreSQL — superseded)
+
+> **Superseded for absolute numbers.** This section was measured on the
+> box's pgrx DEBUG PostgreSQL (`RANDOMIZE_ALLOCATED_MEMORY`), which taxes
+> palloc-heavy code.  The **Release-PostgreSQL re-run** (top section) and
+> the **Settings matrix** below are the current reference numbers; the
+> claims made here are corrected next to each table.
 
 Run with `.design/neon/bench/gap_study.sh` after syncing this repo to the box
-and installing the release build (see `RE-RUN-121.md`). The numbers below
-**replace** everything under "History" for the port.
+and installing the release build (see `RE-RUN-121.md`).
 
 ### Build + size (1M rows)
 
@@ -62,9 +67,11 @@ and installing the release build (see `RE-RUN-121.md`). The numbers below
 | pgvector hnsw | 1 | 446 | 831,995,904 | 832 |
 | pgvector hnsw | 32 | 64 | 832,184,320 | 832 |
 
-The port's parallel build lands at 59s — 1.7x faster than pgvector at the same
-worker count and 7.6x faster than pgvector single-backend. Index is 1.6%
-smaller than pgvector's.
+(Debug-PG numbers; both engines were palloc-taxed here, pgvector more so.)
+On release PG the same comparison is **parity**: hnswsq plain 67.4s vs
+pgvector 66.1s (Settings matrix), and the plain index is ~3% LARGER than
+pgvector's under the pinned seed (858 vs 831 B/vec).  The 59s figure above
+reflects this box's debug build, not a release advantage.
 
 ### Query sweep (mean ms per query, 100 queries, warm)
 
@@ -75,8 +82,11 @@ smaller than pgvector's.
 | 160 | 2.445 | 2.781 | 2.491 | 2.858 | **0.98x** |
 | 640 | 6.609 | 7.405 | 6.982 | 7.948 | **0.95x** |
 
-At ef ≥ 160 the port is faster than pgvector; the ef=10 gap is the fixed
-per-scan pgrx FFI overhead. Perf profiles (in `/tmp/gap_study.log`) show both
+(Debug-PG numbers. On release PG the sweep is at parity at every ef —
+hnswsq plain 0.586/1.028/2.311/6.353 vs pgvector 0.597/1.003/2.244/6.499 ms,
+see the Settings matrix; the "faster at ef ≥ 160" claim above does not hold
+on release PG. The per-scan pgrx FFI overhead at ef=10 was likewise part of
+the debug tax.) Perf profiles (in `/tmp/gap_study.log`) show both
 engines buffer-manager-bound: hnswsq's top symbols are PinBuffer 25% /
 `load_element_impl` 21% / LWLockRelease 19%; pgvector's are PinBuffer 23% /
 LWLockRelease 19% / `HnswLoadElementImpl` 17%.
@@ -95,7 +105,9 @@ LWLockRelease 19% / `HnswLoadElementImpl` 17%.
 
 (reproducible via `.design/neon/bench/recall_sweep.sh`; `plain`, `ieeefp16`
 and `f8` track pgvector within ±1pt over the whole range, `ieeefp8` is ~1pt
-down at low ef and equal or better from ef 160.)
+down at low ef and equal or better from ef 160.  The `f8` column was
+measured with the scalar distance; the weighted-pairwise default
+reproduces it exactly — 0.991/1.0 at ef 160/640 on release PG.)
 
 ## Settings matrix (build / query latency / insert throughput)
 
@@ -103,7 +115,8 @@ Measured on the **release PostgreSQL 17.11** cluster on the same box
 (port 54331; see the "Release-PostgreSQL re-run" section below for how
 it was built), `items_1m`, m=16, efc=64, mwm 8GB, 4 workers, 50k fresh
 inserts per config (batches of 1000, one index at a time), current code
-(bit-math fp conversions + pairwise option left at its `scalar` default):
+(bit-math fp conversions; f8 measured with the weighted-pairwise default,
+pgvector and the other layouts unaffected):
 
 | config | build s | size_bytes | qms ef10/40/160/640 (LIMIT 10) | ins rows/s | ins row_ms mean/p50/p99 |
 |---|---|---|---|---|---|
