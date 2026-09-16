@@ -198,6 +198,19 @@ pub mod tests {
     }
 
     #[pg_test]
+    fn test_hnswsq_recall_sq8_fixed_l2() {
+        // Training-free fixed-range int8; the test data lies in ±1 so the
+        // global range costs nothing vs the calibrated f8.
+        recall_case("vector_l2_ops", "<->", "storage_layout = sq8", 0.85);
+    }
+
+    #[pg_test]
+    fn test_hnswsq_recall_sq16_l2() {
+        // Training-free fixed-range int16: near-plain precision.
+        recall_case("vector_l2_ops", "<->", "storage_layout = sq16", 0.9);
+    }
+
+    #[pg_test]
     fn test_hnswsq_recall_plain_cosine() {
         recall_case("vector_cosine_ops", "<=>", "storage_layout = plain", 0.9);
     }
@@ -205,11 +218,6 @@ pub mod tests {
     #[pg_test]
     fn test_hnswsq_recall_ieeefp16_ip() {
         recall_case("vector_ip_ops", "<#>", "storage_layout = ieeefp16", 0.85);
-    }
-
-    #[pg_test]
-    fn test_hnswsq_recall_sq8_alias_name() {
-        recall_case("vector_l2_ops", "<->", "storage_layout = sq8", 0.85);
     }
 
     // ---------------- gate 2: incremental empty-start ----------------
@@ -266,6 +274,17 @@ pub mod tests {
         // Empty-start SQ8 gets a provisional [-1, 1] calibration; the probes
         // are unit vectors so they stay in range.
         incremental_case("f8");
+    }
+
+    #[pg_test]
+    fn test_hnswsq_incremental_empty_start_sq8_fixed() {
+        // Training-free fixed-range int8: no calibration chain at all.
+        incremental_case("sq8");
+    }
+
+    #[pg_test]
+    fn test_hnswsq_incremental_empty_start_sq16() {
+        incremental_case("sq16");
     }
 
     // ---------------- gate 2: transaction rollback ----------------
@@ -498,6 +517,16 @@ pub mod tests {
     #[test]
     fn hnswsq_vacuum_lifecycle_ieeefp8() {
         vacuum_lifecycle_scaffold("ieeefp8");
+    }
+
+    #[test]
+    fn hnswsq_vacuum_lifecycle_sq8_fixed() {
+        vacuum_lifecycle_scaffold("sq8");
+    }
+
+    #[test]
+    fn hnswsq_vacuum_lifecycle_sq16() {
+        vacuum_lifecycle_scaffold("sq16");
     }
 
     #[cfg(test)]
@@ -808,7 +837,7 @@ pub mod tests {
     }
 
     #[pg_test]
-    fn test_hnswsq_sq8_out_of_range_clamps() {
+    fn test_hnswsq_f8_out_of_range_clamps() {
         let (rows, _q) = gen_clustered(4, 50, 16, 0.05, 1618);
         Spi::run("CREATE TABLE hs_o(id serial primary key, embedding vector(16));").unwrap();
         insert_rows("hs_o", &rows).unwrap();
@@ -834,12 +863,52 @@ pub mod tests {
     }
 
     #[pg_test]
+    fn test_hnswsq_sq_fixed_out_of_range_clamps() {
+        // Fixed-range layouts clamp to ±1 per dimension; out-of-range
+        // vectors still insert and answer queries (no lower-bound proof,
+        // but the graph must stay usable).
+        for layout in ["sq8", "sq16"] {
+            let (rows, _q) = gen_clustered(4, 50, 16, 0.05, 1618);
+            Spi::run(&format!(
+                "CREATE TABLE hs_of_{layout}(id serial primary key, embedding vector(16));"
+            ))
+            .unwrap();
+            insert_rows(&format!("hs_of_{layout}"), &rows).unwrap();
+            Spi::run(&format!(
+                "CREATE INDEX hs_of_idx_{layout} ON hs_of_{layout} USING hnswsq \
+                 (embedding vector_l2_ops) WITH (storage_layout = {layout});
+                 SET enable_seqscan = off;"
+            ))
+            .unwrap();
+            let big: Vec<f32> = (0..16).map(|_| 7.5).collect();
+            Spi::run(&format!(
+                "INSERT INTO hs_of_{layout}(embedding) VALUES ('{}');",
+                vec_literal(&big)
+            ))
+            .unwrap();
+            let n: i64 = Spi::get_one::<i64>(&format!(
+                "SELECT count(*) FROM (SELECT id FROM hs_of_{layout} \
+                 ORDER BY embedding <-> '{}' LIMIT 5) x",
+                vec_literal(&big)
+            ))
+            .unwrap()
+            .unwrap_or(0);
+            assert_eq!(n, 5, "layout {layout}");
+        }
+    }
+
+    #[pg_test]
     fn test_hnswsq_recall_index_size_ratios() {
-        // Same data, four layouts: f16 < plain and fp8/sq8 < f16 (neighbor
-        // lists are the shared floor, so assert a strict decrease).
+        // Same data, six layouts: f16/sq16 < plain and fp8/sq8/f8 < f16
+        // (neighbor lists are the shared floor, so assert a strict decrease
+        // for the 1-byte layouts; sq16 shares f16's 2-byte width so it must
+        // not exceed it).
         let (rows, _queries) = gen_clustered(20, 50, 128, 0.05, 777);
         let mut sizes = Vec::new();
-        for (i, layout) in ["plain", "ieeefp16", "ieeefp8", "f8"].iter().enumerate() {
+        for (i, layout) in ["plain", "ieeefp16", "ieeefp8", "f8", "sq8", "sq16"]
+            .iter()
+            .enumerate()
+        {
             Spi::run(&format!(
                 "CREATE TABLE hs_sz{i}(id serial primary key, embedding vector(128));"
             ))
@@ -864,10 +933,25 @@ pub mod tests {
             sizes[0]
         );
         assert!(
-            sizes[2] < sizes[1] && sizes[3] < sizes[1],
-            "fp8 ({}) / sq8 ({}) should be smaller than f16 ({})",
+            sizes[2] < sizes[1] && sizes[3] < sizes[1] && sizes[4] < sizes[1],
+            "fp8 ({}) / f8 ({}) / sq8 ({}) should be smaller than f16 ({})",
             sizes[2],
             sizes[3],
+            sizes[4],
+            sizes[1]
+        );
+        // sq16 is 2 bytes/dim like f16: same size class, never larger.
+        assert!(
+            sizes[5] <= sizes[1],
+            "sq16 ({}) should not exceed f16 ({})",
+            sizes[5],
+            sizes[1]
+        );
+        // And the fixed sq8 lands in the same 1-byte class as f8/fp8.
+        assert!(
+            sizes[4] < sizes[1],
+            "sq8 ({}) should be smaller than f16 ({})",
+            sizes[4],
             sizes[1]
         );
     }

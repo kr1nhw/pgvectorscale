@@ -195,6 +195,59 @@ pub fn distance_l2_sq8_pairwise_scalar(qhat: &[i16], code: &[u8], w: &[f32]) -> 
     acc
 }
 
+/// Fixed-range (training-free) `sq8` pairwise: `SUM (qhat - code)^2` over the
+/// int8 codes, pure i32 integer accumulation.  Safe up to the 16000-dim
+/// limit: `16000 * 254^2 ≈ 1.03e9 < i32::MAX`.  The quantization step is one
+/// global constant, so this is the decoded-domain L2 of the quantized query
+/// times `127^2` — the stored-code side is exact.
+#[inline]
+pub fn distance_l2_sq8_fixed_pairwise(qhat: &[i16], code: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_sq8_fixed_pairwise_x86(qhat, code);
+    }
+    #[allow(unreachable_code)]
+    distance_l2_sq8_fixed_pairwise_scalar(qhat, code)
+}
+
+#[inline]
+pub fn distance_l2_sq8_fixed_pairwise_scalar(qhat: &[i16], code: &[u8]) -> f32 {
+    debug_assert_eq!(qhat.len(), code.len());
+    let mut acc = 0i32;
+    for i in 0..qhat.len() {
+        // Fixed sq8 codes are signed two's complement bytes.
+        let d = qhat[i] as i32 - code[i] as i8 as i32;
+        acc += d * d;
+    }
+    acc as f32
+}
+
+/// Fixed-range (training-free) `sq16` pairwise: `SUM (qhat - code)^2` over
+/// the int16 codes, i64 accumulation (per-dimension differences up to 65534
+/// square past i32).  Equals the decoded-domain L2 of the quantized query
+/// times `32767^2`.
+#[inline]
+pub fn distance_l2_sq16_fixed_pairwise(qhat: &[i16], code: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_sq16_fixed_pairwise_x86(qhat, code);
+    }
+    #[allow(unreachable_code)]
+    distance_l2_sq16_fixed_pairwise_scalar(qhat, code)
+}
+
+#[inline]
+pub fn distance_l2_sq16_fixed_pairwise_scalar(qhat: &[i16], code: &[u8]) -> f32 {
+    debug_assert_eq!(qhat.len() * 2, code.len());
+    let mut acc = 0i64;
+    for i in 0..qhat.len() {
+        let c = i16::from_le_bytes([code[2 * i], code[2 * i + 1]]);
+        let d = qhat[i] as i64 - c as i64;
+        acc += d * d;
+    }
+    acc as f32
+}
+
 #[inline]
 pub fn distance_inner_product_f16_scalar(q: &[f32], v: &[u8]) -> f32 {
     debug_assert_eq!(q.len() * 2, v.len());

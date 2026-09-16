@@ -253,6 +253,95 @@ unsafe fn horizontal_sum_8(acc: core::arch::x86_64::__m256) -> f32 {
     _mm_cvtss_f32(sum)
 }
 
+/// Sum the 8 i32 lanes of an AVX register.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn horizontal_sum_8_epi32(acc: core::arch::x86_64::__m256i) -> i32 {
+    use core::arch::x86_64::*;
+    let lo = _mm256_castsi256_si128(acc);
+    let hi = _mm256_extracti128_si256(acc, 1);
+    let sum = _mm_add_epi32(lo, hi);
+    let sum = _mm_hadd_epi32(sum, sum);
+    let sum = _mm_hadd_epi32(sum, sum);
+    _mm_cvtsi128_si32(sum)
+}
+
+/// Fixed-range `sq8` pairwise: `SUM (qhat - code)^2`, 8 integer lanes/step,
+/// i32 accumulation (the 16000-dim worst case is ~1.03e9, no overflow).
+#[target_feature(enable = "avx2")]
+pub unsafe fn distance_l2_sq8_fixed_pairwise_x86(qhat: &[i16], code: &[u8]) -> f32 {
+    use core::arch::x86_64::*;
+
+    let n = qhat.len();
+    debug_assert_eq!(n, code.len());
+    let mut acc = _mm256_setzero_si256();
+    let mut i = 0;
+    while i + 8 <= n {
+        let qh = _mm_loadu_si128(qhat.as_ptr().add(i).cast()); // 8 x i16
+        let qh32 = _mm256_cvtepi16_epi32(qh);
+        let c = _mm_cvtsi64_si128(u64::from_le_bytes([
+            code[i],
+            code[i + 1],
+            code[i + 2],
+            code[i + 3],
+            code[i + 4],
+            code[i + 5],
+            code[i + 6],
+            code[i + 7],
+        ]) as i64);
+        // Fixed sq8 codes are SIGNED two's complement bytes (unlike the
+        // calibrated f8's 0..255), so widen sign-extending.
+        let c32 = _mm256_cvtepi8_epi32(c);
+        let d = _mm256_sub_epi32(qh32, c32);
+        acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(d, d));
+        i += 8;
+    }
+    let mut total = horizontal_sum_8_epi32(acc) as i64;
+    while i < n {
+        let d = qhat[i] as i32 - code[i] as i8 as i32;
+        total += (d * d) as i64;
+        i += 1;
+    }
+    total as f32
+}
+
+/// Fixed-range `sq16` pairwise: `SUM (qhat - code)^2`, 4 lanes/step with
+/// widening i64 squares (differences up to 65534 square past i32).
+#[target_feature(enable = "avx2")]
+pub unsafe fn distance_l2_sq16_fixed_pairwise_x86(qhat: &[i16], code: &[u8]) -> f32 {
+    use core::arch::x86_64::*;
+
+    let n = qhat.len();
+    debug_assert_eq!(n * 2, code.len());
+    let mut acc = _mm256_setzero_si256(); // 4 x i64
+    let mut i = 0;
+    while i + 4 <= n {
+        let qh = _mm_loadl_epi64(qhat.as_ptr().add(i).cast()); // 4 x i16
+        let qh32 = _mm256_cvtepi16_epi32(qh);
+        let qh64 = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(qh32));
+        // 4 codes: load the 8 bytes as __m128i and widen i16 -> i32 -> i64
+        // (each code gets its own lane).
+        let c = _mm_loadl_epi64(code.as_ptr().add(2 * i).cast()); // 4 x i16
+        let c32 = _mm256_cvtepi16_epi32(c);
+        let c64 = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(c32));
+        let d = _mm256_sub_epi64(qh64, c64);
+        acc = _mm256_add_epi64(acc, _mm256_mul_epi32(d, d));
+        i += 4;
+    }
+    // Horizontal i64 sum.
+    let lo = _mm256_castsi256_si128(acc);
+    let hi = _mm256_extracti128_si256(acc, 1);
+    let sum = _mm_add_epi64(lo, hi);
+    let mut total = _mm_cvtsi128_si64(sum) + _mm_cvtsi128_si64(_mm_unpackhi_epi64(sum, sum));
+    while i < n {
+        let c = i16::from_le_bytes([code[2 * i], code[2 * i + 1]]);
+        let d = qhat[i] as i64 - c as i64;
+        total += d * d;
+        i += 1;
+    }
+    total as f32
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

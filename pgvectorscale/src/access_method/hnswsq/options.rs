@@ -26,7 +26,8 @@ const DEFAULT_EF_CONSTRUCTION: i32 = 64;
 const DEFAULT_SAMPLE_SIZE_OPTION: i32 = 0;
 
 /// Default storage layout (precision).  The IEEE layouts (`ieeefp16`,
-/// `ieeefp8`) are training-free; `f8` (SQ8) is calibrated at build.
+/// `ieeefp8`) and the fixed-range SQ layouts (`sq8`, `sq16`) are
+/// training-free; `f8` (calibrated SQ8) trains at build.
 const HNSW_DEFAULT_STORAGE_TYPE_STR: &str = "plain";
 
 /// Build-time default for the SQ8 calibration reservoir sample.
@@ -256,7 +257,7 @@ pub unsafe fn init() {
     pg_sys::add_string_reloption(
         RELOPT_KIND_HNSW2,
         "storage_layout".as_pg_cstr(),
-        "Node vector precision: plain, ieeefp16 (f16), ieeefp8, or f8 (sq8)"
+        "Node vector precision: plain, ieeefp16 (f16), ieeefp8, f8, sq8, or sq16"
             .as_pg_cstr(),
         HNSW_DEFAULT_STORAGE_TYPE_STR.as_pg_cstr(),
         Some(validate_storage_layout),

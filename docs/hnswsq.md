@@ -1,7 +1,7 @@
 # hnswsq — the HNSW index access method with reduced-precision storage
 
 `hnswsq` is this repository's HNSW (hierarchical navigable small world) index
-over pgvector `vector` columns, with **four node-vector storage layouts**. The
+over pgvector `vector` columns, with **six node-vector storage layouts**. The
 graph core is a **function-for-function Rust port of pgvector's HNSW**
 (build, insert, scan, vacuum, relptr addressing, the same on-disk tuple
 format); this repository's contribution is the reduced-precision layouts and
@@ -12,15 +12,27 @@ the scan contract that goes with them:
 | `plain` | IEEE f32 verbatim | 4 | 1× | none |
 | `ieeefp16` (alias `f16`) | IEEE 754 binary16 (half) | 2 | ~1/2× | **none — stateless cast** |
 | `ieeefp8` | OCP FP8 **E4M3** | 1 | ~1/4× | **none — stateless cast** |
-| `f8` (alias `sq8`) | Lance-style SQ8: per-dimension min/max linear | 1 | ~1/4× | calibrated at CREATE INDEX |
+| `f8` | Lance-style SQ8: per-dimension min/max linear | 1 | ~1/4× | calibrated at CREATE INDEX |
+| `sq8` | fixed-range int8: `round(clamp(x, ±1) · 127)` | 1 | ~1/4× | **none — global fixed range** |
+| `sq16` | fixed-range int16: `round(clamp(x, ±1) · 32767)` | 2 | ~1/2× | **none — global fixed range** |
 
-The IEEE layouts are **training-free**: no calibration artifact, no range
-drift, identical behavior on bulk builds and on empty-start/incremental
-indexes (CREATE INDEX on an empty table, rows appended over time).  `f8`/SQ8
-freezes a per-dimension `[min, max]` range from a reservoir sample at build
-time; inserts outside the range clamp (accuracy loss only, never a
-correctness issue), and an empty-start SQ8 index gets a provisional `[-1, 1]`
-range until `REINDEX` retrains from real data.
+The IEEE layouts and the fixed-range `sq8`/`sq16` are **training-free**: no
+calibration artifact, no range drift, identical behavior on bulk builds and on
+empty-start/incremental indexes (CREATE INDEX on an empty table, rows appended
+over time).  `f8`/SQ8 freezes a per-dimension `[min, max]` range from a
+reservoir sample at build time; inserts outside the range clamp (accuracy loss
+only, never a correctness issue), and an empty-start SQ8 index gets a
+provisional `[-1, 1]` range until `REINDEX` retrains from real data.
+
+`sq8`/`sq16` quantize against a **global, fixed `[-1, 1]` range** — the natural
+range of cosine-normalized embeddings — so their distances are computable
+**directly from the integer codes**: `Σ (q̂ − code)²` is the decoded-domain L2
+distance of the quantized query times one global constant (the stored side is
+exact; the query carries only the standard half-step error).  The graph
+itself is always constructed with the exact decoded distance (graph mutation
+never uses the query-quantized form: on clustered data the half-step noise
+rivals intra-cluster spacing and fragments the neighbor graph), while scans
+use the fast integer-code form under `hnswsq.sq8_distance = pairwise`.
 
 The index is built to the same operational bar as the `ivf` (IVF-RaBitQ) work:
 append-only node storage, WAL-logged transactional mutations, executor-driven
@@ -57,17 +69,18 @@ Notes:
   disk insert path.
 - The indexed column must have a fixed dimension (e.g. `vector(128)`).
   Dimension limits per layout: a node must fit one page item — roughly
-  `plain` ≤ ~1900, `ieeefp16` ≤ ~3900, `ieeefp8`/`f8` ≤ ~7900 at `m = 16`
-  (the exact bound is computed from `m` and reported in the error message).
+  `plain` ≤ ~1900, `ieeefp16`/`sq16` ≤ ~3900, `ieeefp8`/`f8`/`sq8` ≤ ~7900
+  at `m = 16` (the exact bound is computed from `m` and reported in the error
+  message).
 
 ### Options (WITH clause)
 
 | option | range | default | meaning |
 |---|---|---|---|
-| `storage_layout` | `plain`, `ieeefp16`, `ieeefp8`, `f8` | `plain` | node-vector precision (aliases `f16`, `sq8`) |
+| `storage_layout` | `plain`, `ieeefp16`, `ieeefp8`, `f8`, `sq8`, `sq16` | `plain` | node-vector precision (alias `f16`) |
 | `m` | 4 – 100 | 16 | max neighbors per node per upper layer; layer 0 gets `2·m` |
 | `ef_construction` | 4 – 1000 | 64 | search width during build and insert |
-| `sample_size` | 0 – 1000000 | 0 (= auto, 30000) | vectors reservoir-sampled for SQ8 calibration only |
+| `sample_size` | 0 – 1000000 | 0 (= auto, 30000) | vectors reservoir-sampled for `f8` calibration only |
 
 ## 3. Querying
 
@@ -80,6 +93,7 @@ GUC:
 | `hnswsq.iterative_scan` | `off` / `relaxed` / `strict` | `relaxed` | pgvector-style iterative scan: a full search up front (`off`), or emit from the first batch and resume from discarded candidates on demand (`relaxed`; `strict` additionally forces non-decreasing distances) |
 | `hnswsq.max_scan_tuples` | −1 – INT_MAX | −1 (unbounded) | cap on tuples one scan may visit before falling back to the discarded heap; −1 disables |
 | `hnswsq.build_seed` | −1 – INT_MAX | −1 (entropy) | seeds the level RNG; pin it to make two builds' graphs (and timings) comparable |
+| `hnswsq.sq8_distance` | `scalar` / `pairwise` | `pairwise` | scan-time distance form for the SQ layouts (`f8`, `sq8`, `sq16`): decode-then-compare, or the integer code-pairwise form.  Graph construction always uses the exact decoded distance. |
 
 ```sql
 SET enable_seqscan = off;   -- force the index on small tables
@@ -114,6 +128,17 @@ sequential scan.
   the only layout that needs calibration: build it over representative data,
   or accept the provisional `[-1, 1]` range on empty-start indexes until
   REINDEX.
+- **`sq8`** — ~4× smaller; fixed-range int8 (`round(clamp(x, ±1) · 127)`,
+  one global step).  No calibration at all — the training-free 1-byte layout.
+  Distances are computed directly from the codes (`Σ (q̂ − code)²`, pure
+  integer arithmetic), and the stored side is exact: the fixed global range
+  means the code-pairwise form reproduces the decoded-domain ranking with no
+  per-dimension weights.  Components outside ±1 clamp on encode (the vector
+  loses its provable lower bound, never its validity), so it is aimed at
+  normalized data — cosine-normalized embeddings land in ±1 naturally.
+- **`sq16`** — ~2× smaller; the same fixed-range design at int16 precision
+  (~2^-15 steps): near-plain accuracy with half the bytes and training-free.
+  For normalized data this is effectively lossless for ANN ranking.
 
 Size note: neighbor pointers are shared across layouts (each node carries
 `2·m + m·level` ItemPointers), so the 2×/4× ratios hold for the vector bytes;
@@ -126,8 +151,9 @@ total index size shrinks a bit less for small `dim`.
   Ordering depends on the storage layout: for the lossless `plain` layout the
   index emits the operator's own distance and PostgreSQL trusts that order
   (`xs_recheckorderby = false`, exactly as pgvector's hnsw does for `vector`
-  columns); for the reduced-precision layouts (`ieeefp16`, `ieeefp8`, `f8`) the
-  emitted value is a provable **lower bound**, `xs_recheckorderby = true`, and
+  columns); for the reduced-precision layouts (`ieeefp16`, `ieeefp8`, `f8`,
+  `sq8`, `sq16`) the emitted value is a provable **lower bound**,
+  `xs_recheckorderby = true`, and
   the executor recomputes the exact operator value per tuple and restores exact
   ordering over the candidates the graph search produced.  Uncommitted /
   aborted / dead rows are therefore invisible either way, and aborted inserts
@@ -169,7 +195,9 @@ out of the box (standard callbacks, no reloption tuning required).
   rows flow through the regular disk insert path (NOTICE logged, build takes
   significantly longer — the same fallback pgvector has).
 - `ieeefp8`'s accuracy assumes in-range data (±448); out-of-range components
-  clamp (cosine-normalized data is unaffected).
+  clamp (cosine-normalized data is unaffected).  `sq8`/`sq16` assume the
+  tighter ±1 range for the same reason: components outside it clamp on
+  encode, which is fine for normalized data and costs recall elsewhere.
 - As with any approximate index, crash windows are transactional: a crash
   rolls back the inserting transaction, so committed rows are never lost;
   an orphaned node (dead TID) is removed by the next vacuum.

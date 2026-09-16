@@ -472,12 +472,17 @@ unsafe fn load_elements_for_insert(
     support: &Support,
 ) -> i32 {
     let na = array.as_mut_ptr().cast::<NeighborArray>();
-    // SQ8: quantize the query once; the neighbor distances below are integer
-    // arithmetic (see sq8_query_state).
+    // SQ: quantize the query once; the neighbor distances below are integer
+    // arithmetic (see sq8_query_state).  The fixed-range layouts always use
+    // the exact form here — this is graph mutation (see
+    // mutation_distance_mode).
     let qstate = sq8_query_state(
         support,
         q,
-        crate::access_method::hnswsq::options::HNSW_SQ8_DISTANCE.get(),
+        crate::access_method::hnswsq::utils::mutation_distance_mode(
+            support,
+            crate::access_method::hnswsq::options::HNSW_SQ8_DISTANCE.get(),
+        ),
     );
     for i in 0..(*na).length as usize {
         let hc = &mut *neighbor_items(na).add(i);

@@ -110,7 +110,7 @@ pub unsafe fn resolve_distance_type(index: pg_sys::Relation) -> DistanceType {
 pub unsafe fn init_support(index: pg_sys::Relation) -> Support {
     let dist_type = resolve_distance_type(index);
     let (precision, dimensions, calibration) = meta_page_layout(index);
-    let codec = if precision == HnswPrecision::Sq8 {
+    let codec = if precision.needs_calibration() {
         let calib = Sq8Calibration::load(&PgRelation::from_pg(index), calibration);
         Codec::new_sq8(&calib)
     } else {
@@ -672,17 +672,17 @@ pub unsafe fn load_element_from_tuple(
 /// which is how the search path avoids allocating for non-admitted
 /// candidates.  Returns the materialized element pointer.
 ///
-/// Per-search SQ8 query state: `None` unless the index is SQ8 + L2 and the
-/// `hnswsq.sq8_distance` GUC selects one of the integer forms (see
-/// `smoke.rs`).  The query is quantized once per search; every candidate
-/// distance then uses pure integer arithmetic.
+/// Per-search SQ query state: `None` unless the index is an SQ layout
+/// (`f8`, `sq8`, `sq16`) + L2 and the `hnswsq.sq8_distance` GUC selects the
+/// pairwise integer form (see `smoke.rs`).  The query is quantized once per
+/// search; every candidate distance then uses pure integer arithmetic.
 pub fn sq8_query_state(
     support: &Support,
     q: &[f32],
     mode: crate::access_method::hnswsq::options::Sq8DistanceMode,
 ) -> Option<Sq8QueryState> {
     use crate::access_method::hnswsq::options::Sq8DistanceMode;
-    if support.precision != HnswPrecision::Sq8 || support.dist_type != DistanceType::L2 {
+    if !support.precision.is_sq() || support.dist_type != DistanceType::L2 {
         return None;
     }
     match mode {
@@ -691,8 +691,31 @@ pub fn sq8_query_state(
     }
 }
 
-/// Distance from `q` to the encoded `bytes`, using the per-search SQ8 state
-/// when one is present (the scalar codec path otherwise).
+/// The distance mode for GRAPH-MUTATING searches (build, insert, vacuum
+/// repair).  The fixed-range layouts (`sq8`, `sq16`) always construct their
+/// graph with the exact code-direct distance: the integer pairwise form
+/// quantizes the query, and that half-step noise rivals intra-cluster
+/// distances, so neighbor selection with it fragments the graph (measured on
+/// clustered data: recall collapsed to ~0.75 with a pairwise-built graph vs
+/// 1.0 with an exact-built one, at every ef).  The read-only scan still uses
+/// the GUC-selected integer form — the exact-built graph navigates correctly
+/// under it.
+pub fn mutation_distance_mode(
+    support: &Support,
+    mode: crate::access_method::hnswsq::options::Sq8DistanceMode,
+) -> crate::access_method::hnswsq::options::Sq8DistanceMode {
+    use crate::access_method::hnswsq::options::Sq8DistanceMode;
+    match support.precision {
+        HnswPrecision::Sq8Fixed | HnswPrecision::Sq16Fixed => Sq8DistanceMode::Scalar,
+        _ => mode,
+    }
+}
+
+/// Distance from `q` to the encoded `bytes`, using the per-search SQ state
+/// when one is present (the scalar codec path otherwise).  The pairwise
+/// kernel depends on the layout: the calibrated `f8` weights by
+/// `scale²`, while the fixed-range `sq8`/`sq16` need no weights (their
+/// quantization step is one global constant).
 #[inline]
 pub unsafe fn encoded_distance(
     support: &Support,
@@ -701,7 +724,12 @@ pub unsafe fn encoded_distance(
     qstate: Option<&Sq8QueryState>,
 ) -> f32 {
     match qstate {
-        Some(Sq8QueryState::Pairwise(qhat)) => support.codec.distance_l2_sq8_pairwise(qhat, bytes),
+        Some(Sq8QueryState::Pairwise(qhat)) => match support.precision {
+            HnswPrecision::Sq8 => support.codec.distance_l2_sq8_pairwise(qhat, bytes),
+            HnswPrecision::Sq8Fixed => support.codec.distance_l2_sq8_fixed_pairwise(qhat, bytes),
+            HnswPrecision::Sq16Fixed => support.codec.distance_l2_sq16_fixed_pairwise(qhat, bytes),
+            _ => support.distance(q, bytes),
+        },
         None => support.distance(q, bytes),
     }
 }
@@ -1716,7 +1744,13 @@ pub unsafe fn find_element_neighbors(
     // then pure integer arithmetic (see sq8_query_state).  The mode comes
     // from the caller: the parallel build passes the leader's GUC value
     // through shared memory (workers do not see the leader's session GUCs).
-    let qstate = sq8_query_state(support, decode.as_slice(), sq8_mode);
+    // The fixed-range layouts always mutate the graph with the exact form
+    // (see mutation_distance_mode).
+    let qstate = sq8_query_state(
+        support,
+        decode.as_slice(),
+        mutation_distance_mode(support, sq8_mode),
+    );
 
     // Precompute hash
     if in_memory {

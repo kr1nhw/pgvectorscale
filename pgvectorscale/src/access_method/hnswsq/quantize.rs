@@ -40,6 +40,18 @@ pub const FP16_MAX: f32 = 65504.0;
 
 /// Identifies which reduced-precision layout an hnswsq index stores node
 /// vectors in.  Persisted as a `u8` in the meta page; do not renumber.
+
+/// Fixed-range int8 SQ (training-free): `round(clamp(x, -1, 1) * 127)`.
+/// One global quantization step, so the integer pairwise distance
+/// `SUM (qhat - code)^2` is the decoded-domain L2 distance (of the
+/// quantized query) times a constant — the stored side is exact.
+pub const SQ8_FIXED_SCALE: f32 = 0.007_874_015_748_031_496; // 1 / 127
+/// Fixed-range int16 SQ (training-free): `round(clamp(x, -1, 1) * 32767)`.
+pub const SQ16_FIXED_SCALE: f32 = 0.000_030_518_509_475_997; // 1 / 32767
+/// Encoded range of the fixed SQ layouts (`[-1, 1]`; cosine-normalized
+/// embeddings land here naturally).
+pub const SQ_FIXED_RANGE: f32 = 1.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HnswPrecision {
@@ -52,12 +64,22 @@ pub enum HnswPrecision {
     Sq8 = 2,
     /// OCP FP8 E4M3 (1 byte/dim), training-free.
     IeeeFp8 = 3,
+    /// Fixed-range int8 SQ (1 byte/dim), training-free.  The range is a
+    /// global `[-1, 1]` constant (no calibration), so distances are
+    /// computable directly from the codes.
+    Sq8Fixed = 4,
+    /// Fixed-range int16 SQ (2 bytes/dim), training-free.  Same global range
+    /// as [`HnswPrecision::Sq8Fixed`] with ~2^-15 precision.
+    Sq16Fixed = 5,
 }
 
-/// Per-query SQ8 distance state (see [`Codec::sq8_query_state`]).
+/// Per-query SQ distance state (see [`Codec::sq8_query_state`]).
 pub enum Sq8QueryState {
-    /// The pairwise form: `qhat = round((q - min) * inv_scale)`, and
-    /// `d = SUM (qhat - code)^2`.
+    /// The pairwise form: the query is quantized ONCE into code space
+    /// (`qhat`), and every candidate distance is then pure integer
+    /// arithmetic: `d = SUM (qhat - code)^2` (scale-weighted for the
+    /// calibrated `f8` layout, unweighted — and therefore exact — for the
+    /// fixed-range `sq8`/`sq16` layouts).
     Pairwise(Vec<i16>),
 }
 
@@ -68,21 +90,25 @@ impl HnswPrecision {
             1 => HnswPrecision::IeeeFp16,
             2 => HnswPrecision::Sq8,
             3 => HnswPrecision::IeeeFp8,
+            4 => HnswPrecision::Sq8Fixed,
+            5 => HnswPrecision::Sq16Fixed,
             _ => pgrx::error!("Invalid hnswsq precision: {}", value),
         }
     }
 
     /// Parse a `storage_layout` reloption value.  Accepts the canonical names
-    /// plus aliases (`f16` → `ieeefp16`, `sq8` → `f8`), case-insensitively.
+    /// plus the `f16` alias for `ieeefp16`, case-insensitively.
     pub fn parse(value: &str) -> Self {
         match value.to_lowercase().as_str() {
             "plain" => HnswPrecision::Plain,
             "ieeefp16" | "f16" => HnswPrecision::IeeeFp16,
             "ieeefp8" => HnswPrecision::IeeeFp8,
-            "f8" | "sq8" => HnswPrecision::Sq8,
+            "f8" => HnswPrecision::Sq8,
+            "sq8" => HnswPrecision::Sq8Fixed,
+            "sq16" => HnswPrecision::Sq16Fixed,
             _ => pgrx::error!(
                 "Invalid storage_layout '{}'. Must be one of 'plain', 'ieeefp16' (f16), \
-                 'ieeefp8', or 'f8' (sq8)",
+                 'ieeefp8', 'f8', 'sq8', or 'sq16'",
                 value
             ),
         }
@@ -95,6 +121,8 @@ impl HnswPrecision {
             HnswPrecision::IeeeFp16 => "ieeefp16",
             HnswPrecision::IeeeFp8 => "ieeefp8",
             HnswPrecision::Sq8 => "f8",
+            HnswPrecision::Sq8Fixed => "sq8",
+            HnswPrecision::Sq16Fixed => "sq16",
         }
     }
 
@@ -105,13 +133,25 @@ impl HnswPrecision {
             HnswPrecision::IeeeFp16 => 2,
             HnswPrecision::Sq8 => 1,
             HnswPrecision::IeeeFp8 => 1,
+            HnswPrecision::Sq8Fixed => 1,
+            HnswPrecision::Sq16Fixed => 2,
         }
     }
 
-    /// Whether the layout needs a build-time calibration artifact.  Only SQ8
-    /// does; the IEEE layouts are stateless casts (incremental-build friendly).
+    /// Whether the layout needs a build-time calibration artifact.  Only the
+    /// calibrated `f8` does; the IEEE layouts and the fixed-range `sq8`/`sq16`
+    /// are stateless (incremental-build friendly).
     pub fn needs_calibration(&self) -> bool {
         matches!(self, HnswPrecision::Sq8)
+    }
+
+    /// Whether the layout uses the per-query integer pairwise distance
+    /// (`sq8_query_state` + `encoded_distance`).
+    pub fn is_sq(&self) -> bool {
+        matches!(
+            self,
+            HnswPrecision::Sq8 | HnswPrecision::Sq8Fixed | HnswPrecision::Sq16Fixed
+        )
     }
 }
 
@@ -329,6 +369,28 @@ impl Codec {
                     out.push(q.clamp(0.0, 255.0) as u8);
                 }
             }
+            HnswPrecision::Sq8Fixed => {
+                for &x in v.iter().take(self.dim) {
+                    let x = sanitize(x);
+                    if x < -SQ_FIXED_RANGE || x > SQ_FIXED_RANGE {
+                        clamped = true;
+                    }
+                    // round-to-nearest, saturating cast → i8 code in
+                    // [-127, 127]; `as` saturates out-of-range floats.
+                    out.push((x.clamp(-SQ_FIXED_RANGE, SQ_FIXED_RANGE) * 127.0).round() as i8 as u8);
+                }
+            }
+            HnswPrecision::Sq16Fixed => {
+                for &x in v.iter().take(self.dim) {
+                    let x = sanitize(x);
+                    if x < -SQ_FIXED_RANGE || x > SQ_FIXED_RANGE {
+                        clamped = true;
+                    }
+                    let q =
+                        (x.clamp(-SQ_FIXED_RANGE, SQ_FIXED_RANGE) * 32767.0).round() as i16;
+                    out.extend_from_slice(&q.to_le_bytes());
+                }
+            }
         }
         debug_assert_eq!(out.len(), self.vector_bytes());
         clamped
@@ -362,6 +424,16 @@ impl Codec {
                     out[d] = self.sq8_mins[d] + q as f32 * self.sq8_scales[d];
                 }
             }
+            HnswPrecision::Sq8Fixed => {
+                for (d, &q) in bytes.iter().enumerate() {
+                    out[d] = q as i8 as f32 * SQ8_FIXED_SCALE;
+                }
+            }
+            HnswPrecision::Sq16Fixed => {
+                for (d, chunk) in bytes.chunks_exact(2).enumerate() {
+                    out[d] = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 * SQ16_FIXED_SCALE;
+                }
+            }
         }
     }
 
@@ -373,18 +445,36 @@ impl Codec {
     }
 
     // -----------------------------------------------------------------------
-    // SQ8 integer distances (the smoke-gun winners; see smoke.rs)
+    // SQ integer distances (the smoke-gun winners; see smoke.rs)
     // -----------------------------------------------------------------------
 
     /// Build the per-query state for the integer pairwise distance: the query
     /// is quantized ONCE into code space; every candidate distance is then
-    /// pure integer arithmetic.
+    /// pure integer arithmetic.  Applies to every SQ layout (`f8`, `sq8`,
+    /// `sq16`).
     pub fn sq8_query_state(&self, q: &[f32], _pairwise: bool) -> Sq8QueryState {
-        debug_assert_eq!(self.precision, HnswPrecision::Sq8);
+        debug_assert_eq!(q.len(), self.dim);
         let mut qhat = Vec::with_capacity(self.dim);
-        for i in 0..self.dim {
-            let s = (q[i] - self.sq8_mins[i]) * self.sq8_inv_scales[i];
-            qhat.push(s.round().clamp(0.0, 255.0) as i16);
+        match self.precision {
+            HnswPrecision::Sq8 => {
+                for i in 0..self.dim {
+                    let s = (q[i] - self.sq8_mins[i]) * self.sq8_inv_scales[i];
+                    qhat.push(s.round().clamp(0.0, 255.0) as i16);
+                }
+            }
+            HnswPrecision::Sq8Fixed => {
+                for &x in q.iter().take(self.dim) {
+                    qhat.push((x.clamp(-SQ_FIXED_RANGE, SQ_FIXED_RANGE) * 127.0).round() as i16);
+                }
+            }
+            HnswPrecision::Sq16Fixed => {
+                for &x in q.iter().take(self.dim) {
+                    qhat.push(
+                        (x.clamp(-SQ_FIXED_RANGE, SQ_FIXED_RANGE) * 32767.0).round() as i16,
+                    );
+                }
+            }
+            _ => unreachable!("integer query state only for SQ layouts"),
         }
         Sq8QueryState::Pairwise(qhat)
     }
@@ -405,6 +495,29 @@ impl Codec {
             bytes,
             &self.sq8_scales2,
         )
+    }
+
+    /// Fixed-range `sq8` pairwise: `SUM (qhat - code)^2` over the int8 codes,
+    /// i32 accumulation (max per-lane sum ~1.03e9 at the 16000-dim limit,
+    /// no overflow).  Because the quantization step is ONE global constant,
+    /// this equals the decoded-domain L2 of the quantized query times `127^2`
+    /// — the stored-code side is exact (no per-dimension weights, no
+    /// calibration); the query carries only the standard half-step error.
+    #[inline]
+    pub fn distance_l2_sq8_fixed_pairwise(&self, qhat: &[i16], bytes: &[u8]) -> f32 {
+        debug_assert_eq!(qhat.len(), self.dim);
+        debug_assert_eq!(bytes.len(), self.dim);
+        crate::access_method::distance::distance_l2_sq8_fixed_pairwise(qhat, bytes)
+    }
+
+    /// Fixed-range `sq16` pairwise: `SUM (qhat - code)^2` over the int16
+    /// codes, i64 accumulation.  Equals the decoded-domain L2 of the
+    /// quantized query times `32767^2`.
+    #[inline]
+    pub fn distance_l2_sq16_fixed_pairwise(&self, qhat: &[i16], bytes: &[u8]) -> f32 {
+        debug_assert_eq!(qhat.len(), self.dim);
+        debug_assert_eq!(bytes.len(), self.dim * 2);
+        crate::access_method::distance::distance_l2_sq16_fixed_pairwise(qhat, bytes)
     }
 
 
@@ -525,20 +638,54 @@ impl Codec {
                     }
                 }
             },
+            HnswPrecision::Sq8Fixed => match dist_type {
+                DistanceType::L2 => {
+                    for i in 0..dim {
+                        let x = bytes[i] as i8 as f32 * SQ8_FIXED_SCALE;
+                        let d = query[i] - x;
+                        acc += d * d;
+                    }
+                }
+                _ => {
+                    for i in 0..dim {
+                        acc += query[i] * (bytes[i] as i8 as f32 * SQ8_FIXED_SCALE);
+                    }
+                }
+            },
+            HnswPrecision::Sq16Fixed => match dist_type {
+                DistanceType::L2 => {
+                    for i in 0..dim {
+                        let x = i16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as f32
+                            * SQ16_FIXED_SCALE;
+                        let d = query[i] - x;
+                        acc += d * d;
+                    }
+                }
+                _ => {
+                    for i in 0..dim {
+                        let x = i16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as f32
+                            * SQ16_FIXED_SCALE;
+                        acc += query[i] * x;
+                    }
+                }
+            },
         }
         finish(acc, dist_type)
     }
 
-    /// SQ8 only: `sqrt(Σ scale_d²)` — the L2 norm of the per-dimension
+    /// SQ layouts only: `sqrt(Σ scale_d²)` — the L2 norm of the per-dimension
     /// quantization steps.  Half of it bounds the L2 norm of one vector's
     /// quantization error `‖v̂ − v‖ ≤ scale_norm / 2` (round-to-nearest),
-    /// which the scan turns into provable distance lower bounds.  Zero for
-    /// the other layouts.
+    /// which the scan turns into provable distance lower bounds.  For the
+    /// fixed-range layouts every step is the global constant scale, so the
+    /// norm is `scale · √dim`.  Zero for the other layouts.
     pub fn sq8_scale_norm(&self) -> f32 {
-        if self.precision != HnswPrecision::Sq8 {
-            return 0.0;
+        match self.precision {
+            HnswPrecision::Sq8 => self.sq8_scales.iter().map(|s| s * s).sum::<f32>().sqrt(),
+            HnswPrecision::Sq8Fixed => SQ8_FIXED_SCALE * (self.dim as f32).sqrt(),
+            HnswPrecision::Sq16Fixed => SQ16_FIXED_SCALE * (self.dim as f32).sqrt(),
+            _ => 0.0,
         }
-        self.sq8_scales.iter().map(|s| s * s).sum::<f32>().sqrt()
     }
 }
 
@@ -720,6 +867,8 @@ mod tests {
             HnswPrecision::IeeeFp16,
             HnswPrecision::IeeeFp8,
             HnswPrecision::Sq8,
+            HnswPrecision::Sq8Fixed,
+            HnswPrecision::Sq16Fixed,
         ] {
             let codec = match precision {
                 HnswPrecision::Sq8 => {
@@ -800,7 +949,10 @@ mod tests {
         assert_eq!(HnswPrecision::parse("F16"), HnswPrecision::IeeeFp16);
         assert_eq!(HnswPrecision::parse("ieeefp8"), HnswPrecision::IeeeFp8);
         assert_eq!(HnswPrecision::parse("f8"), HnswPrecision::Sq8);
-        assert_eq!(HnswPrecision::parse("SQ8"), HnswPrecision::Sq8);
+        assert_eq!(HnswPrecision::parse("sq8"), HnswPrecision::Sq8Fixed);
+        assert_eq!(HnswPrecision::parse("SQ8"), HnswPrecision::Sq8Fixed);
+        assert_eq!(HnswPrecision::parse("sq16"), HnswPrecision::Sq16Fixed);
+        assert_eq!(HnswPrecision::parse("Sq16"), HnswPrecision::Sq16Fixed);
     }
 
     #[test]
@@ -810,10 +962,19 @@ mod tests {
             HnswPrecision::IeeeFp16,
             HnswPrecision::Sq8,
             HnswPrecision::IeeeFp8,
+            HnswPrecision::Sq8Fixed,
+            HnswPrecision::Sq16Fixed,
         ] {
             assert_eq!(HnswPrecision::from_u8(p as u8), p);
             assert!(p.elem_bytes() >= 1 && p.elem_bytes() <= 4);
         }
+        // Storage-footprint expectations per layout.
+        assert_eq!(HnswPrecision::Sq8Fixed.elem_bytes(), 1);
+        assert_eq!(HnswPrecision::Sq16Fixed.elem_bytes(), 2);
+        // The fixed layouts are training-free.
+        assert!(!HnswPrecision::Sq8Fixed.needs_calibration());
+        assert!(!HnswPrecision::Sq16Fixed.needs_calibration());
+        assert!(HnswPrecision::Sq8.needs_calibration());
     }
 
     #[test]
@@ -957,6 +1118,142 @@ mod tests {
         let codec8 = Codec::new(HnswPrecision::IeeeFp8, dim);
         let dec8 = codec8.decode(&codec8.encode(&[f32::NAN, f32::NEG_INFINITY]));
         assert!(dec8.iter().all(|x| x.is_finite()));
+        for p in [HnswPrecision::Sq8Fixed, HnswPrecision::Sq16Fixed] {
+            let codec_sq = Codec::new(p, dim);
+            let dec_sq = codec_sq.decode(&codec_sq.encode(&[f32::NAN, f32::NEG_INFINITY]));
+            assert!(dec_sq.iter().all(|x| x.is_finite()), "{:?}", p);
+        }
+    }
+
+    /// The fixed-range SQ layouts: training-free, symmetric ±1 range, one
+    /// global quantization step, and `clamped` flags on out-of-range values.
+    #[test]
+    fn test_fixed_sq_roundtrip_and_clamp() {
+        let dim = 16;
+        for (p, scale, max_code) in [
+            (HnswPrecision::Sq8Fixed, SQ8_FIXED_SCALE, 127.0f32),
+            (HnswPrecision::Sq16Fixed, SQ16_FIXED_SCALE, 32767.0f32),
+        ] {
+            let codec = Codec::new(p, dim);
+            // Training-free.
+            assert!(!p.needs_calibration());
+            for s in 0..30 {
+                let v = sample_vector(dim, s);
+                let mut enc = Vec::new();
+                let clamped = codec.encode_into(&v, &mut enc);
+                assert_eq!(enc.len(), dim * p.elem_bytes());
+                assert!(!clamped, "sample data lies within ±1");
+                let dec = codec.decode(&enc);
+                for (a, b) in v.iter().zip(dec.iter()) {
+                    // abs err ≤ half a quantization step
+                    assert!(
+                        (a - b).abs() <= scale / 2.0 + 1e-9,
+                        "{:?}: error too large: {} vs {}",
+                        p,
+                        a,
+                        b
+                    );
+                }
+            }
+            // Out-of-range: clamps to the range endpoints and flags it.
+            let codec2 = Codec::new(p, 2);
+            let mut enc = Vec::new();
+            let clamped = codec2.encode_into(&vec![7.5, -7.5], &mut enc);
+            assert!(clamped);
+            let dec = codec2.decode(&enc);
+            assert!((dec[0] - 1.0).abs() < 1e-6, "{:?}", p);
+            assert!((dec[1] + 1.0).abs() < 1e-6, "{:?}", p);
+            // The query state quantizes identically to encode.
+            let q = vec![0.25, -0.75];
+            let Sq8QueryState::Pairwise(qhat) = codec2.sq8_query_state(&q, true);
+            assert_eq!(qhat.len(), 2);
+            for (&qh, &x) in qhat.iter().zip(q.iter()) {
+                let want = (x * max_code).round() as i16;
+                assert_eq!(qh, want, "{:?}", p);
+            }
+        }
+    }
+
+    /// THE fixed-range property: the code-pairwise distance equals the
+    /// decoded-domain L2 distance of the quantized query times a global
+    /// constant (the code side is exact — no per-dimension weights, no
+    /// calibration; the query side carries the standard half-step
+    /// quantization, exactly like the calibrated f8 pairwise).
+    #[test]
+    fn test_fixed_sq_pairwise_is_exact_decoded_l2() {
+        use crate::access_method::distance::DistanceType;
+        let dim = 41; // odd tail exercises the scalar remainder paths
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(99);
+        for (p, scale, k2) in [
+            (HnswPrecision::Sq8Fixed, SQ8_FIXED_SCALE, 127.0f32 * 127.0f32),
+            (
+                HnswPrecision::Sq16Fixed,
+                SQ16_FIXED_SCALE,
+                32767.0f32 * 32767.0f32,
+            ),
+        ] {
+            let codec = Codec::new(p, dim);
+            for _ in 0..30 {
+                let q: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+                let v: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+                let enc = codec.encode(&v);
+                let Sq8QueryState::Pairwise(qhat) = codec.sq8_query_state(&q, true);
+                let got = match p {
+                    HnswPrecision::Sq8Fixed => {
+                        codec.distance_l2_sq8_fixed_pairwise(&qhat, &enc)
+                    }
+                    HnswPrecision::Sq16Fixed => {
+                        codec.distance_l2_sq16_fixed_pairwise(&qhat, &enc)
+                    }
+                    _ => unreachable!(),
+                };
+                // Reference: decoded-domain L2 of the QUANTIZED query —
+                // `SUM (qhat*scale - code*scale)^2 = pairwise * scale^2`.
+                let decoded: Vec<f32> = codec.decode(&enc);
+                let want = qhat
+                    .iter()
+                    .zip(decoded.iter())
+                    .map(|(&qh, &x)| {
+                        let d = qh as f32 * scale - x;
+                        d * d
+                    })
+                    .sum::<f32>();
+                // Integer sums are exact; only the f32 reference accumulates.
+                let tol = 1e-5 * (1.0 + want);
+                assert!(
+                    (got - want * k2).abs() <= tol * k2,
+                    "{:?}: pairwise {} vs decoded(qhat)*K^2 {}",
+                    p,
+                    got,
+                    want * k2
+                );
+                // And the raw-query decoded distance is within the query
+                // quantization error (half a step per dim).
+                let decoded_raw = codec.distance_encoded_direct(DistanceType::L2, &q, &enc);
+                let slack = (dim as f32).sqrt() * scale / 2.0 * 4.0;
+                assert!(
+                    (got * scale * scale - decoded_raw).abs()
+                        <= slack * (1.0 + decoded_raw.sqrt()),
+                    "{:?}: pairwise {} vs raw decoded {}",
+                    p,
+                    got * scale * scale,
+                    decoded_raw
+                );
+                // And both kernels (x86 SIMD + scalar fallback) agree.
+                let scalar = match p {
+                    HnswPrecision::Sq8Fixed => crate::access_method::distance::distance_l2_sq8_fixed_pairwise_scalar(&qhat, &enc),
+                    HnswPrecision::Sq16Fixed => crate::access_method::distance::distance_l2_sq16_fixed_pairwise_scalar(&qhat, &enc),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    (got - scalar).abs() <= 1e-3 * (1.0 + scalar.abs()),
+                    "{:?}: x86 {} vs scalar {}",
+                    p,
+                    got,
+                    scalar
+                );
+            }
+        }
     }
 
     /// Exhaustive oracle: every finite E4M3 value, as (bits, f32).
