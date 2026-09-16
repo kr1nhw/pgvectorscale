@@ -692,21 +692,24 @@ pub fn sq8_query_state(
 }
 
 /// The distance mode for GRAPH-MUTATING searches (build, insert, vacuum
-/// repair).  The fixed-range layouts (`sq8`, `sq16`) always construct their
-/// graph with the exact code-direct distance: the integer pairwise form
-/// quantizes the query, and that sub-step noise rivals intra-cluster
-/// distances, so neighbor selection with it fragments the graph (measured on
-/// clustered data: recall collapsed to ~0.75 with a pairwise-built graph vs
-/// 1.0 with an exact-built one, at every ef).  The read-only scan still uses
-/// the GUC-selected integer form — the exact-built graph navigates correctly
-/// under it.
+/// repair).  The fixed-range layouts may use the fast integer pairwise form
+/// ONLY when it is value-identical to the scalar decode distance — i.e. when
+/// the decoded domain is integral.  That holds for `sq8` (decode = the codes
+/// themselves, so the integer pairwise equals the f32 scalar exactly and the
+/// two builds produce identical graphs), but NOT for `sq16` (decode =
+/// code/128 — fractional: the integer form deviates from the f32 form at the
+/// ulp level, and on clustered data those near-tie flips fragment the
+/// neighbor graph — recall collapsed to ~0.72, the same signature the old
+/// ±1-range pairwise build showed).  The read-only scan always uses the
+/// GUC-selected form.
 pub fn mutation_distance_mode(
     support: &Support,
     mode: crate::access_method::hnswsq::options::Sq8DistanceMode,
 ) -> crate::access_method::hnswsq::options::Sq8DistanceMode {
     use crate::access_method::hnswsq::options::Sq8DistanceMode;
     match support.precision {
-        HnswPrecision::Sq8Fixed | HnswPrecision::Sq16Fixed => Sq8DistanceMode::Scalar,
+        HnswPrecision::Sq8Fixed => mode,
+        HnswPrecision::Sq16Fixed => Sq8DistanceMode::Scalar,
         _ => mode,
     }
 }
@@ -1740,12 +1743,13 @@ pub unsafe fn find_element_neighbors(
     pair_scratch.resize(support.codec.dim(), 0.0);
     support.codec.decode_into(value, decode.as_mut_slice());
 
-    // SQ8: quantize the decoded query once; every search distance below is
+    // SQ: quantize the decoded query once; every search distance below is
     // then pure integer arithmetic (see sq8_query_state).  The mode comes
     // from the caller: the parallel build passes the leader's GUC value
     // through shared memory (workers do not see the leader's session GUCs).
-    // The fixed-range layouts always mutate the graph with the exact form
-    // (see mutation_distance_mode).
+    // Graph mutation restricts the pairwise form to layouts where it is
+    // value-identical to the scalar decode (sq8; see
+    // mutation_distance_mode).
     let qstate = sq8_query_state(
         support,
         decode.as_slice(),

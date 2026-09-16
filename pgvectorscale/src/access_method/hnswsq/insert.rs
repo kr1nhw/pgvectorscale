@@ -473,9 +473,9 @@ unsafe fn load_elements_for_insert(
 ) -> i32 {
     let na = array.as_mut_ptr().cast::<NeighborArray>();
     // SQ: quantize the query once; the neighbor distances below are integer
-    // arithmetic (see sq8_query_state).  The fixed-range layouts always use
-    // the exact form here — this is graph mutation (see
-    // mutation_distance_mode).
+    // arithmetic (see sq8_query_state).  Graph mutation restricts the
+    // pairwise form to layouts where it is value-identical to the scalar
+    // decode (sq8; see mutation_distance_mode).
     let qstate = sq8_query_state(
         support,
         q,
