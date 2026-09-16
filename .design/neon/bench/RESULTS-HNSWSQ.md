@@ -19,7 +19,7 @@ was restored from the scratch cluster (`items_1m` 1M + `bench_queries` +
 |---|---|---|---|---|
 | pgvector hnsw | 72.6 | 0.294 / 0.770 / 2.394 / 7.029 | 0.995 / 1.0 | 208 (4.80) |
 | hnswsq f8 scalar | 103.3 | 0.249 / 0.619 / 1.725 / 5.103 | 0.992 / 1.0 | 184 (5.43) |
-| hnswsq f8 pairwise (weighted, default) | 92.1 | 0.231 / 0.536 / 1.449 / 4.497 | 0.991 / 1.0 | 188 (5.33) |
+| hnswsq f8 pairwise (weighted, default) | 89.7 | 0.218 / 0.544 / 1.448 / 4.461 | 0.991 / 1.0 | 250 (4.00) |
 
 Findings:
 
@@ -33,11 +33,14 @@ Findings:
   query-quantized integer form (the scale weights Lance preserves via
   stored per-vector norms and Milvus via per-dimension 256-entry LUTs),
   with a vectorized AVX2 kernel.  On 1M: recall identical to scalar
-  (0.991/1.0), queries 2.2x scalar (0.231-4.497 vs 0.249-5.103 ms), build
-  1.15x (92.1 vs 103.3 s).  The earlier no-gain measurements were a
-  plumbing bug: the parallel build's workers never saw the leader's
-  `hnswsq.sq8_distance` SET (workers are separate processes); the mode
-  now travels through shared memory.  The UNWEIGHTED pairwise was
+  (0.991/1.0), queries 2.2x scalar (0.218-4.461 vs 0.249-5.103 ms), build
+  1.15x (89.7 vs 103.3 s), and the pairwise-built graph is smaller
+  (376 vs 450 MB).  The earlier no-gain measurements were two
+  plumbing bugs, both fixed: the parallel build's workers never saw the
+  leader's `hnswsq.sq8_distance` SET (workers are separate processes), and
+  the shared-mode write initially raced the worker launch — the mode now
+  travels through shared memory and is published BEFORE
+  `LaunchParallelWorkers`.  The UNWEIGHTED pairwise was
   rejected (4 pt recall loss on uneven scales); the Lance-dot variant
   needs stored norms (format change).
 - **pgvector's build is faster on release PG** (72.6s vs 103.3s for f8):
@@ -124,7 +127,7 @@ pgvector and the other layouts unaffected):
 | hnswsq plain | 67.4 | 860,176,384 | 0.586 / 1.028 / 2.311 / 6.353 | 682 | 1.466 / 1.473 / 1.644 |
 | hnswsq ieeefp16 | 99.9 | 564,215,808 | 0.536 / 0.968 / 2.143 / 5.573 | 373 | 2.682 / 2.794 / 3.141 |
 | hnswsq ieeefp8 | 186.4 | 432,021,504 | 0.581 / 1.169 / 2.946 / 7.906 | 325 | 3.078 / 3.101 / 3.472 |
-| hnswsq f8 (sq8) | 92.1 (default) | 450,830,336 | 0.231 / 0.536 / 1.449 / 4.497 | 233 | 4.285 / 4.336 / 4.922 |
+| hnswsq f8 (sq8) | 89.7 (default) | 375,685,120 | 0.218 / 0.544 / 1.448 / 4.461 | 250 | 4.003 / 3.970 / 4.735 |
 
 On release PG the debug-box distortions are gone:
 
@@ -135,9 +138,10 @@ On release PG the debug-box distortions are gone:
   measurement predicted (1.12x there).
 - **fp16's halved memory traffic shows up**: queries beat plain at
   ef >= 40 (e.g. 5.573 vs 6.353 ms at ef640) at 65% of the size.
-- **f8 queries beat plain at every ef** (0.231-4.497 vs 0.586-6.353 ms)
-  at half the size; fp8 remains the slowest layout (its scalar E4M3
-  decode path has no SIMD variant yet).
+- **f8 queries beat plain at every ef** (0.218-4.461 vs 0.586-6.353 ms)
+  at 44% of the size (376 vs 860 MB — the weighted graph is also smaller
+  than the scalar-built one, 450 MB); fp8 remains the slowest layout (its
+  scalar E4M3 decode path has no SIMD variant yet).
 - Quantized builds stay slower than plain (fp16 1.5x, fp8 2.8x, f8 1.4x
   with the weighted-pairwise default) — the per-dimension conversion cost
   in the build's distance kernel; f8's insert rate is parity with

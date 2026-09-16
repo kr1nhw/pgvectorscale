@@ -953,6 +953,11 @@ unsafe fn begin_parallel(build: &mut BuildState, isconcurrent: bool, request: i3
     pg_sys::shm_toc_insert((*pcxt).toc, PARALLEL_KEY_SHARED, shared.cast::<std::os::raw::c_void>());
     pg_sys::shm_toc_insert((*pcxt).toc, PARALLEL_KEY_AREA, area.cast::<std::os::raw::c_void>());
 
+    // Workers are separate processes and do not see the leader's session
+    // GUCs: publish the SQ8 distance mode BEFORE launching them (they read
+    // it at their init).
+    (*shared).sq8_distance_mode = build.sq8_mode.as_i32();
+
     // Launch workers, saving status for leader/caller
     pg_sys::LaunchParallelWorkers(pcxt);
     let mut nparticipanttuplesorts = (*pcxt).nworkers_launched;
@@ -982,8 +987,6 @@ unsafe fn begin_parallel(build: &mut BuildState, isconcurrent: bool, request: i3
 
     // Workers are separate processes: hand the leader's SQ8 distance mode
     // to them through the shared area.
-    (*shared).sq8_distance_mode = build.sq8_mode.as_i32();
-
     // Save leader state now that it's clear build will be parallel
     build.leader = Some(Leader {
         pcxt,
