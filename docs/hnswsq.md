@@ -13,8 +13,8 @@ the scan contract that goes with them:
 | `ieeefp16` (alias `f16`) | IEEE 754 binary16 (half) | 2 | ~1/2× | **none — stateless cast** |
 | `ieeefp8` | OCP FP8 **E4M3** | 1 | ~1/4× | **none — stateless cast** |
 | `f8` | Lance-style SQ8: per-dimension min/max linear | 1 | ~1/4× | calibrated at CREATE INDEX |
-| `sq8` | fixed-range int8: `round(clamp(x, ±1) · 127)` | 1 | ~1/4× | **none — global fixed range** |
-| `sq16` | fixed-range int16: `round(clamp(x, ±1) · 32767)` | 2 | ~1/2× | **none — global fixed range** |
+| `sq8` | fixed-range int8: `round(clamp(x, 0, 255))`, scale 1.0 | 1 | ~1/4× | **none — global fixed range** |
+| `sq16` | fixed-range int16: `round(clamp(x, 0, 255) · 128)`, scale 2⁻⁷ | 2 | ~1/2× | **none — global fixed range** |
 
 The IEEE layouts and the fixed-range `sq8`/`sq16` are **training-free**: no
 calibration artifact, no range drift, identical behavior on bulk builds and on
@@ -24,15 +24,17 @@ reservoir sample at build time; inserts outside the range clamp (accuracy loss
 only, never a correctness issue), and an empty-start SQ8 index gets a
 provisional `[-1, 1]` range until `REINDEX` retrains from real data.
 
-`sq8`/`sq16` quantize against a **global, fixed `[-1, 1]` range** — the natural
-range of cosine-normalized embeddings — so their distances are computable
-**directly from the integer codes**: `Σ (q̂ − code)²` is the decoded-domain L2
-distance of the quantized query times one global constant (the stored side is
-exact; the query carries only the standard half-step error).  The graph
-itself is always constructed with the exact decoded distance (graph mutation
-never uses the query-quantized form: on clustered data the half-step noise
-rivals intra-cluster spacing and fragments the neighbor graph), while scans
-use the fast integer-code form under `hnswsq.sq8_distance = pairwise`.
+`sq8`/`sq16` quantize against a **global, fixed `[0, 255]` range** — the uint8
+domain of BIGANN/SIFT-style byte-valued vectors, which encode *losslessly*
+(`sq8` stores the byte itself, scale 1.0; `sq16` adds 128 sub-steps per unit
+at scale 2⁻⁷).  Their distances are computable **directly from the integer
+codes**: `Σ (q̂ − code)²` is the decoded-domain L2 distance of the quantized
+query times one global constant (the stored side is exact for in-range data;
+the query carries only the standard half-step error).  The graph itself is
+always constructed with the exact decoded distance (graph mutation never uses
+the query-quantized form: on clustered data the half-step noise rivals
+intra-cluster spacing and fragments the neighbor graph), while scans use the
+fast integer-code form under `hnswsq.sq8_distance = pairwise`.
 
 The index is built to the same operational bar as the `ivf` (IVF-RaBitQ) work:
 append-only node storage, WAL-logged transactional mutations, executor-driven
@@ -128,17 +130,19 @@ sequential scan.
   the only layout that needs calibration: build it over representative data,
   or accept the provisional `[-1, 1]` range on empty-start indexes until
   REINDEX.
-- **`sq8`** — ~4× smaller; fixed-range int8 (`round(clamp(x, ±1) · 127)`,
-  one global step).  No calibration at all — the training-free 1-byte layout.
-  Distances are computed directly from the codes (`Σ (q̂ − code)²`, pure
-  integer arithmetic), and the stored side is exact: the fixed global range
-  means the code-pairwise form reproduces the decoded-domain ranking with no
-  per-dimension weights.  Components outside ±1 clamp on encode (the vector
-  loses its provable lower bound, never its validity), so it is aimed at
-  normalized data — cosine-normalized embeddings land in ±1 naturally.
-- **`sq16`** — ~2× smaller; the same fixed-range design at int16 precision
-  (~2^-15 steps): near-plain accuracy with half the bytes and training-free.
-  For normalized data this is effectively lossless for ANN ranking.
+- **`sq8`** — ~4× smaller; fixed-range int8 (`round(clamp(x, 0, 255))`,
+  scale 1.0 — byte-valued vectors store losslessly).  No calibration at all —
+  the training-free 1-byte layout.  Distances are computed directly from the
+  codes (`Σ (q̂ − code)²`, pure integer arithmetic), and the stored side is
+  exact for in-range data: the fixed global range means the code-pairwise
+  form reproduces the decoded-domain ranking with no per-dimension weights.
+  Components outside `[0, 255]` clamp on encode (the vector loses its
+  provable lower bound, never its validity), so it is aimed at byte-domain
+  data — BIGANN/SIFT-style uint8 vectors encode exactly.
+- **`sq16`** — ~2× smaller; the same fixed-range design with 128 sub-steps
+  per unit (`round(clamp(x, 0, 255) · 128)`, scale 2⁻⁷): near-plain accuracy
+  (≤ 2⁻⁸ error per in-range component) with half the bytes and
+  training-free.
 
 Size note: neighbor pointers are shared across layouts (each node carries
 `2·m + m·level` ItemPointers), so the 2×/4× ratios hold for the vector bytes;
@@ -196,8 +200,9 @@ out of the box (standard callbacks, no reloption tuning required).
   significantly longer — the same fallback pgvector has).
 - `ieeefp8`'s accuracy assumes in-range data (±448); out-of-range components
   clamp (cosine-normalized data is unaffected).  `sq8`/`sq16` assume the
-  tighter ±1 range for the same reason: components outside it clamp on
-  encode, which is fine for normalized data and costs recall elsewhere.
+  byte-domain `[0, 255]` range for the same reason: components outside it
+  clamp on encode — exact for uint8 vectors, costly for data outside the
+  range.
 - As with any approximate index, crash windows are transactional: a crash
   rolls back the inserting transaction, so committed rows are never lost;
   an orphaned node (dead TID) is removed by the next vacuum.

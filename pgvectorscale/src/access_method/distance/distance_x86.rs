@@ -267,7 +267,7 @@ unsafe fn horizontal_sum_8_epi32(acc: core::arch::x86_64::__m256i) -> i32 {
 }
 
 /// Fixed-range `sq8` pairwise: `SUM (qhat - code)^2`, 8 integer lanes/step,
-/// i32 accumulation (the 16000-dim worst case is ~1.03e9, no overflow).
+/// i32 accumulation (the 16000-dim worst case is ~1.04e9, no overflow).
 #[target_feature(enable = "avx2")]
 pub unsafe fn distance_l2_sq8_fixed_pairwise_x86(qhat: &[i16], code: &[u8]) -> f32 {
     use core::arch::x86_64::*;
@@ -289,16 +289,16 @@ pub unsafe fn distance_l2_sq8_fixed_pairwise_x86(qhat: &[i16], code: &[u8]) -> f
             code[i + 6],
             code[i + 7],
         ]) as i64);
-        // Fixed sq8 codes are SIGNED two's complement bytes (unlike the
-        // calibrated f8's 0..255), so widen sign-extending.
-        let c32 = _mm256_cvtepi8_epi32(c);
+        // Fixed sq8 codes are UNSIGNED bytes in [0, 255] (like the
+        // calibrated f8's code space).
+        let c32 = _mm256_cvtepu8_epi32(c);
         let d = _mm256_sub_epi32(qh32, c32);
         acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(d, d));
         i += 8;
     }
     let mut total = horizontal_sum_8_epi32(acc) as i64;
     while i < n {
-        let d = qhat[i] as i32 - code[i] as i8 as i32;
+        let d = qhat[i] as i32 - code[i] as i32;
         total += (d * d) as i64;
         i += 1;
     }

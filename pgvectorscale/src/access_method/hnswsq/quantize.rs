@@ -41,16 +41,19 @@ pub const FP16_MAX: f32 = 65504.0;
 /// Identifies which reduced-precision layout an hnswsq index stores node
 /// vectors in.  Persisted as a `u8` in the meta page; do not renumber.
 
-/// Fixed-range int8 SQ (training-free): `round(clamp(x, -1, 1) * 127)`.
-/// One global quantization step, so the integer pairwise distance
-/// `SUM (qhat - code)^2` is the decoded-domain L2 distance (of the
-/// quantized query) times a constant — the stored side is exact.
-pub const SQ8_FIXED_SCALE: f32 = 0.007_874_015_748_031_496; // 1 / 127
-/// Fixed-range int16 SQ (training-free): `round(clamp(x, -1, 1) * 32767)`.
-pub const SQ16_FIXED_SCALE: f32 = 0.000_030_518_509_475_997; // 1 / 32767
-/// Encoded range of the fixed SQ layouts (`[-1, 1]`; cosine-normalized
-/// embeddings land here naturally).
-pub const SQ_FIXED_RANGE: f32 = 1.0;
+/// Fixed-range int8 SQ (training-free): `round(clamp(x, 0, 255))` stored as
+/// an unsigned byte, scale 1.0 — byte-valued vectors (BIGANN/SIFT-style
+/// uint8 data) encode EXACTLY, so the integer pairwise distance
+/// `SUM (qhat - code)^2` reproduces the decoded-domain L2 ranking (of the
+/// quantized query) exactly on the stored side.
+pub const SQ8_FIXED_SCALE: f32 = 1.0;
+/// Fixed-range int16 SQ (training-free): `round(clamp(x, 0, 255) * 128)`,
+/// scale 2^-7 — 128 sub-steps per unit over the same [0, 255] range.
+pub const SQ16_FIXED_SCALE: f32 = 0.007_812_5; // 2^-7
+/// Encoded range of the fixed SQ layouts (`[0, 255]` — the uint8 domain;
+/// byte-valued vectors encode losslessly).
+pub const SQ_FIXED_MIN: f32 = 0.0;
+pub const SQ_FIXED_MAX: f32 = 255.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -65,11 +68,12 @@ pub enum HnswPrecision {
     /// OCP FP8 E4M3 (1 byte/dim), training-free.
     IeeeFp8 = 3,
     /// Fixed-range int8 SQ (1 byte/dim), training-free.  The range is a
-    /// global `[-1, 1]` constant (no calibration), so distances are
-    /// computable directly from the codes.
+    /// global `[0, 255]` constant (no calibration): byte-valued vectors
+    /// encode losslessly, and distances are computable directly from the
+    /// codes.
     Sq8Fixed = 4,
     /// Fixed-range int16 SQ (2 bytes/dim), training-free.  Same global range
-    /// as [`HnswPrecision::Sq8Fixed`] with ~2^-15 precision.
+    /// as [`HnswPrecision::Sq8Fixed`] at 2^-7 sub-step precision.
     Sq16Fixed = 5,
 }
 
@@ -372,22 +376,20 @@ impl Codec {
             HnswPrecision::Sq8Fixed => {
                 for &x in v.iter().take(self.dim) {
                     let x = sanitize(x);
-                    if x < -SQ_FIXED_RANGE || x > SQ_FIXED_RANGE {
+                    if !(SQ_FIXED_MIN..=SQ_FIXED_MAX).contains(&x) {
                         clamped = true;
                     }
-                    // round-to-nearest, saturating cast → i8 code in
-                    // [-127, 127]; `as` saturates out-of-range floats.
-                    out.push((x.clamp(-SQ_FIXED_RANGE, SQ_FIXED_RANGE) * 127.0).round() as i8 as u8);
+                    // round-to-nearest, saturating cast → unsigned byte code.
+                    out.push(x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX).round() as u8);
                 }
             }
             HnswPrecision::Sq16Fixed => {
                 for &x in v.iter().take(self.dim) {
                     let x = sanitize(x);
-                    if x < -SQ_FIXED_RANGE || x > SQ_FIXED_RANGE {
+                    if !(SQ_FIXED_MIN..=SQ_FIXED_MAX).contains(&x) {
                         clamped = true;
                     }
-                    let q =
-                        (x.clamp(-SQ_FIXED_RANGE, SQ_FIXED_RANGE) * 32767.0).round() as i16;
+                    let q = (x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX) * 128.0).round() as u16;
                     out.extend_from_slice(&q.to_le_bytes());
                 }
             }
@@ -426,12 +428,12 @@ impl Codec {
             }
             HnswPrecision::Sq8Fixed => {
                 for (d, &q) in bytes.iter().enumerate() {
-                    out[d] = q as i8 as f32 * SQ8_FIXED_SCALE;
+                    out[d] = q as f32; // scale 1.0
                 }
             }
             HnswPrecision::Sq16Fixed => {
                 for (d, chunk) in bytes.chunks_exact(2).enumerate() {
-                    out[d] = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 * SQ16_FIXED_SCALE;
+                    out[d] = u16::from_le_bytes([chunk[0], chunk[1]]) as f32 * SQ16_FIXED_SCALE;
                 }
             }
         }
@@ -464,14 +466,12 @@ impl Codec {
             }
             HnswPrecision::Sq8Fixed => {
                 for &x in q.iter().take(self.dim) {
-                    qhat.push((x.clamp(-SQ_FIXED_RANGE, SQ_FIXED_RANGE) * 127.0).round() as i16);
+                    qhat.push(x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX).round() as i16);
                 }
             }
             HnswPrecision::Sq16Fixed => {
                 for &x in q.iter().take(self.dim) {
-                    qhat.push(
-                        (x.clamp(-SQ_FIXED_RANGE, SQ_FIXED_RANGE) * 32767.0).round() as i16,
-                    );
+                    qhat.push((x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX) * 128.0).round() as i16);
                 }
             }
             _ => unreachable!("integer query state only for SQ layouts"),
@@ -497,12 +497,12 @@ impl Codec {
         )
     }
 
-    /// Fixed-range `sq8` pairwise: `SUM (qhat - code)^2` over the int8 codes,
-    /// i32 accumulation (max per-lane sum ~1.03e9 at the 16000-dim limit,
-    /// no overflow).  Because the quantization step is ONE global constant,
-    /// this equals the decoded-domain L2 of the quantized query times `127^2`
-    /// — the stored-code side is exact (no per-dimension weights, no
-    /// calibration); the query carries only the standard half-step error.
+    /// Fixed-range `sq8` pairwise: `SUM (qhat - code)^2` over the unsigned
+    /// byte codes, i32 accumulation (max per-lane sum ~1.04e9 at the
+    /// 16000-dim limit, no overflow).  The scale is 1.0, so for in-range
+    /// (byte-valued) vectors this equals the decoded-domain L2 of the
+    /// quantized query exactly on the stored side (no per-dimension weights,
+    /// no calibration); the query carries only the standard half-step error.
     #[inline]
     pub fn distance_l2_sq8_fixed_pairwise(&self, qhat: &[i16], bytes: &[u8]) -> f32 {
         debug_assert_eq!(qhat.len(), self.dim);
@@ -510,9 +510,9 @@ impl Codec {
         crate::access_method::distance::distance_l2_sq8_fixed_pairwise(qhat, bytes)
     }
 
-    /// Fixed-range `sq16` pairwise: `SUM (qhat - code)^2` over the int16
+    /// Fixed-range `sq16` pairwise: `SUM (qhat - code)^2` over the u16
     /// codes, i64 accumulation.  Equals the decoded-domain L2 of the
-    /// quantized query times `32767^2`.
+    /// quantized query times `128^2`.
     #[inline]
     pub fn distance_l2_sq16_fixed_pairwise(&self, qhat: &[i16], bytes: &[u8]) -> f32 {
         debug_assert_eq!(qhat.len(), self.dim);
@@ -641,21 +641,21 @@ impl Codec {
             HnswPrecision::Sq8Fixed => match dist_type {
                 DistanceType::L2 => {
                     for i in 0..dim {
-                        let x = bytes[i] as i8 as f32 * SQ8_FIXED_SCALE;
+                        let x = bytes[i] as f32; // scale 1.0
                         let d = query[i] - x;
                         acc += d * d;
                     }
                 }
                 _ => {
                     for i in 0..dim {
-                        acc += query[i] * (bytes[i] as i8 as f32 * SQ8_FIXED_SCALE);
+                        acc += query[i] * bytes[i] as f32;
                     }
                 }
             },
             HnswPrecision::Sq16Fixed => match dist_type {
                 DistanceType::L2 => {
                     for i in 0..dim {
-                        let x = i16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as f32
+                        let x = u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as f32
                             * SQ16_FIXED_SCALE;
                         let d = query[i] - x;
                         acc += d * d;
@@ -663,7 +663,7 @@ impl Codec {
                 }
                 _ => {
                     for i in 0..dim {
-                        let x = i16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as f32
+                        let x = u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as f32
                             * SQ16_FIXED_SCALE;
                         acc += query[i] * x;
                     }
@@ -1125,24 +1125,31 @@ mod tests {
         }
     }
 
-    /// The fixed-range SQ layouts: training-free, symmetric ±1 range, one
+    /// The fixed-range SQ layouts: training-free, global [0, 255] range, one
     /// global quantization step, and `clamped` flags on out-of-range values.
+    /// Byte-valued vectors must roundtrip exactly for `sq8` (scale 1.0).
     #[test]
     fn test_fixed_sq_roundtrip_and_clamp() {
         let dim = 16;
         for (p, scale, max_code) in [
-            (HnswPrecision::Sq8Fixed, SQ8_FIXED_SCALE, 127.0f32),
-            (HnswPrecision::Sq16Fixed, SQ16_FIXED_SCALE, 32767.0f32),
+            (HnswPrecision::Sq8Fixed, SQ8_FIXED_SCALE, 1.0f32),
+            (HnswPrecision::Sq16Fixed, SQ16_FIXED_SCALE, 128.0f32),
         ] {
             let codec = Codec::new(p, dim);
             // Training-free.
             assert!(!p.needs_calibration());
+            // Byte-domain samples: in-range, fractional values.
+            let byte_sample = |s: usize| -> Vec<f32> {
+                (0..dim)
+                    .map(|d| ((s * 31 + d * 17) % 2000) as f32 / 7.84)
+                    .collect()
+            };
             for s in 0..30 {
-                let v = sample_vector(dim, s);
+                let v = byte_sample(s);
                 let mut enc = Vec::new();
                 let clamped = codec.encode_into(&v, &mut enc);
                 assert_eq!(enc.len(), dim * p.elem_bytes());
-                assert!(!clamped, "sample data lies within ±1");
+                assert!(!clamped, "sample data lies within [0, 255]");
                 let dec = codec.decode(&enc);
                 for (a, b) in v.iter().zip(dec.iter()) {
                     // abs err ≤ half a quantization step
@@ -1155,16 +1162,22 @@ mod tests {
                     );
                 }
             }
+            // Integer byte values encode EXACTLY for both layouts.
+            let ints: Vec<f32> = (0..dim).map(|d| (d * 3) as f32).collect();
+            let dec_ints = codec.decode(&codec.encode(&ints));
+            for (a, b) in ints.iter().zip(dec_ints.iter()) {
+                assert_eq!(a, b, "{:?}: integer byte value must roundtrip", p);
+            }
             // Out-of-range: clamps to the range endpoints and flags it.
             let codec2 = Codec::new(p, 2);
             let mut enc = Vec::new();
-            let clamped = codec2.encode_into(&vec![7.5, -7.5], &mut enc);
+            let clamped = codec2.encode_into(&vec![500.0, -500.0], &mut enc);
             assert!(clamped);
             let dec = codec2.decode(&enc);
-            assert!((dec[0] - 1.0).abs() < 1e-6, "{:?}", p);
-            assert!((dec[1] + 1.0).abs() < 1e-6, "{:?}", p);
+            assert!((dec[0] - 255.0).abs() < 1e-4, "{:?}", p);
+            assert!(dec[1].abs() < 1e-4, "{:?}", p);
             // The query state quantizes identically to encode.
-            let q = vec![0.25, -0.75];
+            let q = vec![64.25, 128.75];
             let Sq8QueryState::Pairwise(qhat) = codec2.sq8_query_state(&q, true);
             assert_eq!(qhat.len(), 2);
             for (&qh, &x) in qhat.iter().zip(q.iter()) {
@@ -1185,17 +1198,14 @@ mod tests {
         let dim = 41; // odd tail exercises the scalar remainder paths
         let mut rng = rand::rngs::SmallRng::seed_from_u64(99);
         for (p, scale, k2) in [
-            (HnswPrecision::Sq8Fixed, SQ8_FIXED_SCALE, 127.0f32 * 127.0f32),
-            (
-                HnswPrecision::Sq16Fixed,
-                SQ16_FIXED_SCALE,
-                32767.0f32 * 32767.0f32,
-            ),
+            (HnswPrecision::Sq8Fixed, SQ8_FIXED_SCALE, 1.0f32),
+            (HnswPrecision::Sq16Fixed, SQ16_FIXED_SCALE, 128.0f32 * 128.0f32),
         ] {
             let codec = Codec::new(p, dim);
             for _ in 0..30 {
-                let q: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
-                let v: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+                // Byte-domain data (the layout's range).
+                let q: Vec<f32> = (0..dim).map(|_| rng.gen_range(0.0f32..255.0)).collect();
+                let v: Vec<f32> = (0..dim).map(|_| rng.gen_range(0.0f32..255.0)).collect();
                 let enc = codec.encode(&v);
                 let Sq8QueryState::Pairwise(qhat) = codec.sq8_query_state(&q, true);
                 let got = match p {

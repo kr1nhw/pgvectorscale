@@ -138,8 +138,24 @@ pub mod tests {
         Ok(recall)
     }
 
-    fn recall_case(opclass: &str, op: &str, with_opts: &str, threshold: f64) {
-        let (rows, queries) = gen_clustered(20, 50, 16, 0.05, 12345);
+    /// Affine-map ±1 data into the byte domain [1, 255]: the fixed-range
+    /// `sq8`/`sq16` layouts quantize against a global [0, 255] range, so
+    /// their tests need byte-domain data to keep the cluster structure
+    /// distinguishable.
+    fn to_byte_domain(vecs: &mut [Vec<f32>]) {
+        for row in vecs.iter_mut() {
+            for x in row.iter_mut() {
+                *x = *x * 127.0 + 128.0;
+            }
+        }
+    }
+
+    fn recall_case(opclass: &str, op: &str, with_opts: &str, threshold: f64, byte_domain: bool) {
+        let (mut rows, mut queries) = gen_clustered(20, 50, 16, 0.05, 12345);
+        if byte_domain {
+            to_byte_domain(&mut rows);
+            to_byte_domain(&mut queries);
+        }
         setup_case(16, &rows, &queries, op).unwrap();
         // Pin the build RNG: recall is a property of the graph, so an
         // entropy-seeded build makes this assertion a random sample.
@@ -179,52 +195,58 @@ pub mod tests {
 
     #[pg_test]
     fn test_hnswsq_recall_plain_l2() {
-        recall_case("vector_l2_ops", "<->", "storage_layout = plain", 0.9);
+        recall_case("vector_l2_ops", "<->", "storage_layout = plain", 0.9, false);
     }
 
     #[pg_test]
     fn test_hnswsq_recall_ieeefp16_l2() {
-        recall_case("vector_l2_ops", "<->", "storage_layout = ieeefp16", 0.9);
+        recall_case("vector_l2_ops", "<->", "storage_layout = ieeefp16", 0.9, false);
     }
 
     #[pg_test]
     fn test_hnswsq_recall_ieeefp8_l2() {
-        recall_case("vector_l2_ops", "<->", "storage_layout = ieeefp8", 0.75);
+        recall_case("vector_l2_ops", "<->", "storage_layout = ieeefp8", 0.75, false);
     }
 
     #[pg_test]
     fn test_hnswsq_recall_sq8_l2() {
-        recall_case("vector_l2_ops", "<->", "storage_layout = f8", 0.85);
+        recall_case("vector_l2_ops", "<->", "storage_layout = f8", 0.85, false);
     }
 
     #[pg_test]
     fn test_hnswsq_recall_sq8_fixed_l2() {
         // Training-free fixed-range int8; the test data lies in ±1 so the
         // global range costs nothing vs the calibrated f8.
-        recall_case("vector_l2_ops", "<->", "storage_layout = sq8", 0.85);
+        recall_case("vector_l2_ops", "<->", "storage_layout = sq8", 0.85, true);
     }
 
     #[pg_test]
     fn test_hnswsq_recall_sq16_l2() {
         // Training-free fixed-range int16: near-plain precision.
-        recall_case("vector_l2_ops", "<->", "storage_layout = sq16", 0.9);
+        recall_case("vector_l2_ops", "<->", "storage_layout = sq16", 0.9, true);
     }
 
     #[pg_test]
     fn test_hnswsq_recall_plain_cosine() {
-        recall_case("vector_cosine_ops", "<=>", "storage_layout = plain", 0.9);
+        recall_case("vector_cosine_ops", "<=>", "storage_layout = plain", 0.9, false);
     }
 
     #[pg_test]
     fn test_hnswsq_recall_ieeefp16_ip() {
-        recall_case("vector_ip_ops", "<#>", "storage_layout = ieeefp16", 0.85);
+        recall_case("vector_ip_ops", "<#>", "storage_layout = ieeefp16", 0.85, false);
     }
 
     // ---------------- gate 2: incremental empty-start ----------------
 
     fn incremental_case(layout: &str) {
         let dim = 16;
-        let (rows, _queries) = gen_clustered(10, 100, dim, 0.05, 4242);
+        let (mut rows, _queries) = gen_clustered(10, 100, dim, 0.05, 4242);
+        if layout == "sq8" || layout == "sq16" {
+            // The fixed layouts quantize against [0, 255]: byte-domain data
+            // keeps distinct rows distinguishable (the exact-match probe
+            // needs distance 0 only for the row itself).
+            to_byte_domain(&mut rows);
+        }
         Spi::run(&format!(
             "CREATE TABLE hs_i(id serial primary key, embedding vector({}));
              CREATE INDEX hs_i_idx ON hs_i USING hnswsq (embedding vector_l2_ops)
@@ -386,7 +408,10 @@ pub mod tests {
             .execute("SELECT pg_advisory_lock(5205217837881163778)", &[])
             .unwrap();
 
-        let (rows, _q) = gen_clustered(12, 50, 16, 0.05, 9999);
+        let (mut rows, _q) = gen_clustered(12, 50, 16, 0.05, 9999);
+        if layout == "sq8" || layout == "sq16" {
+            to_byte_domain(&mut rows);
+        }
         let values: Vec<String> = rows
             .iter()
             .map(|v| format!("('{}')", vec_literal(v)))
@@ -864,11 +889,12 @@ pub mod tests {
 
     #[pg_test]
     fn test_hnswsq_sq_fixed_out_of_range_clamps() {
-        // Fixed-range layouts clamp to ±1 per dimension; out-of-range
+        // Fixed-range layouts clamp to [0, 255] per dimension; out-of-range
         // vectors still insert and answer queries (no lower-bound proof,
         // but the graph must stay usable).
         for layout in ["sq8", "sq16"] {
-            let (rows, _q) = gen_clustered(4, 50, 16, 0.05, 1618);
+            let (mut rows, _q) = gen_clustered(4, 50, 16, 0.05, 1618);
+            to_byte_domain(&mut rows);
             Spi::run(&format!(
                 "CREATE TABLE hs_of_{layout}(id serial primary key, embedding vector(16));"
             ))
@@ -880,7 +906,7 @@ pub mod tests {
                  SET enable_seqscan = off;"
             ))
             .unwrap();
-            let big: Vec<f32> = (0..16).map(|_| 7.5).collect();
+            let big: Vec<f32> = (0..16).map(|_| 500.0).collect();
             Spi::run(&format!(
                 "INSERT INTO hs_of_{layout}(embedding) VALUES ('{}');",
                 vec_literal(&big)
