@@ -29,11 +29,11 @@ BCONF=0
 q() { sudo -u pgtest "$PSQL" -h 127.0.0.1 -p "$PORT" -U pgtest -d postgres -X -q -At -v ON_ERROR_STOP=1 "$@"; }
 qin() { sudo -u pgtest "$PSQL" -h 127.0.0.1 -p "$PORT" -U pgtest -d postgres -X -q -At -v ON_ERROR_STOP=1; }
 
-# ---- 0. staging: 5 x INSERT_N fresh vectors from the 100M base file -------
+# ---- 0. staging: 7 x INSERT_N fresh vectors from the 100M base file -------
 python3 - "$STAGING" "$INSERT_N" <<'PY'
 import struct, sys
 out, per = sys.argv[1], int(sys.argv[2])
-total = 5 * per
+total = 7 * per
 start = 1_000_000  # items_1m holds rows 0..999999
 # bigann_base_100M.bvecs: 4-byte dim + 128 uint8 per row (132 B/row)
 with open('/data1/bigann/bigann_base_100M.bvecs', 'rb') as f, open(out, 'w') as w:
@@ -136,4 +136,6 @@ SQL
   run_config hnswsq ieeefp16 "CREATE INDEX items_1m_matrix ON $TABLE USING hnswsq (embedding vector_l2_ops) WITH (storage_layout='ieeefp16', m=16, ef_construction=64);"
   run_config hnswsq ieeefp8 "CREATE INDEX items_1m_matrix ON $TABLE USING hnswsq (embedding vector_l2_ops) WITH (storage_layout='ieeefp8', m=16, ef_construction=64);"
   run_config hnswsq f8 "CREATE INDEX items_1m_matrix ON $TABLE USING hnswsq (embedding vector_l2_ops) WITH (storage_layout='f8', m=16, ef_construction=64);"
+  run_config hnswsq sq8 "CREATE INDEX items_1m_matrix ON $TABLE USING hnswsq (embedding vector_l2_ops) WITH (storage_layout='sq8', m=16, ef_construction=64);"
+  run_config hnswsq sq16 "CREATE INDEX items_1m_matrix ON $TABLE USING hnswsq (embedding vector_l2_ops) WITH (storage_layout='sq16', m=16, ef_construction=64);"
 } | tee "$OUT_CSV"

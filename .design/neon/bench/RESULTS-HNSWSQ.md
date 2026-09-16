@@ -20,6 +20,29 @@ was restored from the scratch cluster (`items_1m` 1M + `bench_queries` +
 | pgvector hnsw | 72.6 | 0.294 / 0.770 / 2.394 / 7.029 | 0.995 / 1.0 | 208 (4.80) |
 | hnswsq f8 scalar | 103.3 | 0.249 / 0.619 / 1.725 / 5.103 | 0.992 / 1.0 | 184 (5.43) |
 | hnswsq f8 pairwise (weighted, default) | 89.7 | 0.218 / 0.544 / 1.448 / 4.461 | 0.991 / 1.0 | 250 (4.00) |
+| hnswsq sq8 (fixed [0,255] int8, training-free) | 125.2 | 0.480 / 0.915 / 2.059 / 5.429 | 0.994 / 1.0 | 461 (2.17) |
+| hnswsq sq16 (fixed [0,255] int16, training-free) | 146.0 | 0.523 / 0.984 / 2.194 / 5.579 | 0.994 / 1.0 | 418 (2.39) |
+
+Recall@10 across ef (release PG, `recall_sweep.sh`, all layouts on the
+1M-row table):
+
+| ef | pgvector | plain | ieeefp16 | ieeefp8 | f8 | sq8 | sq16 |
+|----|----------|-------|----------|---------|----|-----|------|
+| 10 | 0.795 | 0.782 | 0.782 | 0.709 | 0.782 | 0.783 | 0.782 |
+| 20 | 0.886 | 0.883 | 0.883 | 0.876 | 0.878 | 0.884 | 0.884 |
+| 40 | 0.941 | 0.939 | 0.939 | 0.928 | 0.943 | 0.940 | 0.941 |
+| 80 | 0.975 | 0.978 | 0.979 | 0.971 | 0.979 | 0.978 | 0.979 |
+| 160 | 0.991 | 0.994 | 0.994 | 0.994 | 0.991 | 0.994 | 0.994 |
+| 320 | 0.999 | 0.999 | 0.999 | 1.000 | 0.998 | 0.999 | 0.999 |
+| 640 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+
+The fixed-range layouts track plain within ±0.2pt over the whole range —
+the byte-exact codes give them plain-class ranking on uint8 data with a
+quarter of the vector bytes.
+
+(The `sq8`/`sq16` rows above are from the 2026-09-16 run on the restored
+1M table; pgvector/f8 are the 2026-09-15 numbers.  See the settings
+matrix below for the full same-pass 09-16 table.)
 
 Findings:
 
@@ -49,6 +72,23 @@ Findings:
   (105.7s debug vs 103.3s release).  Build parity for f8 remains the
   open item; `plain` hnswsq built in 71s on the debug box vs pgvector's
   107s there.
+- **`sq8`/`sq16` — the training-free fixed-range SQ layouts** (added
+  2026-09-16): a global `[0, 255]` range, so byte-valued BIGANN vectors
+  encode losslessly (`sq8` stores the byte itself, scale 1.0; `sq16` adds
+  128 sub-steps per unit at 2⁻⁷) and distances come straight from the
+  integer codes (`Σ(q̂ − code)²`).  **Recall tracks plain exactly**
+  (0.994/0.999/1.0 at ef 160/320/640 — equal to plain/fp16, ahead of
+  f8's 0.991/0.998 and pgvector's 0.991/0.999), queries beat pgvector at
+  every ef (0.480–5.429 ms vs 0.545–6.291 for sq8; 0.523–5.579 for sq16),
+  inserts are the fastest quantized layout (461 rows/s vs f8's 457, at
+  2.17 ms/row), and the size is the plain ratio expected of 1-byte /
+  2-byte vectors (376 vs 537 B/row — sq8 matches f8 per row).  Builds
+  are decode-bound like f8's (100–112 µs/row vs f8's 95).  Graph
+  construction uses the exact decoded distance for these layouts — the
+  query-quantized integer form fragments the neighbor graph on clustered
+  data (its half-step query noise rivals intra-cluster spacing: recall
+  collapsed to ~0.75 at every ef vs 1.0 with the exact build) — while
+  scans keep the fast integer form.
 
 ## Re-run 2026-09-15 (measured on the box's pgrx DEBUG PostgreSQL — superseded)
 
@@ -117,35 +157,49 @@ reproduces it exactly — 0.991/1.0 at ef 160/640 on release PG.)
 Measured on the **release PostgreSQL 17.11** cluster on the same box
 (port 54331; see the "Release-PostgreSQL re-run" section below for how
 it was built), `items_1m`, m=16, efc=64, mwm 8GB, 4 workers, 50k fresh
-inserts per config (batches of 1000, one index at a time), current code
-(bit-math fp conversions; f8 measured with the weighted-pairwise default,
-pgvector and the other layouts unaffected):
+inserts per config (batches of 1000, one index at a time).  Each config
+indexes the table as grown by the previous configs' inserts (1M for
+pgvector, +50k each step), so per-row costs are the comparable column.
+2026-09-16 run — all seven configs in one pass, current code (bit-math fp
+conversions, weighted-pairwise f8 default, the new fixed-range `sq8`/
+`sq16` layouts):
 
 | config | build s | size_bytes | qms ef10/40/160/640 (LIMIT 10) | ins rows/s | ins row_ms mean/p50/p99 |
 |---|---|---|---|---|---|
-| pgvector | 66.1 | 832,274,432 | 0.597 / 1.003 / 2.244 / 6.499 | 695 | 1.439 / 1.443 / 1.627 |
-| hnswsq plain | 67.4 | 860,176,384 | 0.586 / 1.028 / 2.311 / 6.353 | 682 | 1.466 / 1.473 / 1.644 |
-| hnswsq ieeefp16 | 99.9 | 564,215,808 | 0.536 / 0.968 / 2.143 / 5.573 | 373 | 2.682 / 2.794 / 3.141 |
-| hnswsq ieeefp8 | 186.4 | 432,021,504 | 0.581 / 1.169 / 2.946 / 7.906 | 325 | 3.078 / 3.101 / 3.472 |
-| hnswsq f8 (sq8) | 89.7 (default) | 375,685,120 | 0.218 / 0.544 / 1.448 / 4.461 | 250 | 4.003 / 3.970 / 4.735 |
+| pgvector | 64.7 | 832,200,704 | 0.545 / 0.913 / 2.196 / 6.291 | 691 | 1.448 / 1.449 / 1.642 |
+| hnswsq plain | 66.9 | 860,176,384 | 0.572 / 0.990 / 2.317 / 6.252 | 696 | 1.436 / 1.420 / 1.620 |
+| hnswsq ieeefp16 | 108.5 | 564,215,808 | 0.487 / 0.933 / 2.068 / 5.215 | 336 | 2.972 / 3.099 / 3.420 |
+| hnswsq ieeefp8 | 188.0 | 431,980,544 | 0.567 / 1.156 / 2.828 / 7.740 | 338 | 2.962 / 2.980 / 3.392 |
+| hnswsq f8 (weighted-pairwise default) | 113.8 | 450,797,568 | 0.492 / 0.902 / 2.033 / 5.345 | 457 | 2.190 / 2.178 / 2.467 |
+| hnswsq sq8 (fixed [0,255] int8) | 125.2 | 469,581,824 | 0.480 / 0.915 / 2.059 / 5.429 | 461 | 2.169 / 2.175 / 2.435 |
+| hnswsq sq16 (fixed [0,255] int16) | 146.0 | 666,804,224 | 0.523 / 0.984 / 2.194 / 5.579 | 418 | 2.392 / 2.403 / 2.709 |
+
+(The table was restored to exactly 1M rows before this run; the
+DELETE+VACUUM reshuffled the physical layout, so the f8 calibration
+sample — and therefore the whole f8 graph — differs from the 2026-09-15
+run above, where f8 pairwise measured 89.7s build / 376 MB /
+0.218–4.461 ms / 250 rows/s on the pre-restore table.  The other
+layouts are layout-insensitive and match the 09-15 numbers.)
 
 On release PG the debug-box distortions are gone:
 
-- **plain reaches parity everywhere**: build 67.4 vs 66.1s, queries
-  equal, inserts 682 vs 695 rows/s (1.47 vs 1.44 ms/row) — the earlier
+- **plain reaches parity everywhere**: build 66.9 vs 64.7s, queries
+  equal, inserts 696 vs 691 rows/s (1.44 vs 1.45 ms/row) — the earlier
   3.2x insert gap was the debug PG's RANDOMIZE_ALLOCATED_MEMORY tax on
   the port's higher palloc volume, exactly as the local release-PG
   measurement predicted (1.12x there).
 - **fp16's halved memory traffic shows up**: queries beat plain at
-  ef >= 40 (e.g. 5.573 vs 6.353 ms at ef640) at 65% of the size.
-- **f8 queries beat plain at every ef** (0.218-4.461 vs 0.586-6.353 ms)
-  at 44% of the size (376 vs 860 MB — the weighted graph is also smaller
-  than the scalar-built one, 450 MB); fp8 remains the slowest layout (its
-  scalar E4M3 decode path has no SIMD variant yet).
-- Quantized builds stay slower than plain (fp16 1.5x, fp8 2.8x, f8 1.4x
-  with the weighted-pairwise default) — the per-dimension conversion cost
-  in the build's distance kernel; f8's insert rate is parity with
-  scalar (buffer/backlink-bound, not distance-bound).
+  ef >= 40 (e.g. 5.215 vs 6.252 ms at ef640) at 65% of the size.
+- **f8 and the fixed-range sq8 tie on queries** (0.492–5.345 vs
+  0.480–5.429 ms — the same code space, both ahead of plain's
+  0.572–6.252) at 52% of plain's size; **sq8's inserts are the fastest
+  quantized layout** (461 rows/s, 2.17 ms/row, vs f8's 457) and its
+  per-row size matches f8's (376 B/row).  sq16 costs the expected
+  +~50% size (513 B/row) and ~10% more query time for near-plain recall.
+- Quantized builds stay slower than plain (fp16 1.6x, fp8 2.8x, f8 1.7x,
+  sq8 1.9x, sq16 2.2x) — the per-dimension conversion cost in the
+  build's distance kernel; f8/sq8/sq16's insert rates are the best of
+  the quantized layouts (buffer/backlink-bound, not distance-bound).
 
 (The earlier version of this table, measured on the box's pgrx DEBUG
 PostgreSQL, is superseded: pgvector 107.1s / plain 71.0s / fp16 294.7s /

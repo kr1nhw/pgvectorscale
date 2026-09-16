@@ -88,5 +88,7 @@ build_pgvector() {
   build_hnswsq ieeefp16
   build_hnswsq ieeefp8
   build_hnswsq f8
+  build_hnswsq sq8
+  build_hnswsq sq16
 } | tee "$OUT_CSV"
 log "done -> $OUT_CSV"
