@@ -644,11 +644,9 @@ impl Codec {
             },
             HnswPrecision::Sq8Fixed => match dist_type {
                 DistanceType::L2 => {
-                    for i in 0..dim {
-                        let x = bytes[i] as f32; // scale 1.0
-                        let d = query[i] - x;
-                        acc += d * d;
-                    }
+                    return crate::access_method::distance::distance_l2_sq8_fixed_decode(
+                        query, bytes,
+                    );
                 }
                 _ => {
                     for i in 0..dim {
@@ -658,12 +656,9 @@ impl Codec {
             },
             HnswPrecision::Sq16Fixed => match dist_type {
                 DistanceType::L2 => {
-                    for i in 0..dim {
-                        let x = u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as f32
-                            * SQ16_FIXED_SCALE;
-                        let d = query[i] - x;
-                        acc += d * d;
-                    }
+                    return crate::access_method::distance::distance_l2_sq16_fixed_decode(
+                        query, bytes,
+                    );
                 }
                 _ => {
                     for i in 0..dim {

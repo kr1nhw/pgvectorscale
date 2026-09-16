@@ -200,10 +200,20 @@ unsafe fn f16x8_to_f32(h: core::arch::x86_64::__m128i) -> core::arch::x86_64::__
     _mm256_castsi256_ps(bits)
 }
 
-/// Scale-weighted pairwise SQ8: `SUM w * (qhat - code)^2`, 8 lanes/step
-/// (i16 widening + integer sub + f32 square/FMA).
-#[target_feature(enable = "avx2,fma")]
+/// Scale-weighted pairwise SQ8: `SUM w * (qhat - code)^2`, runtime dispatch
+/// to the 16-lane AVX-512 kernel where available, 8-lane AVX2 otherwise.
+#[inline]
 pub unsafe fn distance_l2_sq8_pairwise_x86(qhat: &[i16], code: &[u8], w: &[f32]) -> f32 {
+    if std::arch::is_x86_feature_detected!("avx512f") {
+        return distance_l2_sq8_pairwise_x86_avx512(qhat, code, w);
+    }
+    distance_l2_sq8_pairwise_x86_avx2(qhat, code, w)
+}
+
+/// Scale-weighted pairwise SQ8, 8 lanes/step (i16 widening + integer sub +
+/// f32 square/FMA).
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn distance_l2_sq8_pairwise_x86_avx2(qhat: &[i16], code: &[u8], w: &[f32]) -> f32 {
     use core::arch::x86_64::*;
 
     let n = qhat.len();
@@ -240,6 +250,36 @@ pub unsafe fn distance_l2_sq8_pairwise_x86(qhat: &[i16], code: &[u8], w: &[f32])
     total
 }
 
+/// Scale-weighted pairwise SQ8, 16 lanes/step (AVX-512).
+#[target_feature(enable = "avx512f")]
+pub unsafe fn distance_l2_sq8_pairwise_x86_avx512(qhat: &[i16], code: &[u8], w: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+
+    let n = qhat.len();
+    debug_assert_eq!(n, code.len());
+    debug_assert_eq!(n, w.len());
+    let mut acc = _mm512_setzero_ps();
+    let mut i = 0;
+    while i + 16 <= n {
+        let qh = _mm256_loadu_si256(qhat.as_ptr().add(i).cast()); // 16 x i16
+        let qh32 = _mm512_cvtepi16_epi32(qh);
+        let c = _mm_loadu_si128(code.as_ptr().add(i).cast()); // 16 x u8
+        let c32 = _mm512_cvtepu8_epi32(c);
+        let d = _mm512_sub_epi32(qh32, c32);
+        let df = _mm512_cvtepi32_ps(d);
+        let wv = _mm512_loadu_ps(w.as_ptr().add(i));
+        acc = _mm512_fmadd_ps(wv, _mm512_mul_ps(df, df), acc);
+        i += 16;
+    }
+    let mut total = _mm512_reduce_add_ps(acc);
+    while i < n {
+        let d = (qhat[i] - code[i] as i16) as f32;
+        total += w[i] * d * d;
+        i += 1;
+    }
+    total
+}
+
 /// Sum the 8 lanes of an AVX register.
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -266,10 +306,22 @@ unsafe fn horizontal_sum_8_epi32(acc: core::arch::x86_64::__m256i) -> i32 {
     _mm_cvtsi128_si32(sum)
 }
 
-/// Fixed-range `sq8` pairwise: `SUM (qhat - code)^2`, 8 integer lanes/step,
-/// i32 accumulation (the 16000-dim worst case is ~1.04e9, no overflow).
-#[target_feature(enable = "avx2")]
+/// Fixed-range `sq8` pairwise: `SUM (qhat - code)^2`, runtime dispatch to
+/// the 16-lane AVX-512 kernel where available, 8-lane AVX2 otherwise.
+#[inline]
 pub unsafe fn distance_l2_sq8_fixed_pairwise_x86(qhat: &[i16], code: &[u8]) -> f32 {
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+    {
+        return distance_l2_sq8_fixed_pairwise_x86_avx512(qhat, code);
+    }
+    distance_l2_sq8_fixed_pairwise_x86_avx2(qhat, code)
+}
+
+/// Fixed-range `sq8` pairwise, 8 integer lanes/step, i32 accumulation (the
+/// 16000-dim worst case is ~1.04e9, no overflow).
+#[target_feature(enable = "avx2")]
+pub unsafe fn distance_l2_sq8_fixed_pairwise_x86_avx2(qhat: &[i16], code: &[u8]) -> f32 {
     use core::arch::x86_64::*;
 
     let n = qhat.len();
@@ -305,10 +357,47 @@ pub unsafe fn distance_l2_sq8_fixed_pairwise_x86(qhat: &[i16], code: &[u8]) -> f
     total as f32
 }
 
-/// Fixed-range `sq16` pairwise: `SUM (qhat - code)^2`, 4 lanes/step with
-/// widening i64 squares (differences up to 65534 square past i32).
-#[target_feature(enable = "avx2")]
+/// Fixed-range `sq8` pairwise, 16 integer lanes/step (AVX-512).
+#[target_feature(enable = "avx512f,avx512bw")]
+pub unsafe fn distance_l2_sq8_fixed_pairwise_x86_avx512(qhat: &[i16], code: &[u8]) -> f32 {
+    use core::arch::x86_64::*;
+
+    let n = qhat.len();
+    debug_assert_eq!(n, code.len());
+    let mut acc = _mm512_setzero_si512(); // 16 x i32
+    let mut i = 0;
+    while i + 16 <= n {
+        let qh = _mm256_loadu_si256(qhat.as_ptr().add(i).cast()); // 16 x i16
+        let qh32 = _mm512_cvtepi16_epi32(qh);
+        let c = _mm_loadu_si128(code.as_ptr().add(i).cast()); // 16 x u8
+        let c32 = _mm512_cvtepu8_epi32(c);
+        let d = _mm512_sub_epi32(qh32, c32);
+        acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(d, d));
+        i += 16;
+    }
+    let mut total = _mm512_reduce_add_epi32(acc) as i64;
+    while i < n {
+        let d = qhat[i] as i32 - code[i] as i32;
+        total += (d * d) as i64;
+        i += 1;
+    }
+    total as f32
+}
+
+/// Fixed-range `sq16` pairwise: `SUM (qhat - code)^2`, runtime dispatch to
+/// the 8-lane AVX-512 kernel where available, 4-lane AVX2 otherwise.
+#[inline]
 pub unsafe fn distance_l2_sq16_fixed_pairwise_x86(qhat: &[i16], code: &[u8]) -> f32 {
+    if std::arch::is_x86_feature_detected!("avx512f") {
+        return distance_l2_sq16_fixed_pairwise_x86_avx512(qhat, code);
+    }
+    distance_l2_sq16_fixed_pairwise_x86_avx2(qhat, code)
+}
+
+/// Fixed-range `sq16` pairwise, 4 lanes/step with widening i64 squares
+/// (differences up to 65534 square past i32).
+#[target_feature(enable = "avx2")]
+pub unsafe fn distance_l2_sq16_fixed_pairwise_x86_avx2(qhat: &[i16], code: &[u8]) -> f32 {
     use core::arch::x86_64::*;
 
     let n = qhat.len();
@@ -340,6 +429,127 @@ pub unsafe fn distance_l2_sq16_fixed_pairwise_x86(qhat: &[i16], code: &[u8]) -> 
         i += 1;
     }
     total as f32
+}
+
+/// Fixed-range `sq16` pairwise, 8 lanes/step (AVX-512).
+#[target_feature(enable = "avx512f")]
+pub unsafe fn distance_l2_sq16_fixed_pairwise_x86_avx512(qhat: &[i16], code: &[u8]) -> f32 {
+    use core::arch::x86_64::*;
+
+    let n = qhat.len();
+    debug_assert_eq!(n * 2, code.len());
+    let mut acc = _mm512_setzero_si512(); // 8 x i64
+    let mut i = 0;
+    while i + 8 <= n {
+        // 8 x i16 zero-extended to 256 bits, then widened to 16 i32 lanes
+        // (the upper 8 lanes are zero and contribute nothing).
+        let qh = _mm256_castsi128_si256(_mm_loadu_si128(qhat.as_ptr().add(i).cast()));
+        let qh32 = _mm512_cvtepi16_epi32(qh);
+        let qh64 = _mm512_cvtepi32_epi64(_mm512_castsi512_si256(qh32));
+        let c = _mm256_castsi128_si256(_mm_loadu_si128(code.as_ptr().add(2 * i).cast()));
+        let c32 = _mm512_cvtepu16_epi32(c);
+        let c64 = _mm512_cvtepi32_epi64(_mm512_castsi512_si256(c32));
+        let d = _mm512_sub_epi64(qh64, c64);
+        acc = _mm512_add_epi64(acc, _mm512_mul_epi32(d, d));
+        i += 8;
+    }
+    let mut total = _mm512_reduce_add_epi64(acc);
+    while i < n {
+        let c = i16::from_le_bytes([code[2 * i], code[2 * i + 1]]);
+        let d = qhat[i] as i64 - c as i64;
+        total += d * d;
+        i += 1;
+    }
+    total as f32
+}
+
+/// Fixed-range `sq8` DECODE distance: `SUM (q - code)^2` (scale 1.0), the
+/// scalar-mode/graph-mutation path.  Runtime dispatch: 16-lane AVX-512, else
+/// the counted scalar loop (LLVM vectorizes it).
+#[inline]
+pub unsafe fn distance_l2_sq8_fixed_decode_x86(q: &[f32], code: &[u8]) -> f32 {
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+    {
+        return distance_l2_sq8_fixed_decode_x86_avx512(q, code);
+    }
+    let mut acc = 0.0f32;
+    for i in 0..q.len() {
+        let d = q[i] - code[i] as f32;
+        acc += d * d;
+    }
+    acc
+}
+
+#[target_feature(enable = "avx512f,avx512bw")]
+pub unsafe fn distance_l2_sq8_fixed_decode_x86_avx512(q: &[f32], code: &[u8]) -> f32 {
+    use core::arch::x86_64::*;
+
+    let n = q.len();
+    debug_assert_eq!(n, code.len());
+    let mut acc = _mm512_setzero_ps();
+    let mut i = 0;
+    while i + 16 <= n {
+        let c = _mm_loadu_si128(code.as_ptr().add(i).cast()); // 16 x u8
+        let c32 = _mm512_cvtepu8_epi32(c);
+        let cf = _mm512_cvtepi32_ps(c32);
+        let qf = _mm512_loadu_ps(q.as_ptr().add(i));
+        let d = _mm512_sub_ps(qf, cf);
+        acc = _mm512_fmadd_ps(d, d, acc);
+        i += 16;
+    }
+    let mut total = _mm512_reduce_add_ps(acc);
+    while i < n {
+        let d = q[i] - code[i] as f32;
+        total += d * d;
+        i += 1;
+    }
+    total
+}
+
+/// Fixed-range `sq16` DECODE distance: `SUM (q - code * 2^-7)^2`, the
+/// scalar-mode/graph-mutation path.  Runtime dispatch: 8-lane AVX-512, else
+/// the counted scalar loop.
+#[inline]
+pub unsafe fn distance_l2_sq16_fixed_decode_x86(q: &[f32], code: &[u8]) -> f32 {
+    if std::arch::is_x86_feature_detected!("avx512f") {
+        return distance_l2_sq16_fixed_decode_x86_avx512(q, code);
+    }
+    let mut acc = 0.0f32;
+    for i in 0..q.len() {
+        let x = u16::from_le_bytes([code[2 * i], code[2 * i + 1]]) as f32 * 0.007_812_5;
+        let d = q[i] - x;
+        acc += d * d;
+    }
+    acc
+}
+
+#[target_feature(enable = "avx512f")]
+pub unsafe fn distance_l2_sq16_fixed_decode_x86_avx512(q: &[f32], code: &[u8]) -> f32 {
+    use core::arch::x86_64::*;
+
+    let n = q.len();
+    debug_assert_eq!(n * 2, code.len());
+    let mut acc = _mm512_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let c = _mm256_castsi128_si256(_mm_loadu_si128(code.as_ptr().add(2 * i).cast()));
+        let c32 = _mm512_cvtepu16_epi32(c);
+        let cf = _mm512_cvtepi32_ps(c32);
+        let cf = _mm512_mul_ps(cf, _mm512_set1_ps(0.007_812_5));
+        let qf = _mm256_loadu_ps(q.as_ptr().add(i));
+        let d = _mm512_sub_ps(_mm512_castps256_ps512(qf), cf);
+        acc = _mm512_fmadd_ps(d, d, acc);
+        i += 8;
+    }
+    let mut total = _mm512_reduce_add_ps(acc);
+    while i < n {
+        let x = u16::from_le_bytes([code[2 * i], code[2 * i + 1]]) as f32 * 0.007_812_5;
+        let d = q[i] - x;
+        total += d * d;
+        i += 1;
+    }
+    total
 }
 
 #[cfg(test)]

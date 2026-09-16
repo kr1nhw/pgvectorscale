@@ -236,6 +236,47 @@ pub fn distance_l2_sq16_fixed_pairwise(qhat: &[i16], code: &[u8]) -> f32 {
     distance_l2_sq16_fixed_pairwise_scalar(qhat, code)
 }
 
+/// Fixed-range `sq8` decode distance: `SUM (q - code)^2` (scale 1.0) — the
+/// scalar-mode / graph-mutation path.  Dispatches to the 16-lane AVX-512
+/// kernel where available.
+#[inline]
+pub fn distance_l2_sq8_fixed_decode(q: &[f32], code: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_sq8_fixed_decode_x86(q, code);
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut acc = 0.0f32;
+        for i in 0..q.len() {
+            let d = q[i] - code[i] as f32;
+            acc += d * d;
+        }
+        acc
+    }
+}
+
+/// Fixed-range `sq16` decode distance: `SUM (q - code * 2^-7)^2` — the
+/// scalar-mode / graph-mutation path.  Dispatches to the 8-lane AVX-512
+/// kernel where available.
+#[inline]
+pub fn distance_l2_sq16_fixed_decode(q: &[f32], code: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_sq16_fixed_decode_x86(q, code);
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut acc = 0.0f32;
+        for i in 0..q.len() {
+            let x = u16::from_le_bytes([code[2 * i], code[2 * i + 1]]) as f32 * 0.007_812_5;
+            let d = q[i] - x;
+            acc += d * d;
+        }
+        acc
+    }
+}
+
 #[inline]
 pub fn distance_l2_sq16_fixed_pairwise_scalar(qhat: &[i16], code: &[u8]) -> f32 {
     debug_assert_eq!(qhat.len() * 2, code.len());
