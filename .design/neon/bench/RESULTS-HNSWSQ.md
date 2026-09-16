@@ -171,8 +171,8 @@ conversions, weighted-pairwise f8 default, the new fixed-range `sq8`/
 | hnswsq ieeefp16 | 108.5 | 564,215,808 | 0.487 / 0.933 / 2.068 / 5.215 | 336 | 2.972 / 3.099 / 3.420 |
 | hnswsq ieeefp8 | 188.0 | 431,980,544 | 0.567 / 1.156 / 2.828 / 7.740 | 338 | 2.962 / 2.980 / 3.392 |
 | hnswsq f8 (weighted-pairwise default) | 113.8 | 450,797,568 | 0.492 / 0.902 / 2.033 / 5.345 | 457 | 2.190 / 2.178 / 2.467 |
-| hnswsq sq8 (fixed [0,255] int8) | 125.2 | 469,581,824 | 0.480 / 0.915 / 2.059 / 5.429 | 461 | 2.169 / 2.175 / 2.435 |
-| hnswsq sq16 (fixed [0,255] int16) | 146.0 | 666,804,224 | 0.523 / 0.984 / 2.194 / 5.579 | 418 | 2.392 / 2.403 / 2.709 |
+| hnswsq sq8 (fixed [0,255] int8) | **114.4** | 469,581,824 | 0.508 / 0.976 / 2.278 / 5.448 | **504** | 1.985 / 1.971 / 2.268 |
+| hnswsq sq16 (fixed [0,255] int16) | 149.2 | 666,836,992 | 0.628 / 1.103 / 2.245 / 5.657 | 404 | 2.477 / 2.482 / 2.766 |
 
 (The table was restored to exactly 1M rows before this run; the
 DELETE+VACUUM reshuffled the physical layout, so the f8 calibration
@@ -191,15 +191,47 @@ On release PG the debug-box distortions are gone:
 - **fp16's halved memory traffic shows up**: queries beat plain at
   ef >= 40 (e.g. 5.215 vs 6.252 ms at ef640) at 65% of the size.
 - **f8 and the fixed-range sq8 tie on queries** (0.492–5.345 vs
-  0.480–5.429 ms — the same code space, both ahead of plain's
+  0.508–5.448 ms — the same code space, both ahead of plain's
   0.572–6.252) at 52% of plain's size; **sq8's inserts are the fastest
-  quantized layout** (461 rows/s, 2.17 ms/row, vs f8's 457) and its
+  quantized layout** (504 rows/s, 1.99 ms/row, vs f8's 457) and its
   per-row size matches f8's (376 B/row).  sq16 costs the expected
   +~50% size (513 B/row) and ~10% more query time for near-plain recall.
 - Quantized builds stay slower than plain (fp16 1.6x, fp8 2.8x, f8 1.7x,
-  sq8 1.9x, sq16 2.2x) — the per-dimension conversion cost in the
+  sq8 1.7x, sq16 2.2x) — the per-dimension conversion cost in the
   build's distance kernel; f8/sq8/sq16's insert rates are the best of
   the quantized layouts (buffer/backlink-bound, not distance-bound).
+
+### perf attribution (2026-09-16, `perf record` on the release build)
+
+Single-backend sq8 build (90s sample): **`distance_encoded_direct` 69.7%**,
+then visited-table insert (4.8%), candidate loading (5.3%),
+`select_neighbors` sort (1.8%) and heap pops (1.7%) — the build is
+distance-bound.  ef-640 scan (20s sample): pairwise distance kernel
+27.4%, `load_element_impl` 19.3%, `PinBuffer` 18.0%, `LWLockRelease`
+8.8%, `LWLockAttemptLock` 6.9% — the scan is buffer-manager-bound with
+the distance as the largest single symbol.
+
+Two changes followed:
+
+- **sq8 graph mutation now uses the integer pairwise distance** — for
+  `sq8` the build's query is the decoded vector, which is always
+  integral (decode = the codes themselves), so the integer pairwise is
+  value-identical to the f32 scalar form and the graph is unchanged.
+  Matrix: sq8 build 125.2 → **114.4s**, inserts 461 → **504 rows/s**,
+  recall identical (0.993/0.999/1.0 at ef 160/320/640).  `sq16` keeps
+  the scalar mutation path: its decoded domain is fractional
+  (code/128), where the integer form deviates from the f32 form at the
+  ulp level and those near-tie flips fragmented the graph (recall
+  collapsed to ~0.72 in the local suite — the same signature the old
+  ±1-range pairwise build showed).
+- **AVX-512 distance kernels** (the box has avx512f/bw/vl): 16-lane
+  versions of the weighted f8 pairwise, the fixed sq8/sq16 pairwise and
+  the fixed decode distances, with runtime dispatch.  The distance
+  share of an ef-640 scan dropped from 27% to **~2.5%**, leaving the
+  scan ~60% PostgreSQL buffer management (PinBuffer/LWLock/UnpinBuffer)
+  and ~20% element loading — the distance math is no longer a visible
+  scan cost.  The buffer-manager path (pgvector-identical) is the next
+  frontier.
 
 (The earlier version of this table, measured on the box's pgrx DEBUG
 PostgreSQL, is superseded: pgvector 107.1s / plain 71.0s / fp16 294.7s /
