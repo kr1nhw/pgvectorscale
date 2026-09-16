@@ -251,8 +251,8 @@ unsafe fn emit_distance(state: &ScanState, sc: &SearchCandidate) -> f64 {
         quantize::HnswPrecision::IeeeFp16 => 1.01,
         _ => 1.0,
     };
-    let sq8_half_norm = state.support.codec.sq8_scale_norm() / 2.0;
-    let e = rel_err * rel_margin * norm_v + sq8_half_norm;
+    let sq_error_norm = state.support.codec.quant_error_norm();
+    let e = rel_err * rel_margin * norm_v + sq_error_norm;
     let slack = 1e-4 * (1.0 + state.norm_q * norm_v);
 
     // The search distance may come from an integer-distance form

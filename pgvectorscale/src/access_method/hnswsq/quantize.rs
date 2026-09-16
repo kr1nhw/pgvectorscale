@@ -379,8 +379,11 @@ impl Codec {
                     if !(SQ_FIXED_MIN..=SQ_FIXED_MAX).contains(&x) {
                         clamped = true;
                     }
-                    // round-to-nearest, saturating cast → unsigned byte code.
-                    out.push(x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX).round() as u8);
+                    // Truncate toward zero (the native float->int cast; no
+                    // rounding instruction): byte-valued data is exact
+                    // either way, and truncation is the cheapest correct
+                    // quantization for this fixed range.
+                    out.push(x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX) as u8);
                 }
             }
             HnswPrecision::Sq16Fixed => {
@@ -389,7 +392,7 @@ impl Codec {
                     if !(SQ_FIXED_MIN..=SQ_FIXED_MAX).contains(&x) {
                         clamped = true;
                     }
-                    let q = (x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX) * 128.0).round() as u16;
+                    let q = (x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX) * 128.0) as u16;
                     out.extend_from_slice(&q.to_le_bytes());
                 }
             }
@@ -466,12 +469,12 @@ impl Codec {
             }
             HnswPrecision::Sq8Fixed => {
                 for &x in q.iter().take(self.dim) {
-                    qhat.push(x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX).round() as i16);
+                    qhat.push(x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX) as i16);
                 }
             }
             HnswPrecision::Sq16Fixed => {
                 for &x in q.iter().take(self.dim) {
-                    qhat.push((x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX) * 128.0).round() as i16);
+                    qhat.push((x.clamp(SQ_FIXED_MIN, SQ_FIXED_MAX) * 128.0) as i16);
                 }
             }
             _ => unreachable!("integer query state only for SQ layouts"),
@@ -502,7 +505,8 @@ impl Codec {
     /// 16000-dim limit, no overflow).  The scale is 1.0, so for in-range
     /// (byte-valued) vectors this equals the decoded-domain L2 of the
     /// quantized query exactly on the stored side (no per-dimension weights,
-    /// no calibration); the query carries only the standard half-step error.
+    /// no calibration); the query carries only the standard sub-step
+    /// truncation error.
     #[inline]
     pub fn distance_l2_sq8_fixed_pairwise(&self, qhat: &[i16], bytes: &[u8]) -> f32 {
         debug_assert_eq!(qhat.len(), self.dim);
@@ -673,15 +677,17 @@ impl Codec {
         finish(acc, dist_type)
     }
 
-    /// SQ layouts only: `sqrt(Σ scale_d²)` — the L2 norm of the per-dimension
-    /// quantization steps.  Half of it bounds the L2 norm of one vector's
-    /// quantization error `‖v̂ − v‖ ≤ scale_norm / 2` (round-to-nearest),
-    /// which the scan turns into provable distance lower bounds.  For the
-    /// fixed-range layouts every step is the global constant scale, so the
-    /// norm is `scale · √dim`.  Zero for the other layouts.
-    pub fn sq8_scale_norm(&self) -> f32 {
+    /// SQ layouts only: the L2 norm of one vector's worst-case quantization
+    /// error `‖v̂ − v‖`, which the scan turns into provable distance lower
+    /// bounds.  For round-to-nearest (the calibrated `f8`) the per-dimension
+    /// error is half a step, so the norm is `√(Σ scale_d²) / 2`; for the
+    /// fixed-range layouts the encode TRUNCATES (one full step per dim), so
+    /// the norm is `scale · √dim`.  Zero for the other layouts.
+    pub fn quant_error_norm(&self) -> f32 {
         match self.precision {
-            HnswPrecision::Sq8 => self.sq8_scales.iter().map(|s| s * s).sum::<f32>().sqrt(),
+            HnswPrecision::Sq8 => {
+                self.sq8_scales.iter().map(|s| s * s).sum::<f32>().sqrt() / 2.0
+            }
             HnswPrecision::Sq8Fixed => SQ8_FIXED_SCALE * (self.dim as f32).sqrt(),
             HnswPrecision::Sq16Fixed => SQ16_FIXED_SCALE * (self.dim as f32).sqrt(),
             _ => 0.0,
@@ -691,8 +697,8 @@ impl Codec {
 
 /// Maximum relative per-element error of the IEEE layouts (round-to-nearest):
 /// binary16 has 10 explicit mantissa bits (half-ulp 2^-11), E4M3 has 3
-/// (half-ulp 2^-4).  Zero for plain/SQ8 (SQ8 error is absolute; see
-/// [`Codec::sq8_scale_norm`]).
+/// (half-ulp 2^-4).  Zero for plain/SQ layouts (SQ error is absolute; see
+/// [`Codec::quant_error_norm`]).
 pub fn relative_element_error(precision: HnswPrecision) -> f32 {
     match precision {
         HnswPrecision::IeeeFp16 => 2.0f32.powi(-11),
@@ -1152,9 +1158,9 @@ mod tests {
                 assert!(!clamped, "sample data lies within [0, 255]");
                 let dec = codec.decode(&enc);
                 for (a, b) in v.iter().zip(dec.iter()) {
-                    // abs err ≤ half a quantization step
+                    // truncation: error in [0, 1) per dimension
                     assert!(
-                        (a - b).abs() <= scale / 2.0 + 1e-9,
+                        (a - b).abs() < scale + 1e-9,
                         "{:?}: error too large: {} vs {}",
                         p,
                         a,
@@ -1181,7 +1187,7 @@ mod tests {
             let Sq8QueryState::Pairwise(qhat) = codec2.sq8_query_state(&q, true);
             assert_eq!(qhat.len(), 2);
             for (&qh, &x) in qhat.iter().zip(q.iter()) {
-                let want = (x * max_code).round() as i16;
+                let want = (x * max_code) as i16; // truncating cast, like encode
                 assert_eq!(qh, want, "{:?}", p);
             }
         }
@@ -1190,8 +1196,8 @@ mod tests {
     /// THE fixed-range property: the code-pairwise distance equals the
     /// decoded-domain L2 distance of the quantized query times a global
     /// constant (the code side is exact — no per-dimension weights, no
-    /// calibration; the query side carries the standard half-step
-    /// quantization, exactly like the calibrated f8 pairwise).
+    /// calibration; the query side carries the standard sub-step
+    /// truncation error).
     #[test]
     fn test_fixed_sq_pairwise_is_exact_decoded_l2() {
         use crate::access_method::distance::DistanceType;
@@ -1238,12 +1244,13 @@ mod tests {
                     want * k2
                 );
                 // And the raw-query decoded distance is within the query
-                // quantization error (half a step per dim).
+                // quantization error: ‖q̂·scale − q‖ ≤ q_err, so
+                // |d(q̂,v̂) − d(q,v̂)| ≤ q_err·(2‖q−v̂‖ + q_err).
                 let decoded_raw = codec.distance_encoded_direct(DistanceType::L2, &q, &enc);
-                let slack = (dim as f32).sqrt() * scale / 2.0 * 4.0;
+                let q_err = (dim as f32).sqrt() * scale;
+                let bound = q_err * (2.0 * decoded_raw.sqrt() + q_err);
                 assert!(
-                    (got * scale * scale - decoded_raw).abs()
-                        <= slack * (1.0 + decoded_raw.sqrt()),
+                    (got * scale * scale - decoded_raw).abs() <= bound * 1.001 + 1e-3,
                     "{:?}: pairwise {} vs raw decoded {}",
                     p,
                     got * scale * scale,
@@ -1361,5 +1368,52 @@ mod tests {
         assert_eq!(e4m3_to_f32(0x01), 2.0f32.powi(-9));
         assert_eq!(f32_to_e4m3(-3.0), 0x80 | 0x44); // -3 = (8+4)*2^-3+... verify by decode
         assert_eq!(e4m3_to_f32(f32_to_e4m3(-3.0)), -3.0);
+    }
+
+    /// Informational micro-benchmark: encode cost, round vs truncation
+    /// (~140 vs ~103 ns per dim-128 vector on this machine).
+    #[test]
+    #[ignore]
+    fn bench_encode_round_vs_trunc() {
+        let dim = 128;
+        let v: Vec<f32> = (0..dim).map(|i| i as f32 * 1.7 + 0.3).collect();
+        let mut out = Vec::with_capacity(dim);
+        let n = 500_000usize;
+
+        // Round-to-nearest variant (the pre-truncation encode).
+        for _ in 0..10_000 {
+            out.clear();
+            for &x in &v {
+                let x = super::sanitize(x);
+                out.push(x.clamp(0.0f32, 255.0f32).round() as u8);
+            }
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            out.clear();
+            for &x in &v {
+                let x = super::sanitize(x);
+                out.push(x.clamp(0.0f32, 255.0f32).round() as u8);
+            }
+        }
+        println!("round-based: {} ns/vec", t0.elapsed().as_nanos() / n as u128);
+
+        // Truncation variant: clamp + native truncating cast, no round().
+        for _ in 0..10_000 {
+            out.clear();
+            for &x in &v {
+                let x = super::sanitize(x);
+                out.push(x.clamp(0.0f32, 255.0f32) as u8);
+            }
+        }
+        let t1 = std::time::Instant::now();
+        for _ in 0..n {
+            out.clear();
+            for &x in &v {
+                let x = super::sanitize(x);
+                out.push(x.clamp(0.0f32, 255.0f32) as u8);
+            }
+        }
+        println!("trunc-based: {} ns/vec", t1.elapsed().as_nanos() / n as u128);
     }
 }

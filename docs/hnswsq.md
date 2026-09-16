@@ -13,8 +13,8 @@ the scan contract that goes with them:
 | `ieeefp16` (alias `f16`) | IEEE 754 binary16 (half) | 2 | ~1/2× | **none — stateless cast** |
 | `ieeefp8` | OCP FP8 **E4M3** | 1 | ~1/4× | **none — stateless cast** |
 | `f8` | Lance-style SQ8: per-dimension min/max linear | 1 | ~1/4× | calibrated at CREATE INDEX |
-| `sq8` | fixed-range int8: `round(clamp(x, 0, 255))`, scale 1.0 | 1 | ~1/4× | **none — global fixed range** |
-| `sq16` | fixed-range int16: `round(clamp(x, 0, 255) · 128)`, scale 2⁻⁷ | 2 | ~1/2× | **none — global fixed range** |
+| `sq8` | fixed-range int8: `trunc(clamp(x, 0, 255))`, scale 1.0 | 1 | ~1/4× | **none — global fixed range** |
+| `sq16` | fixed-range int16: `trunc(clamp(x, 0, 255) · 128)`, scale 2⁻⁷ | 2 | ~1/2× | **none — global fixed range** |
 
 The IEEE layouts and the fixed-range `sq8`/`sq16` are **training-free**: no
 calibration artifact, no range drift, identical behavior on bulk builds and on
@@ -30,9 +30,9 @@ domain of BIGANN/SIFT-style byte-valued vectors, which encode *losslessly*
 at scale 2⁻⁷).  Their distances are computable **directly from the integer
 codes**: `Σ (q̂ − code)²` is the decoded-domain L2 distance of the quantized
 query times one global constant (the stored side is exact for in-range data;
-the query carries only the standard half-step error).  The graph itself is
+the query carries only the sub-step truncation error, < 1 per dim).  The graph itself is
 always constructed with the exact decoded distance (graph mutation never uses
-the query-quantized form: on clustered data the half-step noise rivals
+the query-quantized form: on clustered data the sub-step noise rivals
 intra-cluster spacing and fragments the neighbor graph), while scans use the
 fast integer-code form under `hnswsq.sq8_distance = pairwise`.
 
@@ -130,7 +130,7 @@ sequential scan.
   the only layout that needs calibration: build it over representative data,
   or accept the provisional `[-1, 1]` range on empty-start indexes until
   REINDEX.
-- **`sq8`** — ~4× smaller; fixed-range int8 (`round(clamp(x, 0, 255))`,
+- **`sq8`** — ~4× smaller; fixed-range int8 (`trunc(clamp(x, 0, 255))`,
   scale 1.0 — byte-valued vectors store losslessly).  No calibration at all —
   the training-free 1-byte layout.  Distances are computed directly from the
   codes (`Σ (q̂ − code)²`, pure integer arithmetic), and the stored side is
@@ -140,7 +140,7 @@ sequential scan.
   provable lower bound, never its validity), so it is aimed at byte-domain
   data — BIGANN/SIFT-style uint8 vectors encode exactly.
 - **`sq16`** — ~2× smaller; the same fixed-range design with 128 sub-steps
-  per unit (`round(clamp(x, 0, 255) · 128)`, scale 2⁻⁷): near-plain accuracy
+  per unit (`trunc(clamp(x, 0, 255) · 128)`, scale 2⁻⁷): near-plain accuracy
   (≤ 2⁻⁸ error per in-range component) with half the bytes and
   training-free.
 

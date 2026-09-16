@@ -694,7 +694,7 @@ pub fn sq8_query_state(
 /// The distance mode for GRAPH-MUTATING searches (build, insert, vacuum
 /// repair).  The fixed-range layouts (`sq8`, `sq16`) always construct their
 /// graph with the exact code-direct distance: the integer pairwise form
-/// quantizes the query, and that half-step noise rivals intra-cluster
+/// quantizes the query, and that sub-step noise rivals intra-cluster
 /// distances, so neighbor selection with it fragments the graph (measured on
 /// clustered data: recall collapsed to ~0.75 with a pairwise-built graph vs
 /// 1.0 with an exact-built one, at every ef).  The read-only scan still uses
