@@ -253,26 +253,26 @@ The port is a faithful translation of pgvector's build (`.design/hnswsq2_port.md
 lists the sanctioned divergences — deterministic `BinaryHeap` candidates with a
 packed-TID tie-break instead of pairing heaps, a reimplemented relptr, codec-based
 distances, a caller-owned scratch instead of reset contexts, and the SQ8
-calibration chain written before the parallel phase). The retired engine's
-bespoke in-memory machinery (`search_layer_mem`, `DistBuf`, the incremental
-backlink re-prune) is gone with it.
+calibration chain written before the parallel phase).
 
-Measured builds, **release builds**, `m=16`, `ef_construction=64`:
+Measured builds, **release builds**, `m=16`, `ef_construction=64`, on
+121.37.117.106 (32 vCPU, PG 17.11, 1M BIGANN dim 128, mwm 8GB, 4 workers):
 
-| dataset | box | hnswsq | pgvector | ratio |
+| config | build s | size B/vec | qms ef10/40/160/640 | ins rows/s |
 |---|---|---|---|---|
-| 100k × 128 i.i.d., mwm 2GB | local (Apple M4 Pro, PG 18) | **6.9 s** | 7.5 s | **0.92x** |
-| 1M BIGANN dim 128, mwm 8GB, 4 workers | 121.37.117.106 (32 vCPU, PG 17.11) | **59 s** | 102 s | **0.58x** |
-| 1M BIGANN, single backend | 121.37.117.106 | – | 446 s | – |
-| 1M BIGANN, 32 workers | 121.37.117.106 | – | 64 s | – |
+| pgvector hnsw | 64.7 | 832 | 0.545 / 0.913 / 2.196 / 6.291 | 691 |
+| hnswsq plain | 66.9 | 819 | 0.572 / 0.990 / 2.317 / 6.252 | 696 |
+| hnswsq ieeefp16 | 108.5 | 513 | 0.487 / 0.933 / 2.068 / 5.215 | 336 |
+| hnswsq ieeefp8 | 188.0 | 376 | 0.567 / 1.156 / 2.828 / 7.740 | 338 |
+| hnswsq f8 | 113.8 | 376 | 0.492 / 0.902 / 2.033 / 5.345 | 457 |
+| hnswsq sq8 | 114.4 | 376 | 0.508 / 0.976 / 2.278 / 5.448 | 504 |
+| hnswsq sq16 | 149.2 | 513 | 0.628 / 1.103 / 2.245 / 5.657 | 404 |
 
-Index size on the 1M table: hnswsq **819 B/vec** vs pgvector **832 B/vec**
-(−1.6%).  Query sweep on the same table (mean ms, LIMIT 10, 100 queries):
-0.696 / 1.151 / 2.445 / 6.609 at ef 10/40/160/640 vs pgvector
-0.618 / 1.115 / 2.491 / 6.982 — **0.95–0.98x at ef ≥ 160**.  Recall@10:
-99.3% vs 99.2% at ef 160, 100.0% for both at ef 640.  Full numbers and both
-engines' `perf` profiles (both buffer-manager-bound: PinBuffer /
-`load_element_impl` / LWLockRelease dominate) in
+Recall@10 on the same table: plain 0.994/0.999/1.0 at ef 160/320/640 vs
+pgvector 0.991/0.999/1.0; the quantized layouts land within 0.4pt across
+the ef sweep (fp8 is ~1pt down at low ef).  Full numbers, the per-layout
+recall sweep, and both engines' `perf` profiles (build: distance-bound;
+scan: buffer-manager-bound — see the AVX-512 attribution) are in
 `.design/neon/bench/RESULTS-HNSWSQ.md`; the local-methodology A/B and the
 storage-layout size/latency table are in `.design/hnswsq2_perf_local.md`.
 
@@ -299,15 +299,15 @@ CREATE INDEX ON items USING hnswsq (embedding vector_l2_ops)
     WITH (storage_layout = 'plain', m = 16, ef_construction = 64);
 ```
 
-Measured on the 1M BIGANN box (32 vCPU, release, same server settings for both
-engines):
+Measured on the 1M BIGANN box (32 vCPU, release PG 17.11, same server
+settings for both engines):
 
 | engine | workers | wall |
 |---|---|---|
-| hnswsq | 4 (server default) | **59 s** |
-| pgvector | 4 (server default) | 102 s |
-| pgvector | 1 | 446 s |
-| pgvector | 32 | 64 s |
+| pgvector hnsw | 4 (server default) | 64.7 s |
+| hnswsq plain | 4 (server default) | 66.9 s |
+| hnswsq sq8 (fixed int8) | 4 (server default) | 114.4 s |
+| hnswsq sq16 (fixed int16) | 4 (server default) | 149.2 s |
 
 The cross-process path is exercised by the test suite (parallel-build scaffold)
 and was A/B-verified against the single-builder path during the port; recall
