@@ -116,6 +116,190 @@ pub fn distance_l2_unoptimized(a: &[f32], b: &[f32]) -> f32 {
     norm
 }
 
+// ---------------------------------------------------------------------------
+// Distances against fp16 (binary16) stored vectors.  The binary16 bit pattern
+// is ORDER-preserving, so f16 -> f32 is field moves on the pattern (no IEEE
+// decode machinery); the accumulation is the same SIMD FMA as the f32 kernels.
+// ---------------------------------------------------------------------------
+
+/// Branchless f16 -> f32: the normal case is a few integer ops; subnormals and
+/// inf/nan take the exact slow path (essentially never on real data).
+#[inline]
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h as u32 & 0x8000) << 16;
+    let abs = h as u32 & 0x7FFF;
+    let exp = abs >> 10;
+    if exp == 0 || exp == 31 {
+        // subnormal / inf / nan
+        return half::f16::from_bits(h).to_f32();
+    }
+    // exp - 15 + 127 = exp + 112
+    f32::from_bits(sign | ((exp + 112) << 23) | ((abs & 0x3FF) << 13))
+}
+
+/// L2 squared between the f32 query and an f16 vector (little-endian bytes).
+#[inline]
+pub fn distance_l2_f16(q: &[f32], v: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_f16_x86(q, v);
+    }
+    #[allow(unreachable_code)]
+    distance_l2_f16_scalar(q, v)
+}
+
+/// Dot product between the f32 query and an f16 vector (little-endian bytes).
+#[inline]
+pub fn distance_inner_product_f16(q: &[f32], v: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_inner_product_f16_x86(q, v);
+    }
+    #[allow(unreachable_code)]
+    distance_inner_product_f16_scalar(q, v)
+}
+
+#[inline]
+pub fn distance_l2_f16_scalar(q: &[f32], v: &[u8]) -> f32 {
+    debug_assert_eq!(q.len() * 2, v.len());
+    let mut acc = 0.0f32;
+    for i in 0..q.len() {
+        let x = f16_to_f32(u16::from_le_bytes([v[2 * i], v[2 * i + 1]]));
+        let d = q[i] - x;
+        acc += d * d;
+    }
+    acc
+}
+
+/// Scale-weighted pairwise SQ8 distance: `SUM w_i * (qhat - code)^2` with
+/// `w = scale^2` per dimension.
+#[inline]
+pub fn distance_l2_sq8_pairwise(qhat: &[i16], code: &[u8], w: &[f32]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_sq8_pairwise_x86(qhat, code, w);
+    }
+    #[allow(unreachable_code)]
+    distance_l2_sq8_pairwise_scalar(qhat, code, w)
+}
+
+#[inline]
+pub fn distance_l2_sq8_pairwise_scalar(qhat: &[i16], code: &[u8], w: &[f32]) -> f32 {
+    debug_assert_eq!(qhat.len(), code.len());
+    debug_assert_eq!(qhat.len(), w.len());
+    let mut acc = 0.0f32;
+    for i in 0..qhat.len() {
+        let d = (qhat[i] - code[i] as i16) as f32;
+        acc += w[i] * d * d;
+    }
+    acc
+}
+
+/// Fixed-range (training-free) `sq8` pairwise: `SUM (qhat - code)^2` over the
+/// unsigned byte codes, pure i32 integer accumulation.  Safe up to the
+/// 16000-dim limit: `16000 * 255^2 ≈ 1.04e9 < i32::MAX`.  The quantization
+/// step is one global constant (scale 1.0), so for byte-valued vectors this
+/// is the decoded-domain L2 of the quantized query — the stored side is
+/// exact.
+#[inline]
+pub fn distance_l2_sq8_fixed_pairwise(qhat: &[i16], code: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_sq8_fixed_pairwise_x86(qhat, code);
+    }
+    #[allow(unreachable_code)]
+    distance_l2_sq8_fixed_pairwise_scalar(qhat, code)
+}
+
+#[inline]
+pub fn distance_l2_sq8_fixed_pairwise_scalar(qhat: &[i16], code: &[u8]) -> f32 {
+    debug_assert_eq!(qhat.len(), code.len());
+    let mut acc = 0i32;
+    for i in 0..qhat.len() {
+        let d = qhat[i] as i32 - code[i] as i32;
+        acc += d * d;
+    }
+    acc as f32
+}
+
+/// Fixed-range (training-free) `sq16` pairwise: `SUM (qhat - code)^2` over
+/// the u16 codes, i64 accumulation (per-dimension differences up to 65280
+/// square past i32).  Equals the decoded-domain L2 of the quantized query
+/// times `128^2`.
+#[inline]
+pub fn distance_l2_sq16_fixed_pairwise(qhat: &[i16], code: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_sq16_fixed_pairwise_x86(qhat, code);
+    }
+    #[allow(unreachable_code)]
+    distance_l2_sq16_fixed_pairwise_scalar(qhat, code)
+}
+
+/// Fixed-range `sq8` decode distance: `SUM (q - code)^2` (scale 1.0) — the
+/// scalar-mode / graph-mutation path.  Dispatches to the 16-lane AVX-512
+/// kernel where available.
+#[inline]
+pub fn distance_l2_sq8_fixed_decode(q: &[f32], code: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_sq8_fixed_decode_x86(q, code);
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut acc = 0.0f32;
+        for i in 0..q.len() {
+            let d = q[i] - code[i] as f32;
+            acc += d * d;
+        }
+        acc
+    }
+}
+
+/// Fixed-range `sq16` decode distance: `SUM (q - code * 2^-7)^2` — the
+/// scalar-mode / graph-mutation path.  Dispatches to the 8-lane AVX-512
+/// kernel where available.
+#[inline]
+pub fn distance_l2_sq16_fixed_decode(q: &[f32], code: &[u8]) -> f32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        return distance_x86::distance_l2_sq16_fixed_decode_x86(q, code);
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut acc = 0.0f32;
+        for i in 0..q.len() {
+            let x = u16::from_le_bytes([code[2 * i], code[2 * i + 1]]) as f32 * 0.007_812_5;
+            let d = q[i] - x;
+            acc += d * d;
+        }
+        acc
+    }
+}
+
+#[inline]
+pub fn distance_l2_sq16_fixed_pairwise_scalar(qhat: &[i16], code: &[u8]) -> f32 {
+    debug_assert_eq!(qhat.len() * 2, code.len());
+    let mut acc = 0i64;
+    for i in 0..qhat.len() {
+        let c = i16::from_le_bytes([code[2 * i], code[2 * i + 1]]);
+        let d = qhat[i] as i64 - c as i64;
+        acc += d * d;
+    }
+    acc as f32
+}
+
+#[inline]
+pub fn distance_inner_product_f16_scalar(q: &[f32], v: &[u8]) -> f32 {
+    debug_assert_eq!(q.len() * 2, v.len());
+    let mut acc = 0.0f32;
+    for i in 0..q.len() {
+        let x = f16_to_f32(u16::from_le_bytes([v[2 * i], v[2 * i + 1]]));
+        acc += q[i] * x;
+    }
+    acc
+}
+
 /* PQ computes distances on subsegments that have few dimensions (e.g. 6). This function optimizes that.
 * We optimize by telling the compiler exactly how long the slices are. This allows the compiler to figure
 * out SIMD optimizations. Look at the benchmark results. */

@@ -46,10 +46,14 @@ pub enum PageType {
     IvfSegmentList = 17,
     IvfActiveBuffer = 18,
     IvfFreeList = 19,
-    AgentVecMeta = 20,
-    AgentVecDirectory = 21,
-    AgentVecSegmentHeader = 22,
-    AgentVecFlatPage = 23,
+    HnswMeta = 20,
+    HnswNode = 21,
+    HnswCalibration = 22,
+    HnswFreePages = 23,
+    AgentVecMeta = 24,
+    AgentVecDirectory = 25,
+    AgentVecSegmentHeader = 26,
+    AgentVecFlatPage = 27,
 }
 
 impl PageType {
@@ -75,10 +79,14 @@ impl PageType {
             17 => PageType::IvfSegmentList,
             18 => PageType::IvfActiveBuffer,
             19 => PageType::IvfFreeList,
-            20 => PageType::AgentVecMeta,
-            21 => PageType::AgentVecDirectory,
-            22 => PageType::AgentVecSegmentHeader,
-            23 => PageType::AgentVecFlatPage,
+            20 => PageType::HnswMeta,
+            21 => PageType::HnswNode,
+            22 => PageType::HnswCalibration,
+            23 => PageType::HnswFreePages,
+            24 => PageType::AgentVecMeta,
+            25 => PageType::AgentVecDirectory,
+            26 => PageType::AgentVecSegmentHeader,
+            27 => PageType::AgentVecFlatPage,
             _ => panic!("Unknown PageType number {}", value),
         }
     }
@@ -97,6 +105,7 @@ impl PageType {
             || matches!(self, PageType::IvfListHeader)
             || matches!(self, PageType::IvfSegmentList)
             || matches!(self, PageType::IvfFreeList)
+            || matches!(self, PageType::HnswCalibration)
             || matches!(self, PageType::AgentVecDirectory)
     }
 }
