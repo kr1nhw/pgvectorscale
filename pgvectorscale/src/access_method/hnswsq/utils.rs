@@ -107,9 +107,9 @@ pub unsafe fn resolve_distance_type(index: pg_sys::Relation) -> DistanceType {
 /// Build the [`Support`] for an already-initialized index (insert/scan/vacuum):
 /// distance type from the opclass, precision/dimensions/calibration from the
 /// metapage.
-pub unsafe fn init_support(index: pg_sys::Relation) -> Support {
+pub unsafe fn init_support(index: pg_sys::Relation, base: pg_sys::BlockNumber) -> Support {
     let dist_type = resolve_distance_type(index);
-    let (precision, dimensions, calibration) = meta_page_layout(index);
+    let (precision, dimensions, calibration) = meta_page_layout(index, base);
     let codec = if precision.needs_calibration() {
         let calib = Sq8Calibration::load(&PgRelation::from_pg(index), calibration);
         Codec::new_sq8(&calib)
@@ -345,10 +345,11 @@ pub unsafe fn page_get_meta(page: pg_sys::Page) -> *mut MetaPageData {
 /// `HnswGetMetaPageInfo` — fetch m and/or the entry point from the metapage.
 pub unsafe fn get_meta_page_info(
     index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
     m: Option<&mut usize>,
     entry: Option<&mut Option<Box<Element>>>,
 ) {
-    let buf = pg_sys::ReadBuffer(index, METAPAGE_BLKNO);
+    let buf = pg_sys::ReadBuffer(index, metapage_block(base));
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
     let page = pg_sys::BufferGetPage(buf);
     let metap = page_get_meta(page);
@@ -390,17 +391,21 @@ pub unsafe fn ip_offset(tid: &pg_sys::ItemPointerData) -> pg_sys::OffsetNumber {
 }
 
 /// `HnswGetEntryPoint`.
-pub unsafe fn get_entry_point(index: pg_sys::Relation) -> Option<Box<Element>> {
+pub unsafe fn get_entry_point(
+    index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
+) -> Option<Box<Element>> {
     let mut entry = None;
-    get_meta_page_info(index, None, Some(&mut entry));
+    get_meta_page_info(index, base, None, Some(&mut entry));
     entry
 }
 
 /// Read `(precision, dimensions, calibration pointer)` from the metapage.
 pub unsafe fn meta_page_layout(
     index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
 ) -> (HnswPrecision, usize, crate::util::ItemPointer) {
-    let buf = pg_sys::ReadBuffer(index, METAPAGE_BLKNO);
+    let buf = pg_sys::ReadBuffer(index, metapage_block(base));
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
     let page = pg_sys::BufferGetPage(buf);
     let metap = page_get_meta(page);
@@ -424,12 +429,13 @@ pub unsafe fn meta_page_layout(
 /// The caller must not hold any other buffer content lock.
 pub unsafe fn update_meta_page(
     index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
     update_entry: i32,
     entry_point: Option<*mut Element>,
     insert_page: pg_sys::BlockNumber,
     building: bool,
 ) {
-    let buf = pg_sys::ReadBuffer(index, METAPAGE_BLKNO);
+    let buf = pg_sys::ReadBuffer(index, metapage_block(base));
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
     let state = if building {
         std::ptr::null_mut()
@@ -479,13 +485,31 @@ pub unsafe fn update_meta_page(
 /// Called once per build, before any graph page exists.
 pub unsafe fn create_meta_page(
     index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
     dimensions: usize,
     m: usize,
     ef_construction: usize,
     precision: HnswPrecision,
     calibration: crate::util::ItemPointer,
 ) {
+    // The metapage must land exactly at `base`, the region's first block.
+    // `new_buffer` extends the relation (the caller holds the extension lock,
+    // so the size check and the extension are atomic with respect to other
+    // extenders); the assert turns any base/end mismatch into a clear panic
+    // instead of a misplaced region.  (RBM_ZERO_AND_LOCK is deliberately not
+    // used: on an empty relation it takes PG18's ExtendBufferedRelShared
+    // path, which errors with "unexpected data beyond EOF".)
+    assert_eq!(
+        pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM),
+        base,
+        "hnswsq: region base does not match the relation end",
+    );
     let buf = new_buffer(index);
+    assert_eq!(
+        pg_sys::BufferGetBlockNumber(buf),
+        base,
+        "hnswsq: metapage did not land at region base"
+    );
     let page = pg_sys::BufferGetPage(buf);
     init_page(buf, page);
 
@@ -520,8 +544,12 @@ pub unsafe fn create_meta_page(
 ///
 /// # Safety
 /// The caller must not hold any other buffer content lock.
-pub unsafe fn set_meta_calibration(index: pg_sys::Relation, ptr: crate::util::ItemPointer) {
-    let buf = pg_sys::ReadBuffer(index, METAPAGE_BLKNO);
+pub unsafe fn set_meta_calibration(
+    index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
+    ptr: crate::util::ItemPointer,
+) {
+    let buf = pg_sys::ReadBuffer(index, metapage_block(base));
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
     let page = pg_sys::BufferGetPage(buf);
     let metap = page_get_meta(page);

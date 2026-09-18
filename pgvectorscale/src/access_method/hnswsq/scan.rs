@@ -32,6 +32,8 @@ use crate::access_method::pg_vector::PgVectorInternal;
 /// The scan state (pgvector `HnswScanOpaqueData` + the emission contract).
 pub struct ScanState {
     pub support: Support,
+    /// Base block of the hnswsq region (0 for the standalone AM).
+    pub base: pg_sys::BlockNumber,
     pub first: bool,
     /// The result candidates, furthest-first (pgvector drains `llast`).
     pub w: Vec<SearchCandidate>,
@@ -71,7 +73,7 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
     // Get m and entry point
     let mut m = 0usize;
     let mut entry = None;
-    get_meta_page_info(index, Some(&mut m), Some(&mut entry));
+    get_meta_page_info(index, state.base, Some(&mut m), Some(&mut entry));
     state.m = m;
 
     let Some(entry) = entry else {
@@ -314,7 +316,7 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     norderbys: std::os::raw::c_int,
 ) -> pg_sys::IndexScanDesc {
     let scan = pg_sys::RelationGetIndexScan(index, nkeys, norderbys);
-    let support = init_support(index);
+    let support = init_support(index, HNSW_STANDALONE_BASE);
     let m = get_m(index);
     let tmp_ctx = PgMemoryContexts::new("hnswsq scan temporary context");
 
@@ -333,6 +335,7 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     let state = Box::new(ScanState {
         recheck_orderby: support.precision != HnswPrecision::Plain,
         support,
+        base: HNSW_STANDALONE_BASE,
         first: true,
         w: Vec::new(),
         // Sized for the worst-case ef (1000) like pgvector's
@@ -417,9 +420,9 @@ pub unsafe extern "C-unwind" fn amgettuple(
 
         // A shared lock lets vacuum ensure no in-flight scans before marking
         // tuples deleted.
-        pg_sys::LockPage(index, SCAN_LOCK_PAGE, pg_sys::ShareLock as pg_sys::LOCKMODE);
+        pg_sys::LockPage(index, scan_lock_page(state.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
         state.w = get_scan_items(state, index);
-        pg_sys::UnlockPage(index, SCAN_LOCK_PAGE, pg_sys::ShareLock as pg_sys::LOCKMODE);
+        pg_sys::UnlockPage(index, scan_lock_page(state.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
 
         // The iterative scan owns its discarded heap from the start.
         if HNSW_ITERATIVE_SCAN.get().as_i32() != ITERATIVE_SCAN_OFF {
@@ -468,9 +471,9 @@ pub unsafe extern "C-unwind" fn amgettuple(
                 // Locking ensures when neighbors are read, the elements they
                 // reference will not be deleted (and replaced) during the
                 // iteration.
-                pg_sys::LockPage(index, SCAN_LOCK_PAGE, pg_sys::ShareLock as pg_sys::LOCKMODE);
+                pg_sys::LockPage(index, scan_lock_page(state.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
                 state.w = resume_scan_items(state, index);
-                pg_sys::UnlockPage(index, SCAN_LOCK_PAGE, pg_sys::ShareLock as pg_sys::LOCKMODE);
+                pg_sys::UnlockPage(index, scan_lock_page(state.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
             }
 
             if state.w.is_empty() {

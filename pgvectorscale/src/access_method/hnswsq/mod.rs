@@ -191,7 +191,7 @@ fn hnswsq_diag(index: PgRelation) -> String {
     let mut head = pg_sys::InvalidBlockNumber;
     let mut entry = None;
     unsafe {
-        let buf = pg_sys::ReadBuffer(index_rel, METAPAGE_BLKNO);
+        let buf = pg_sys::ReadBuffer(index_rel, metapage_block(HNSW_STANDALONE_BASE));
         pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
         let page = pg_sys::BufferGetPage(buf);
         let metap = page_get_meta(page);
@@ -251,7 +251,7 @@ fn hnswsq_diag(index: PgRelation) -> String {
         unsafe {
             while let Some(p) = queue.pop_front() {
                 let mut elem = init_element_from_block(p.block_number, p.offset);
-                let support = init_support(index_rel);
+                let support = init_support(index_rel, HNSW_STANDALONE_BASE);
                 let mut dist = 0.0f32;
                 let ok = load_element_impl(
                     p.block_number,
@@ -333,7 +333,7 @@ fn hnswsq_dump(index: PgRelation) -> String {
     unsafe {
         let mut head = pg_sys::InvalidBlockNumber;
         {
-            let buf = pg_sys::ReadBuffer(index_rel, METAPAGE_BLKNO);
+            let buf = pg_sys::ReadBuffer(index_rel, metapage_block(HNSW_STANDALONE_BASE));
             pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
             let page = pg_sys::BufferGetPage(buf);
             let metap = page_get_meta(page);
@@ -348,7 +348,7 @@ fn hnswsq_dump(index: PgRelation) -> String {
             pg_sys::UnlockReleaseBuffer(buf);
         }
         let mut blkno = head;
-        let support = init_support(index_rel);
+        let support = init_support(index_rel, HNSW_STANDALONE_BASE);
         let m = get_m(index_rel);
         while blkno != pg_sys::InvalidBlockNumber {
             let buf = pg_sys::ReadBuffer(index_rel, blkno);

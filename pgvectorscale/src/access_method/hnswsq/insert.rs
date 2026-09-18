@@ -22,8 +22,8 @@ use crate::access_method::pg_vector::PgVectorInternal;
 use crate::util::ports::{PageGetItem, PageGetItemId, PageGetMaxOffsetNumber};
 
 /// `GetInsertPage` (hnswinsert.c): the append hint from the metapage.
-pub unsafe fn get_insert_page(index: pg_sys::Relation) -> pg_sys::BlockNumber {
-    let buf = pg_sys::ReadBuffer(index, METAPAGE_BLKNO);
+pub unsafe fn get_insert_page(index: pg_sys::Relation, base: pg_sys::BlockNumber) -> pg_sys::BlockNumber {
+    let buf = pg_sys::ReadBuffer(index, metapage_block(base));
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
     let page = pg_sys::BufferGetPage(buf);
     let metap = page_get_meta(page);
@@ -682,6 +682,7 @@ unsafe fn update_neighbor_on_disk(
 /// `HnswUpdateNeighborsOnDisk` (hnswinsert.c).
 pub unsafe fn update_neighbors_on_disk(
     index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
     support: &Support,
     e: *mut Element,
     m: usize,
@@ -732,6 +733,7 @@ pub unsafe fn update_neighbors_on_disk(
 /// `UpdateGraphOnDisk` (hnswinsert.c), minus the duplicate search.
 unsafe fn update_graph_on_disk(
     index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
     support: &Support,
     element: *mut Element,
     m: usize,
@@ -751,7 +753,7 @@ unsafe fn update_graph_on_disk(
         support,
         element,
         m,
-        get_insert_page(index),
+        get_insert_page(index, base),
         &mut new_insert_page,
         building,
     );
@@ -760,6 +762,7 @@ unsafe fn update_graph_on_disk(
     if new_insert_page != pg_sys::InvalidBlockNumber {
         update_meta_page(
             index,
+            base,
             0,
             None,
             new_insert_page,
@@ -770,6 +773,7 @@ unsafe fn update_graph_on_disk(
     // Update neighbors
     update_neighbors_on_disk(
         index,
+        base,
         support,
         element,
         m,
@@ -785,6 +789,7 @@ unsafe fn update_graph_on_disk(
     if entry_point.is_none() || (*element).level > entry_point.unwrap().level {
         update_meta_page(
             index,
+            base,
             UPDATE_ENTRY_GREATER,
             Some(element),
             pg_sys::InvalidBlockNumber,
@@ -871,6 +876,7 @@ fn with_insert_scratch(
 /// lower-bound proof).
 pub unsafe fn insert_tuple_on_disk(
     index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
     support: &Support,
     value: &[u8],
     heaptid: &pg_sys::ItemPointerData,
@@ -882,12 +888,12 @@ pub unsafe fn insert_tuple_on_disk(
     // Get a shared lock. This allows vacuum to ensure no in-flight inserts
     // before repairing graph. Use a page lock so it does not interfere with
     // buffer locks (or reads when vacuuming).
-    pg_sys::LockPage(index, UPDATE_LOCK_PAGE, lockmode);
+    pg_sys::LockPage(index, update_lock_page(base), lockmode);
 
     // Get m and entry point
     let mut m = 0usize;
     let mut entry = None;
-    get_meta_page_info(index, Some(&mut m), Some(&mut entry));
+    get_meta_page_info(index, base, Some(&mut m), Some(&mut entry));
 
     // Create an element.  The level honors hnswsq.build_seed when pinned:
     // entropy-seeded insert levels make the incremental tests' exact-match
@@ -910,14 +916,14 @@ pub unsafe fn insert_tuple_on_disk(
     let mut entry_locked = false;
     if entry.is_none() || (*element).level > entry.as_ref().unwrap().level {
         // Release shared lock
-        pg_sys::UnlockPage(index, UPDATE_LOCK_PAGE, lockmode);
+        pg_sys::UnlockPage(index, update_lock_page(base), lockmode);
 
         // Get exclusive lock
         lockmode = pg_sys::ExclusiveLock as pg_sys::LOCKMODE;
-        pg_sys::LockPage(index, UPDATE_LOCK_PAGE, lockmode);
+        pg_sys::LockPage(index, update_lock_page(base), lockmode);
 
         // Get latest entry point after lock is acquired
-        entry = get_entry_point(index);
+        entry = get_entry_point(index, base);
         entry_locked = true;
     }
 
@@ -950,6 +956,7 @@ pub unsafe fn insert_tuple_on_disk(
         // Update graph on disk
         update_graph_on_disk(
             index,
+            base,
             support,
             element,
             m,
@@ -964,7 +971,7 @@ pub unsafe fn insert_tuple_on_disk(
     });
 
     // Release lock
-    pg_sys::UnlockPage(index, UPDATE_LOCK_PAGE, lockmode);
+    pg_sys::UnlockPage(index, update_lock_page(base), lockmode);
 
     let _ = entry_locked;
     true
@@ -991,7 +998,7 @@ pub unsafe extern "C-unwind" fn aminsert(
     // allocations die here.
     let mut insert_ctx = PgMemoryContexts::new("hnswsq insert temporary context");
     insert_ctx.switch_to(|_| {
-        let support = init_support(index);
+        let support = init_support(index, HNSW_STANDALONE_BASE);
 
         // Extract the vector (detoast-copy pattern shared with the old paths).
         let datum = *values;
@@ -1006,7 +1013,7 @@ pub unsafe extern "C-unwind" fn aminsert(
         let mut encoded = Vec::with_capacity(support.codec.vector_bytes());
         let clamped = support.codec.encode_into(&vec, &mut encoded);
 
-        insert_tuple_on_disk(index, &support, &encoded, &*heap_tid, false, clamped);
+        insert_tuple_on_disk(index, HNSW_STANDALONE_BASE, &support, &encoded, &*heap_tid, false, clamped);
     });
     drop(insert_ctx);
 

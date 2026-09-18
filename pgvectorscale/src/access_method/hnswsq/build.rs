@@ -371,6 +371,7 @@ unsafe fn insert_tuple(
         pg_sys::LWLockRelease(std::ptr::addr_of_mut!((*graph).flush_lock));
         return crate::access_method::hnswsq::insert::insert_tuple_on_disk(
             build.index,
+            HNSW_STANDALONE_BASE,
             &build.support,
             &build.encoded,
             heaptid,
@@ -402,6 +403,7 @@ unsafe fn insert_tuple(
 
         return crate::access_method::hnswsq::insert::insert_tuple_on_disk(
             build.index,
+            HNSW_STANDALONE_BASE,
             &build.support,
             &build.encoded,
             heaptid,
@@ -614,10 +616,10 @@ unsafe fn create_graph_pages(build: &mut BuildState) {
     } else {
         Some(entry_point)
     };
-    update_meta_page(index, UPDATE_ENTRY_ALWAYS, entry_point_opt, insert_page, true);
+    update_meta_page(index, HNSW_STANDALONE_BASE, UPDATE_ENTRY_ALWAYS, entry_point_opt, insert_page, true);
 
     // Record where the graph chain starts (see the module docs).
-    let buf = pg_sys::ReadBuffer(index, METAPAGE_BLKNO);
+    let buf = pg_sys::ReadBuffer(index, metapage_block(HNSW_STANDALONE_BASE));
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
     let mpage = pg_sys::BufferGetPage(buf);
     let metap = page_get_meta(mpage);
@@ -846,7 +848,7 @@ pub unsafe extern "C-unwind" fn hnswsq_parallel_build_main(
 
     // Worker state: same shape as the leader's, over the shared graph.  The
     // codec comes from the (already written) metapage and calibration chain.
-    let support = init_support(index);
+    let support = init_support(index, HNSW_STANDALONE_BASE);
     debug_assert_eq!(get_precision(index), support.precision);
     let sq8_mode = crate::access_method::hnswsq::options::Sq8DistanceMode::from_i32(
         (*shared).sq8_distance_mode,
@@ -1278,6 +1280,7 @@ unsafe fn build_index(
 
         create_meta_page(
             index,
+            HNSW_STANDALONE_BASE,
             dimensions,
             m,
             ef_construction,
@@ -1285,11 +1288,12 @@ unsafe fn build_index(
             ItemPointer::new_invalid(),
         );
         let ptr = calib.store(&index_rel);
-        set_meta_calibration(index, ptr);
+        set_meta_calibration(index, HNSW_STANDALONE_BASE, ptr);
         Codec::new_sq8(&calib)
     } else {
         create_meta_page(
             index,
+            HNSW_STANDALONE_BASE,
             dimensions,
             m,
             ef_construction,

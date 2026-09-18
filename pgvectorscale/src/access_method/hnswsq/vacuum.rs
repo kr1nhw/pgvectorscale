@@ -25,6 +25,8 @@ use crate::util::ports::{PageGetItem, PageGetItemId, PageGetMaxOffsetNumber};
 /// The vacuum state (pgvector `HnswVacuumState`).
 pub struct VacuumState {
     pub index: pg_sys::Relation,
+    /// Base block of the hnswsq region (0 for the standalone AM).
+    pub base: pg_sys::BlockNumber,
     pub stats: *mut pg_sys::IndexBulkDeleteResult,
     pub callback: pg_sys::IndexBulkDeleteCallback,
     pub callback_state: *mut std::os::raw::c_void,
@@ -65,7 +67,7 @@ unsafe fn remove_heap_tids(vac: &mut VacuumState) {
     fallback.blkno = pg_sys::InvalidBlockNumber;
     fallback.offno = pg_sys::InvalidOffsetNumber;
 
-    let mut blkno = meta_graph_head(index);
+    let mut blkno = meta_graph_head(index, vac.base);
     while blkno != pg_sys::InvalidBlockNumber {
         check_for_interrupts!();
 
@@ -303,6 +305,7 @@ unsafe fn repair_graph_element(
     let mut na_elements = ElementArena::new();
     update_neighbors_on_disk(
         index,
+        vac.base,
         support,
         element,
         m,
@@ -326,10 +329,10 @@ unsafe fn repair_graph_entry_point(vac: &mut VacuumState) {
 
     if !highest.is_null() {
         // Get a shared lock
-        pg_sys::LockPage(vac.index, UPDATE_LOCK_PAGE, pg_sys::ShareLock as pg_sys::LOCKMODE);
+        pg_sys::LockPage(vac.index, update_lock_page(vac.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
 
         // Get latest entry point
-        let mut entry = get_entry_point(vac.index);
+        let mut entry = get_entry_point(vac.index, vac.base);
 
         // Use fallback point if highest point is entry point
         if let Some(ep) = entry.as_deref() {
@@ -355,14 +358,14 @@ unsafe fn repair_graph_entry_point(vac: &mut VacuumState) {
         }
 
         // Release lock
-        pg_sys::UnlockPage(vac.index, UPDATE_LOCK_PAGE, pg_sys::ShareLock as pg_sys::LOCKMODE);
+        pg_sys::UnlockPage(vac.index, update_lock_page(vac.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
     }
 
     // Prevent concurrent inserts when possibly updating entry point
-    pg_sys::LockPage(vac.index, UPDATE_LOCK_PAGE, pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::LockPage(vac.index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
 
     // Get latest entry point
-    let mut entry = get_entry_point(vac.index);
+    let mut entry = get_entry_point(vac.index, vac.base);
 
     if let Some(entry) = entry.as_deref_mut() {
         let entry_ptr = entry as *mut Element;
@@ -375,6 +378,7 @@ unsafe fn repair_graph_entry_point(vac: &mut VacuumState) {
             // until an element is repaired.
             update_meta_page(
                 vac.index,
+                vac.base,
                 UPDATE_ENTRY_ALWAYS,
                 if highest.is_null() { None } else { Some(highest) },
                 pg_sys::InvalidBlockNumber,
@@ -415,7 +419,7 @@ unsafe fn repair_graph_entry_point(vac: &mut VacuumState) {
     }
 
     // Release lock
-    pg_sys::UnlockPage(vac.index, UPDATE_LOCK_PAGE, pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::UnlockPage(vac.index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
 }
 
 /// `RepairGraph` (hnswvacuum.c): pass 2.
@@ -424,13 +428,13 @@ unsafe fn repair_graph(vac: &mut VacuumState) {
 
     // Wait for inserts to complete. Inserts before this point may have
     // neighbors about to be deleted. Inserts after this point will not.
-    pg_sys::LockPage(index, UPDATE_LOCK_PAGE, pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
-    pg_sys::UnlockPage(index, UPDATE_LOCK_PAGE, pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::LockPage(index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::UnlockPage(index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
 
     // Repair entry point first
     repair_graph_entry_point(vac);
 
-    let mut blkno = meta_graph_head(index);
+    let mut blkno = meta_graph_head(index, vac.base);
     while blkno != pg_sys::InvalidBlockNumber {
         check_for_interrupts!();
 
@@ -506,23 +510,23 @@ unsafe fn repair_graph(vac: &mut VacuumState) {
             }
 
             // Get a shared lock
-            pg_sys::LockPage(index, UPDATE_LOCK_PAGE, lockmode);
+            pg_sys::LockPage(index, update_lock_page(vac.base), lockmode);
 
             // Refresh entry point for each element
-            let mut entry = get_entry_point(index);
+            let mut entry = get_entry_point(index, vac.base);
             let mut entry_ptr = entry.as_deref_mut().map(|e| e as *mut Element);
 
             // Prevent concurrent inserts when likely updating entry point
             if entry_ptr.is_none() || (*element_ptr).level > (*entry_ptr.unwrap()).level {
                 // Release shared lock
-                pg_sys::UnlockPage(index, UPDATE_LOCK_PAGE, lockmode);
+                pg_sys::UnlockPage(index, update_lock_page(vac.base), lockmode);
 
                 // Get exclusive lock
                 lockmode = pg_sys::ExclusiveLock as pg_sys::LOCKMODE;
-                pg_sys::LockPage(index, UPDATE_LOCK_PAGE, lockmode);
+                pg_sys::LockPage(index, update_lock_page(vac.base), lockmode);
 
                 // Get latest entry point after lock is acquired
-                entry = get_entry_point(index);
+                entry = get_entry_point(index, vac.base);
                 entry_ptr = entry.as_deref_mut().map(|e| e as *mut Element);
             }
 
@@ -534,6 +538,7 @@ unsafe fn repair_graph(vac: &mut VacuumState) {
             if entry_ptr.is_none() || (*element_ptr).level > (*entry_ptr.unwrap()).level {
                 update_meta_page(
                     index,
+                    vac.base,
                     UPDATE_ENTRY_GREATER,
                     Some(element_ptr),
                     pg_sys::InvalidBlockNumber,
@@ -542,7 +547,7 @@ unsafe fn repair_graph(vac: &mut VacuumState) {
             }
 
             // Release lock
-            pg_sys::UnlockPage(index, UPDATE_LOCK_PAGE, lockmode);
+            pg_sys::UnlockPage(index, update_lock_page(vac.base), lockmode);
         }
 
         pg_sys::CurrentMemoryContext = old_ctx;
@@ -553,7 +558,7 @@ unsafe fn repair_graph(vac: &mut VacuumState) {
 /// `ConfirmRepaired` (hnswvacuum.c).
 unsafe fn confirm_repaired(vac: &VacuumState) {
     let index = vac.index;
-    let mut blkno = meta_graph_head(index);
+    let mut blkno = meta_graph_head(index, vac.base);
 
     while blkno != pg_sys::InvalidBlockNumber {
         check_for_interrupts!();
@@ -659,15 +664,15 @@ unsafe fn mark_deleted(vac: &mut VacuumState) {
     // Wait for inserts and index scans to complete. Inserts and scans before
     // this point may visit tuples about to be deleted. Inserts and scans
     // after this point will not, since the graph has been repaired.
-    pg_sys::LockPage(index, UPDATE_LOCK_PAGE, pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
-    pg_sys::UnlockPage(index, UPDATE_LOCK_PAGE, pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::LockPage(index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::UnlockPage(index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
 
     confirm_repaired(vac);
 
-    pg_sys::LockPage(index, SCAN_LOCK_PAGE, pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
-    pg_sys::UnlockPage(index, SCAN_LOCK_PAGE, pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::LockPage(index, scan_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::UnlockPage(index, scan_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
 
-    let mut blkno = meta_graph_head(index);
+    let mut blkno = meta_graph_head(index, vac.base);
     let vec_bytes = vac.support.codec.vector_bytes();
 
     while blkno != pg_sys::InvalidBlockNumber {
@@ -801,13 +806,13 @@ unsafe fn mark_deleted(vac: &mut VacuumState) {
     }
 
     // Update insert page last, after everything has been marked as deleted
-    update_meta_page(index, 0, None, insert_page, false);
+    update_meta_page(index, vac.base, 0, None, insert_page, false);
 }
 
 /// The graph's head block from the metapage (pgvector's `HNSW_HEAD_BLKNO`,
 /// recorded because the calibration chain may precede the graph pages).
-pub unsafe fn meta_graph_head(index: pg_sys::Relation) -> pg_sys::BlockNumber {
-    let buf = pg_sys::ReadBuffer(index, METAPAGE_BLKNO);
+pub unsafe fn meta_graph_head(index: pg_sys::Relation, base: pg_sys::BlockNumber) -> pg_sys::BlockNumber {
+    let buf = pg_sys::ReadBuffer(index, metapage_block(base));
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
     let page = pg_sys::BufferGetPage(buf);
     let metap = page_get_meta(page);
@@ -837,14 +842,15 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         stats
     };
 
-    let support = init_support(index);
+    let support = init_support(index, HNSW_STANDALONE_BASE);
     let mut m = 0usize;
-    get_meta_page_info(index, Some(&mut m), None);
+    get_meta_page_info(index, HNSW_STANDALONE_BASE, Some(&mut m), None);
     let dim = support.codec.dim();
     let ef = get_ef_construction(index);
 
     let mut vac = VacuumState {
         index,
+        base: HNSW_STANDALONE_BASE,
         stats,
         callback,
         callback_state,

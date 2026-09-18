@@ -38,14 +38,34 @@ pub const HNSW_VERSION: u32 = 1;
 /// Page special-area id, same value pgvector uses.
 pub const HNSW_PAGE_ID: u16 = 0xFF90;
 
-pub const METAPAGE_BLKNO: pg_sys::BlockNumber = 0;
-pub const HEAD_BLKNO: pg_sys::BlockNumber = 1;
+/// Base block of the standalone `hnswsq` access method's page region
+/// (metapage at 0, first graph/head page at 1).
+pub const HNSW_STANDALONE_BASE: pg_sys::BlockNumber = 0;
 
-/// Pages used as heavyweight lock keys (pgvector's `HNSW_UPDATE_LOCK`/
-/// `HNSW_SCAN_LOCK`).  Page locks here never conflict with buffer content
-/// locks, which is what makes the read paths advisory-lock-free.
-pub const UPDATE_LOCK_PAGE: pg_sys::BlockNumber = 0;
-pub const SCAN_LOCK_PAGE: pg_sys::BlockNumber = 1;
+/// Region layout (pgvector's `METAPAGE_BLKNO` / `HEAD_BLKNO` /
+/// `HNSW_UPDATE_LOCK` / `HNSW_SCAN_LOCK` conventions, parameterized so an
+/// AgentVec HOT segment can embed a region at an arbitrary base block):
+/// base+0 is the metapage and the update-lock page; base+1 is the head and
+/// the scan-lock page.
+#[inline]
+pub const fn metapage_block(base: pg_sys::BlockNumber) -> pg_sys::BlockNumber {
+    base
+}
+
+#[inline]
+pub const fn head_block(base: pg_sys::BlockNumber) -> pg_sys::BlockNumber {
+    base + 1
+}
+
+#[inline]
+pub const fn update_lock_page(base: pg_sys::BlockNumber) -> pg_sys::BlockNumber {
+    base
+}
+
+#[inline]
+pub const fn scan_lock_page(base: pg_sys::BlockNumber) -> pg_sys::BlockNumber {
+    base + 1
+}
 
 pub const ELEMENT_TUPLE_TYPE: u8 = 1;
 pub const NEIGHBOR_TUPLE_TYPE: u8 = 2;
