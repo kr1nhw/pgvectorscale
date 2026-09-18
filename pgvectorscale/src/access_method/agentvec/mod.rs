@@ -219,6 +219,7 @@ fn agentvec_index_info(
         name!(sealed_runs, i32),
         name!(has_active_chain, bool),
         name!(header_block, i64),
+        name!(payload_block, i64),
         name!(dimension, i32),
         name!(format_version, i32),
     ),
@@ -247,6 +248,7 @@ fn agentvec_index_info(
                 header.sealed.len() as i32,
                 header.active.is_some(),
                 segment.header.block_number as i64,
+                segment.code_root.block_number as i64,
                 segment.dimension as i32,
                 segment.format_version as i32,
             )

@@ -17,7 +17,10 @@
 
 use memoffset::*;
 use pgrx::{pg_sys::AsPgCStr, prelude::*, PgRelation};
+use std::ffi::CStr;
 use std::fmt::Debug;
+
+use crate::access_method::hnswsq::quantize::HnswPrecision;
 
 /// Vectors a HOT segment absorbs before it is sealed.  The foreground INSERT
 /// that observes the threshold only performs the metadata changes that make
@@ -60,11 +63,21 @@ const DEFAULT_RERANK_K: i32 = 100;
 
 /// Candidates a single segment scan keeps before the merge.
 ///
-/// `0` means "exhaustive": the exact `FLAT` executor returns every live entry
-/// in distance order, so query semantics never depend on a candidate bound.
-/// A positive value bounds each segment's candidate heap (the eventual ANN
-/// behaviour, where the bound is what keeps search sublinear).
+/// `0` means "unbounded": the exact `FLAT` executor returns every live entry
+/// in distance order, while approximate executors (HNSW HOT, IVF segments)
+/// use their own ef (`hnswsq.ef_search`).  A positive value bounds each
+/// segment's candidate heap.
 const DEFAULT_SEARCH_CANDIDATES: i32 = 0;
+
+/// Storage layout of a HOT HNSW segment (the embedded hnswsq region's
+/// `storage_layout`: plain / ieeefp16 / ieeefp8 / f8 / sq8 / sq16).
+const DEFAULT_HOT_STORAGE_LAYOUT_STR: &str = "f8";
+
+/// HNSW `m` of a HOT segment (neighbors per layer-0 node).
+const DEFAULT_HOT_M: i32 = 16;
+
+/// HNSW `ef_construction` of a HOT segment.
+const DEFAULT_HOT_EF_CONSTRUCTION: i32 = 64;
 
 /// The parsed reloptions of an `agentvec` index.
 ///
@@ -77,6 +90,10 @@ pub struct TSVAgentVecOptions {
     /* varlena header (do not touch directly!) */
     #[allow(dead_code)]
     vl_len_: i32,
+
+    pub hot_storage_layout_offset: i32,
+    pub hot_m: i32,
+    pub hot_ef_construction: i32,
 
     pub hot_segment_max_rows: i32,
     pub warm_segment_target_rows: i32,
@@ -100,6 +117,9 @@ impl TSVAgentVecOptions {
             panic!("'{}' is not an agentvec index", relation.name())
         } else if relation.rd_options.is_null() {
             let mut ops = unsafe { PgBox::<TSVAgentVecOptions>::alloc0() };
+            ops.hot_storage_layout_offset = 0;
+            ops.hot_m = DEFAULT_HOT_M;
+            ops.hot_ef_construction = DEFAULT_HOT_EF_CONSTRUCTION;
             ops.hot_segment_max_rows = DEFAULT_HOT_SEGMENT_MAX_ROWS;
             ops.warm_segment_target_rows = DEFAULT_WARM_SEGMENT_TARGET_ROWS;
             ops.cold_segment_target_rows = DEFAULT_COLD_SEGMENT_TARGET_ROWS;
@@ -131,6 +151,42 @@ impl TSVAgentVecOptions {
             panic!("hot_segment_max_rows must be >= 1");
         }
         self.hot_segment_max_rows as u64
+    }
+
+    /// Storage layout of a HOT HNSW segment.
+    pub fn get_hot_precision(&self) -> HnswPrecision {
+        let s = self.get_str(self.hot_storage_layout_offset, || {
+            DEFAULT_HOT_STORAGE_LAYOUT_STR.to_owned()
+        });
+        HnswPrecision::parse(&s)
+    }
+
+    /// HNSW `m` of a HOT segment.
+    pub fn get_hot_m(&self) -> usize {
+        if self.hot_m < 2 || self.hot_m > 100 {
+            panic!("hot_m must be between 2 and 100");
+        }
+        self.hot_m as usize
+    }
+
+    /// HNSW `ef_construction` of a HOT segment.
+    pub fn get_hot_ef_construction(&self) -> usize {
+        if self.hot_ef_construction < 4 || self.hot_ef_construction > 1000 {
+            panic!("hot_ef_construction must be between 4 and 1000");
+        }
+        self.hot_ef_construction as usize
+    }
+
+    /// Helper to extract a string option from the options struct.
+    fn get_str<F: FnOnce() -> String>(&self, offset: i32, default: F) -> String {
+        if offset == 0 {
+            default()
+        } else {
+            let opts = self as *const _ as usize;
+            let value =
+                unsafe { CStr::from_ptr((opts + offset as usize) as *const std::os::raw::c_char) };
+            value.to_str().unwrap().to_owned()
+        }
     }
 
     /// Target rows per WARM segment.
@@ -234,6 +290,28 @@ static mut RELOPT_KIND_AGENTVEC: pg_sys::relopt_kind::Type = 0;
 pub unsafe fn init() {
     RELOPT_KIND_AGENTVEC = pg_sys::add_reloption_kind();
 
+    pg_sys::add_string_reloption(
+        RELOPT_KIND_AGENTVEC,
+        "hot_storage_layout".as_pg_cstr(),
+        "Storage layout of a HOT HNSW segment: plain, ieeefp16, ieeefp8, f8, sq8, sq16".as_pg_cstr(),
+        DEFAULT_HOT_STORAGE_LAYOUT_STR.as_pg_cstr(),
+        Some(validate_hot_storage_layout),
+        pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
+    );
+    add_int_reloption(
+        "hot_m",
+        "HNSW m of a HOT segment (neighbors per layer-0 node)",
+        DEFAULT_HOT_M,
+        2,
+        100,
+    );
+    add_int_reloption(
+        "hot_ef_construction",
+        "HNSW ef_construction of a HOT segment",
+        DEFAULT_HOT_EF_CONSTRUCTION,
+        4,
+        1000,
+    );
     add_int_reloption(
         "hot_segment_max_rows",
         "Rows a HOT segment absorbs before it is sealed",
@@ -340,6 +418,18 @@ unsafe fn add_int_reloption(name: &str, desc: &str, default: i32, min: i32, max:
     );
 }
 
+/// Reject unknown `hot_storage_layout` values at CREATE INDEX time.
+#[pg_guard]
+extern "C-unwind" fn validate_hot_storage_layout(value: *const std::os::raw::c_char) {
+    if value.is_null() {
+        return;
+    }
+    let value = unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .expect("failed to parse hot_storage_layout value");
+    _ = HnswPrecision::parse(value);
+}
+
 /// Parse the `WITH (...)` options of an `agentvec` index.
 #[allow(clippy::unneeded_field_pattern)] // b/c of offset_of!()
 #[pg_guard]
@@ -371,7 +461,22 @@ pub unsafe extern "C-unwind" fn amoptions(
         }
     }
 
-    let tab: [pg_sys::relopt_parse_elt; 13] = [
+    let tab: [pg_sys::relopt_parse_elt; 16] = [
+        make_relopt_parse_elt(
+            "hot_storage_layout",
+            pg_sys::relopt_type::RELOPT_TYPE_STRING,
+            offset_of!(TSVAgentVecOptions, hot_storage_layout_offset) as i32,
+        ),
+        make_relopt_parse_elt(
+            "hot_m",
+            pg_sys::relopt_type::RELOPT_TYPE_INT,
+            offset_of!(TSVAgentVecOptions, hot_m) as i32,
+        ),
+        make_relopt_parse_elt(
+            "hot_ef_construction",
+            pg_sys::relopt_type::RELOPT_TYPE_INT,
+            offset_of!(TSVAgentVecOptions, hot_ef_construction) as i32,
+        ),
         make_relopt_parse_elt(
             "hot_segment_max_rows",
             pg_sys::relopt_type::RELOPT_TYPE_INT,

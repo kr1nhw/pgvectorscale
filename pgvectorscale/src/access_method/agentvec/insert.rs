@@ -26,6 +26,7 @@ use crate::access_method::agentvec::directory::{
     AgentVecDirectory, AgentVecSegmentHeader, AgentVecSegmentMeta, SegmentAlgorithm, SegmentLevel,
     SegmentOwnership, SegmentState,
 };
+use crate::access_method::hnswsq::quantize::{HnswPrecision, Sq8Calibration};
 use crate::access_method::agentvec::flat;
 use crate::access_method::agentvec::meta_page::AgentVecMetaPage;
 use crate::access_method::agentvec::options::TSVAgentVecOptions;
@@ -72,18 +73,23 @@ pub unsafe extern "C-unwind" fn aminsert(
 
 /// Payload format version of a phase-1 `FLAT` segment.
 pub const SEGMENT_FORMAT_FLAT_V1: u32 = 1;
+/// Payload format version of an embedded hnswsq region (HOT).
+pub const SEGMENT_FORMAT_HNSW_V1: u32 = 2;
 
 /// The segment foreground inserts currently target.
 #[derive(Clone, Copy, Debug)]
 pub struct HotSegment {
     /// Stable segment id.
     pub segment_id: u64,
-    /// Its header page.
+    /// Its header page (the lifecycle/counter record for every algorithm).
     pub header: ItemPointer,
     /// Entries appended so far, as of the header read.
     pub num_entries: u64,
     /// Which algorithm the segment stores.
     pub algorithm: SegmentAlgorithm,
+    /// Payload root: the embedded hnswsq region base block (HNSW segments),
+    /// invalid for `FLAT`.
+    pub code_root: ItemPointer,
 }
 
 /// Resolve the segment foreground inserts should target.
@@ -107,6 +113,7 @@ pub unsafe fn current_hot_segment(index: &PgRelation) -> Option<HotSegment> {
         header: segment.header,
         num_entries: header.num_entries,
         algorithm: segment.algorithm(),
+        code_root: segment.code_root,
     })
 }
 
@@ -122,23 +129,42 @@ unsafe fn open_new_hot_segment(
     directory: &mut AgentVecDirectory,
     meta: &mut AgentVecMetaPage,
     level: SegmentLevel,
+    options: &TSVAgentVecOptions,
 ) -> u64 {
     let segment_id = meta.take_next_segment_id();
-    let header = AgentVecSegmentHeader::new(level, SegmentAlgorithm::Flat);
+    let algorithm = SegmentAlgorithm::Hnsw;
+    let header = AgentVecSegmentHeader::new(level, algorithm);
     let header_pointer = header.store_new(index);
+
+    // The HNSW region: metapage at its base block, written under the
+    // relation extension lock (create_meta_page asserts the base matches the
+    // relation end).
+    let base = create_hot_region(
+        index,
+        meta.get_num_dimensions(),
+        options.get_hot_precision(),
+        options.get_hot_m(),
+        options.get_hot_ef_construction(),
+    );
+    let code_root = ItemPointer::new(base, 1);
+
     directory.segments.push(AgentVecSegmentMeta::new(
         segment_id,
         0,
         level,
         SegmentState::Published,
-        SegmentAlgorithm::Flat,
+        algorithm,
         SegmentOwnership::Owned,
         meta.get_epoch(),
         header_pointer,
         meta.get_distance_type() as u16,
         meta.get_num_dimensions(),
-        SEGMENT_FORMAT_FLAT_V1,
+        SEGMENT_FORMAT_HNSW_V1,
     ));
+    directory
+        .get_mut(segment_id)
+        .expect("segment just created")
+        .code_root = code_root;
 
     let (directory_pointer, directory_blocks) = directory.store(index);
     meta.set_directory(directory_pointer, directory_blocks);
@@ -146,15 +172,55 @@ unsafe fn open_new_hot_segment(
     segment_id
 }
 
+/// Create the embedded hnswsq region of a fresh HOT segment and return its
+/// base block.
+///
+/// The caller must hold the relation extension lock so the region's first
+/// block is exactly the relation end (asserted by `create_meta_page`).  The
+/// region is an ordinary hnswsq metapage + graph pages inside the AgentVec
+/// relation; nothing here touches any other segment.
+unsafe fn create_hot_region(
+    index: &PgRelation,
+    dim: u32,
+    precision: HnswPrecision,
+    m: usize,
+    ef_construction: usize,
+) -> pg_sys::BlockNumber {
+    let _ext_lock = crate::util::buffer::LockRelationForExtension::new(index);
+    let calibration = if precision.needs_calibration() {
+        // An empty-start HOT segment has no samples: use the provisional
+        // [-1, 1] calibration (the hnswsq convention for incremental builds).
+        // Store it FIRST: it extends the relation, and the region base must
+        // be the relation end *after* it (create_meta_page asserts this).
+        let calib = Sq8Calibration::provisional(dim as usize);
+        calib.store(index)
+    } else {
+        ItemPointer::new_invalid()
+    };
+    let base =
+        pg_sys::RelationGetNumberOfBlocksInFork(index.as_ptr(), pg_sys::ForkNumber::MAIN_FORKNUM);
+    crate::access_method::hnswsq::utils::init_region(
+        index.as_ptr(),
+        base,
+        dim as usize,
+        m,
+        ef_construction,
+        precision,
+        calibration,
+    );
+    base
+}
+
 /// Create the first HOT segment of an index that has none.
 pub unsafe fn open_initial_hot_segment(index: &PgRelation) -> u64 {
+    let options = TSVAgentVecOptions::from_relation(index);
     AgentVecMetaPage::update(index, |meta| {
         let mut directory = meta.load_directory(index);
         if directory.get(meta.get_hot_segment_id()).is_some() {
             // Someone else created it while we waited for the meta lock.
             return meta.get_hot_segment_id();
         }
-        open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot)
+        open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot, &options)
     })
 }
 
@@ -166,6 +232,7 @@ pub unsafe fn open_initial_hot_segment(index: &PgRelation) -> u64 {
 /// header plus one directory republication — the vectors themselves are not
 /// touched (design §10).
 pub unsafe fn seal_hot_and_open_new(index: &PgRelation, expected_hot_id: u64) -> bool {
+    let options = TSVAgentVecOptions::from_relation(index);
     AgentVecMetaPage::update(index, |meta| {
         if meta.get_hot_segment_id() != expected_hot_id {
             // Another transaction already sealed this segment.
@@ -206,7 +273,7 @@ pub unsafe fn seal_hot_and_open_new(index: &PgRelation, expected_hot_id: u64) ->
             segment.dead_count = dead_count;
             segment.epoch = epoch;
         }
-        open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot);
+        open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot, &options);
         true
     })
 }
@@ -255,7 +322,7 @@ pub unsafe fn insert_entry(
             None => {
                 open_initial_hot_segment(index);
             }
-            Some(hot) if hot.algorithm != SegmentAlgorithm::Flat => {
+            Some(hot) if hot.algorithm == SegmentAlgorithm::IvfRaBitQ => {
                 error!(
                     "agentvec: HOT segment {} uses {} storage, which this phase cannot append to",
                     hot.segment_id,
@@ -265,10 +332,36 @@ pub unsafe fn insert_entry(
             Some(hot) if hot.num_entries >= max_rows => {
                 seal_hot_and_open_new(index, hot.segment_id);
             }
-            Some(hot) => {
+            Some(hot) if hot.algorithm == SegmentAlgorithm::Flat => {
                 AgentVecSegmentHeader::update(index, hot.header.block_number, |header| {
                     let active = header.active.take();
                     header.active = Some(flat::append_entry(index, active, &entry_bytes));
+                    header.num_entries += 1;
+                });
+                return hot.segment_id;
+            }
+            Some(hot) => {
+                // HNSW: append into the embedded hnswsq region, then bump the
+                // segment's counter.  `stored` is already cosine-normalized
+                // where the metric requires it, matching hnswsq's own insert
+                // convention.
+                let base = hot.code_root.block_number;
+                let support =
+                    crate::access_method::hnswsq::utils::init_support(index.as_ptr(), base);
+                let mut encoded = vec![0u8; support.codec.vector_bytes()];
+                let clamped = support.codec.encode_into(&stored, &mut encoded);
+                let mut tid_data = pg_sys::ItemPointerData::default();
+                heap_tid.to_item_pointer_data(&mut tid_data);
+                crate::access_method::hnswsq::insert::insert_tuple_on_disk(
+                    index.as_ptr(),
+                    base,
+                    &support,
+                    &encoded,
+                    &tid_data,
+                    false,
+                    clamped,
+                );
+                AgentVecSegmentHeader::update(index, hot.header.block_number, |header| {
                     header.num_entries += 1;
                 });
                 return hot.segment_id;

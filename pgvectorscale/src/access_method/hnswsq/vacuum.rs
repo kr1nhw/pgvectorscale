@@ -834,7 +834,19 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     callback_state: *mut std::os::raw::c_void,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     let index = (*info).index;
+    vacuum_region(index, HNSW_STANDALONE_BASE, callback, callback_state, stats)
+}
 
+/// Run the full vacuum pass over one hnswsq region: the standalone AM's whole
+/// index, or an embedded AgentVec HOT segment at `base`.  The lock-page
+/// anchors, the graph walk and the metapage updates are all region-local.
+pub unsafe fn vacuum_region(
+    index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
+    callback: pg_sys::IndexBulkDeleteCallback,
+    callback_state: *mut std::os::raw::c_void,
+    stats: *mut pg_sys::IndexBulkDeleteResult,
+) -> *mut pg_sys::IndexBulkDeleteResult {
     let stats = if stats.is_null() {
         pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexBulkDeleteResult>())
             .cast::<pg_sys::IndexBulkDeleteResult>()
@@ -842,20 +854,20 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         stats
     };
 
-    let support = init_support(index, HNSW_STANDALONE_BASE);
+    let support = init_support(index, base);
     let mut m = 0usize;
-    get_meta_page_info(index, HNSW_STANDALONE_BASE, Some(&mut m), None);
+    get_meta_page_info(index, base, Some(&mut m), None);
     let dim = support.codec.dim();
-    let ef = get_ef_construction(index);
+    let (_m_metapage, ef) = region_params(index, base);
 
     let mut vac = VacuumState {
         index,
-        base: HNSW_STANDALONE_BASE,
+        base,
         stats,
         callback,
         callback_state,
         m,
-        ef_construction: get_ef_construction(index),
+        ef_construction: ef,
         support,
         deleting: Visited::new(256),
         bas: pg_sys::GetAccessStrategy(pg_sys::BufferAccessStrategyType::BAS_BULKREAD),

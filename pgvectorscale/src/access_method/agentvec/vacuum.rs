@@ -22,7 +22,7 @@
 use pgrx::pg_sys::{BlockNumber, OffsetNumber};
 use pgrx::*;
 
-use crate::access_method::agentvec::directory::AgentVecSegmentHeader;
+use crate::access_method::agentvec::directory::{AgentVecSegmentHeader, SegmentAlgorithm};
 use crate::access_method::agentvec::flat;
 use crate::access_method::agentvec::meta_page::AgentVecMetaPage;
 use crate::util::ItemPointer;
@@ -49,52 +49,83 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     let mut total_dead: u64 = 0;
 
     for segment in directory.searchable() {
-        let header = AgentVecSegmentHeader::load(&index_rel, segment.header);
-        // Per chain, which bounds the TID buffer by the chain size
-        // (hot_segment_max_rows) rather than by the index size.
-        for chain_start in header.chain_starts() {
-            let mut entries: Vec<(BlockNumber, OffsetNumber, ItemPointer)> = Vec::new();
-            flat::for_each_entry(&index_rel, chain_start, |block, offset, bytes| {
-                if flat::decode_state(bytes) != flat::STATE_LIVE {
-                    return;
-                }
-                entries.push((block, offset, flat::decode_tid(bytes)));
-            });
+        match segment.algorithm() {
+            SegmentAlgorithm::Flat => {
+                let header = AgentVecSegmentHeader::load(&index_rel, segment.header);
+                // Per chain, which bounds the TID buffer by the chain size
+                // (hot_segment_max_rows) rather than by the index size.
+                for chain_start in header.chain_starts() {
+                    let mut entries: Vec<(BlockNumber, OffsetNumber, ItemPointer)> = Vec::new();
+                    flat::for_each_entry(&index_rel, chain_start, |block, offset, bytes| {
+                        if flat::decode_state(bytes) != flat::STATE_LIVE {
+                            return;
+                        }
+                        entries.push((block, offset, flat::decode_tid(bytes)));
+                    });
 
-            // No AgentVec lock is held here: the callback below may touch heap
-            // buffers.
-            let mut to_tombstone: Vec<(BlockNumber, OffsetNumber)> = Vec::new();
-            for (block, offset, tid) in entries {
-                let is_dead = match callback {
-                    Some(cb) => {
-                        let mut tid_data = pg_sys::ItemPointerData::default();
-                        tid.to_item_pointer_data(&mut tid_data);
-                        cb(&mut tid_data, callback_state)
+                    // No AgentVec lock is held here: the callback below may touch
+                    // heap buffers.
+                    let mut to_tombstone: Vec<(BlockNumber, OffsetNumber)> = Vec::new();
+                    for (block, offset, tid) in entries {
+                        let is_dead = match callback {
+                            Some(cb) => {
+                                let mut tid_data = pg_sys::ItemPointerData::default();
+                                tid.to_item_pointer_data(&mut tid_data);
+                                cb(&mut tid_data, callback_state)
+                            }
+                            None => false,
+                        };
+                        if is_dead {
+                            to_tombstone.push((block, offset));
+                        } else {
+                            total_live += 1;
+                        }
                     }
-                    None => false,
-                };
-                if is_dead {
-                    to_tombstone.push((block, offset));
-                } else {
-                    total_live += 1;
-                }
-            }
 
-            if to_tombstone.is_empty() {
-                continue;
-            }
-            let num_dead = to_tombstone.len() as u64;
-            // Publish the tombstones and the segment's dead count in one
-            // atomic header rewrite.  Taking the header lock and then the
-            // page locks keeps this path's order (header -> page) the same as
-            // the insert path's.
-            AgentVecSegmentHeader::update(&index_rel, segment.header.block_number, |header| {
-                for (block, offset) in to_tombstone {
-                    flat::mark_dead(&index_rel, block, offset);
+                    if to_tombstone.is_empty() {
+                        continue;
+                    }
+                    let num_dead = to_tombstone.len() as u64;
+                    // Publish the tombstones and the segment's dead count in one
+                    // atomic header rewrite.  Taking the header lock and then
+                    // the page locks keeps this path's order (header -> page) the
+                    // same as the insert path's.
+                    AgentVecSegmentHeader::update(&index_rel, segment.header.block_number, |header| {
+                        for (block, offset) in to_tombstone {
+                            flat::mark_dead(&index_rel, block, offset);
+                        }
+                        header.dead_entries += num_dead;
+                    });
+                    total_dead += num_dead;
                 }
-                header.dead_entries += num_dead;
-            });
-            total_dead += num_dead;
+            }
+            SegmentAlgorithm::Hnsw => {
+                // The embedded hnswsq region runs its own vacuum (mark ->
+                // repair -> entry-point fix -> free fully-dead pages); the
+                // region's lock anchors and graph walk are region-local.
+                let base = segment.code_root.block_number;
+                let res = crate::access_method::hnswsq::vacuum::vacuum_region(
+                    index_rel.as_ptr(),
+                    base,
+                    callback,
+                    callback_state,
+                    std::ptr::null_mut(),
+                );
+                let removed = (*res).tuples_removed as u64;
+                if removed > 0 {
+                    AgentVecSegmentHeader::update(&index_rel, segment.header.block_number, |header| {
+                        header.dead_entries += removed;
+                    });
+                }
+                total_dead += removed;
+                let live = AgentVecSegmentHeader::load(&index_rel, segment.header).live_entries();
+                total_live += live;
+                pg_sys::pfree(res as *mut std::os::raw::c_void);
+            }
+            SegmentAlgorithm::IvfRaBitQ => error!(
+                "agentvec: segment {} uses ivf_rabitq storage, which this phase cannot vacuum",
+                segment.segment_id
+            ),
         }
     }
 

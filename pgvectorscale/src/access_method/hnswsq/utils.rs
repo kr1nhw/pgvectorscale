@@ -342,6 +342,29 @@ pub unsafe fn page_get_meta(page: pg_sys::Page) -> *mut MetaPageData {
     PageGetContents(page).cast()
 }
 
+/// The region's `m` and `ef_construction`, from its metapage.
+///
+/// The metapage is authoritative for embedded regions (an AgentVec HOT
+/// segment's relation carries *agentvec* reloptions, not hnswsq ones); for
+/// the standalone AM these equal the reloptions the build stored.
+pub unsafe fn region_params(
+    index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
+) -> (usize, usize) {
+    let buf = pg_sys::ReadBuffer(index, metapage_block(base));
+    pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+    let page = pg_sys::BufferGetPage(buf);
+    let metap = page_get_meta(page);
+    if (*metap).magic_number != HNSW_MAGIC {
+        pg_sys::UnlockReleaseBuffer(buf);
+        error!("hnswsq index is not valid (bad magic)");
+    }
+    let m = (*metap).m as usize;
+    let ef_construction = (*metap).ef_construction as usize;
+    pg_sys::UnlockReleaseBuffer(buf);
+    (m, ef_construction)
+}
+
 /// `HnswGetMetaPageInfo` — fetch m and/or the entry point from the metapage.
 pub unsafe fn get_meta_page_info(
     index: pg_sys::Relation,
@@ -537,6 +560,56 @@ pub unsafe fn create_meta_page(
 
     pg_sys::MarkBufferDirty(buf);
     pg_sys::UnlockReleaseBuffer(buf);
+}
+
+/// Initialize a fresh hnswsq region: the metapage at `base`, the head/insert
+/// page at `base + 1` (pgvector's `HNSW_HEAD_BLKNO` convention), and the
+/// metapage's `insert_page` pointing at it.  Without the pre-created head
+/// page the first insert would meet a raw zeroed extension page, whose
+/// `pd_lower - pd_upper` free space is 0, and fall off the end of the
+/// page-packing loop onto an uninitialized page header.
+///
+/// The caller must hold the relation extension lock across the whole call
+/// (both pages are obtained by extension and must land at `base`/`base + 1`).
+pub unsafe fn init_region(
+    index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
+    dimensions: usize,
+    m: usize,
+    ef_construction: usize,
+    precision: HnswPrecision,
+    calibration: crate::util::ItemPointer,
+) {
+    create_meta_page(
+        index,
+        base,
+        dimensions,
+        m,
+        ef_construction,
+        precision,
+        calibration,
+    );
+
+    let buf = new_buffer(index);
+    assert_eq!(
+        pg_sys::BufferGetBlockNumber(buf),
+        base + 1,
+        "hnswsq: head page did not land at region base + 1"
+    );
+    init_page(buf, pg_sys::BufferGetPage(buf));
+    pg_sys::MarkBufferDirty(buf);
+    pg_sys::UnlockReleaseBuffer(buf);
+
+    let mpage_buf = pg_sys::ReadBuffer(index, metapage_block(base));
+    pg_sys::LockBuffer(mpage_buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+    let mpage = pg_sys::BufferGetPage(mpage_buf);
+    let metap = page_get_meta(mpage);
+    (*metap).insert_page = base + 1;
+    // The graph chain starts at the head page too (the standalone build
+    // records it the same way; vacuum walks it).
+    (*metap).graph_head = base + 1;
+    pg_sys::MarkBufferDirty(mpage_buf);
+    pg_sys::UnlockReleaseBuffer(mpage_buf);
 }
 
 /// Record the SQ8 calibration chain pointer in the metapage (build mode:

@@ -209,7 +209,10 @@ pub struct AgentVecSegmentMeta {
     pub epoch: u64,
     /// The segment's header page: the atomic publication point for its runs.
     pub header: ItemPointer,
-    /// Root of the segment's code/vector payload (WARM/COLD, phase 3).
+    /// Root of the segment's payload, per algorithm:
+    /// * `Hnsw`: the embedded hnswsq region's base block (its metapage);
+    /// * `IvfRaBitQ`: the code store root (phase 3);
+    /// * `Flat`: invalid (the chains are reachable from the header).
     pub code_root: ItemPointer,
     /// Root of the segment's posting lists (WARM/COLD, phase 3).
     pub posting_root: ItemPointer,

@@ -15,7 +15,6 @@ use pgrx::pg_sys;
 use pgrx::*;
 
 use crate::access_method::distance::{preprocess_cosine, DistanceType};
-use crate::access_method::hnswsq::options::Hnsw2Options;
 use crate::access_method::hnswsq::types::*;
 use crate::access_method::hnswsq::utils::*;
 use crate::access_method::pg_vector::PgVectorInternal;
@@ -931,7 +930,8 @@ pub unsafe fn insert_tuple_on_disk(
     // backend-local scratch (per-insert allocation of the search scratch,
     // its 64 KiB arena chunk, the visited table, and the neighbor-loading
     // buffers was the dominant insert cost).
-    let ef_construction = get_ef_construction(index);
+    let (_m_metapage, ef_construction) =
+        crate::access_method::hnswsq::utils::region_params(index, base);
     let entry_ptr = entry
         .as_deref_mut()
         .map(|e| e as *mut Element);

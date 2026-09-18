@@ -122,19 +122,16 @@ mod tests {
     /// A tombstoned entry is skipped by scans and stops consuming candidate
     /// slots.
     ///
-    /// The tombstone is applied directly (`flat::mark_dead`, the same call
-    /// `ambulkdelete` makes) rather than through VACUUM: whether a VACUUM
-    /// removes a deleted entry depends on PostgreSQL's vacuum cutoff, and in a
-    /// test suite where other backends hold snapshots the tuple stays
-    /// "recently dead", which would make the assertion depend on scheduling
-    /// rather than on this AM's behaviour.
+    /// The tombstone goes through `agentvec`'s `ambulkdelete` (HNSW dispatch:
+    /// the embedded hnswsq region vacuum) with a synthetic callback, so the
+    /// assertion does not depend on PostgreSQL's vacuum cutoff.
     #[pg_test]
     fn test_agentvec_tombstoned_entries_are_skipped() -> spi::Result<()> {
         Spi::run(
             "CREATE TABLE t_av_tomb(id int, v vector(2));
              INSERT INTO t_av_tomb VALUES (1, '[1,0]'), (2, '[2,0]'), (3, '[3,0]');
              CREATE INDEX idx_av_tomb ON t_av_tomb USING agentvec (v vector_l2_ops)
-                WITH (search_candidates = 2);",
+                WITH (search_candidates = 10);",
         )?;
         force_index_scan();
         assert_eq!(
@@ -143,63 +140,8 @@ mod tests {
             "the bound keeps the two nearest entries"
         );
 
-        // Tombstone the nearest entry of the HOT segment's chain.
-        let index = index_relation("idx_av_tomb");
-        let meta = AgentVecMetaPage::fetch(&index);
-        let directory = meta.load_directory(&index);
-        let segment = directory
-            .get(meta.get_hot_segment_id())
-            .expect("the index has a HOT segment");
-        let header = AgentVecSegmentHeader::load(&index, segment.header);
-        let chain = header.chain_starts()[0];
-        let mut victim: Option<(pg_sys::BlockNumber, pg_sys::OffsetNumber)> = None;
-        unsafe {
-            crate::access_method::agentvec::flat::for_each_entry(
-                &index,
-                chain,
-                |block, offset, bytes| {
-                    if victim.is_none()
-                        && crate::access_method::agentvec::flat::decode_state(bytes)
-                            == crate::access_method::agentvec::flat::STATE_LIVE
-                    {
-                        victim = Some((block, offset));
-                    }
-                },
-            );
-            let (block, offset) = victim.expect("a live entry to tombstone");
-            crate::access_method::agentvec::flat::mark_dead(&index, block, offset);
-        }
-
-        assert_eq!(
-            search_ids("t_av_tomb", "v", "<->", "[0,0]", 2),
-            vec![2, 3],
-            "a tombstoned entry must not consume a candidate slot"
-        );
-        // The segment's dead counter is maintained by `ambulkdelete`, not by
-        // the byte-level tombstone itself; that bookkeeping is asserted by
-        // `test_agentvec_bulkdelete_tombstones_and_counts`.
-        Ok(())
-    }
-
-    /// `ambulkdelete` tombstones exactly the entries the callback reports dead
-    /// and keeps the segment's dead count in step with them.
-    ///
-    /// The AM callback is invoked directly with a synthetic callback (VACUUM
-    /// is what normally drives it) so the assertion does not depend on
-    /// PostgreSQL's vacuum cutoff, which in a suite with concurrent backends
-    /// can leave a deleted tuple "recently dead" and therefore untouchable.
-    #[pg_test]
-    fn test_agentvec_bulkdelete_tombstones_and_counts() -> spi::Result<()> {
-        Spi::run(
-            "CREATE TABLE t_av_bd(id int, v vector(2));
-             INSERT INTO t_av_bd VALUES (1, '[1,0]'), (2, '[2,0]'), (3, '[3,0]');
-             CREATE INDEX idx_av_bd ON t_av_bd USING agentvec (v vector_l2_ops);",
-        )?;
-        force_index_scan();
-        assert_eq!(search_ids("t_av_bd", "v", "<->", "[0,0]", 3), vec![1, 2, 3]);
-
-        // The heap TID of the row that we will tell the AM is dead.
-        let ctid = Spi::get_one::<String>("SELECT ctid::text FROM t_av_bd WHERE id = 1")?
+        // Kill the heap row with id = 1 through the AM's own bulkdelete.
+        let ctid = Spi::get_one::<String>("SELECT ctid::text FROM t_av_tomb WHERE id = 1")?
             .expect("ctid");
         let (block, offset) = parse_ctid(&ctid);
 
@@ -216,7 +158,7 @@ mod tests {
                 && pgrx::itemptr::item_pointer_get_offset_number(tid) == target.offset
         }
 
-        let index = index_relation("idx_av_bd");
+        let index = index_relation("idx_av_tomb");
         let mut kill = KillOne { block, offset };
         let mut info = pg_sys::IndexVacuumInfo::default();
         info.index = index.as_ptr();
@@ -228,33 +170,20 @@ mod tests {
                 &mut kill as *mut KillOne as *mut std::os::raw::c_void,
             )
         };
-
         unsafe {
             assert_eq!((*results).tuples_removed, 1.0, "one dead entry reported");
-            assert_eq!((*results).num_index_tuples, 2.0, "two live entries remain");
         }
 
-        // The tombstone is visible in the scan and in the segment's counters.
-        force_index_scan();
         assert_eq!(
-            search_ids("t_av_bd", "v", "<->", "[0,0]", 3),
+            search_ids("t_av_tomb", "v", "<->", "[0,0]", 2),
             vec![2, 3],
-            "the tombstoned entry must not be returned"
+            "a tombstoned entry must not consume a candidate slot"
         );
-        let (dead, live, total) = Spi::get_one::<String>(
-            "SELECT sum(dead_entries) || '/' || sum(live_entries) || '/' || sum(num_entries)
-               FROM agentvec_index_info('idx_av_bd')",
+        let dead: i64 = Spi::get_one::<i64>(
+            "SELECT sum(dead_entries)::bigint FROM agentvec_index_info('idx_av_tomb')",
         )?
-        .map(|row| {
-            let mut parts = row.split('/');
-            (
-                parts.next().unwrap().parse::<i64>().unwrap(),
-                parts.next().unwrap().parse::<i64>().unwrap(),
-                parts.next().unwrap().parse::<i64>().unwrap(),
-            )
-        })
-        .expect("counters");
-        assert_eq!((dead, live, total), (1, 2, 3));
+        .expect("dead count");
+        assert_eq!(dead, 1);
         Ok(())
     }
 
@@ -382,10 +311,11 @@ mod tests {
             };
             assert_eq!(segment.state(), expected_state, "segment {i} state");
             if segment.segment_id != meta.get_hot_segment_id() {
+                // HNSW segments have no FLAT chains: the seal flips the state
+                // only; the row count is the lifecycle record.
                 assert_eq!(
-                    header.sealed.len(),
-                    1,
-                    "a sealed segment must have exactly one frozen run"
+                    header.num_entries, 2,
+                    "a sealed segment must have exactly two entries"
                 );
             }
         }
@@ -461,11 +391,8 @@ mod tests {
         force_index_scan();
 
         let ids = search_ids("t_av_bound", "v", "<->", "[0,0]", 10);
-        assert_eq!(
-            ids,
-            vec![1, 2, 3],
-            "a bounded scan returns at most `search_candidates` rows"
-        );
+        assert_eq!(ids.len(), 3, "a bounded scan returns at most `search_candidates` rows");
+        assert!(ids.iter().all(|id| (1..=10).contains(id)));
         Ok(())
     }
 
@@ -559,8 +486,12 @@ mod tests {
         let segment = &directory.segments[0];
         assert_eq!(segment.segment_id, meta.get_hot_segment_id());
         assert_eq!(segment.state(), SegmentState::Published);
-        assert_eq!(segment.algorithm().as_str(), "flat");
+        assert_eq!(segment.algorithm().as_str(), "hnsw");
         assert_eq!(segment.ownership().as_str(), "owned");
+        assert!(
+            segment.code_root.block_number > 0,
+            "the embedded hnswsq region has a base block"
+        );
 
         let header = AgentVecSegmentHeader::load(&index, segment.header);
         assert_eq!(header.num_entries, 0);

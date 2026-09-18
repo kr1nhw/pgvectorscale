@@ -26,6 +26,7 @@ use crate::access_method::hnswsq::options::{
     ITERATIVE_SCAN_OFF, ITERATIVE_SCAN_STRICT,
 };
 use crate::access_method::hnswsq::types::*;
+use crate::access_method::hnswsq::quantize::Sq8QueryState;
 use crate::access_method::hnswsq::utils::*;
 use crate::access_method::pg_vector::PgVectorInternal;
 
@@ -68,24 +69,6 @@ fn scan_load_vec(precision: HnswPrecision) -> bool {
 /// `GetScanItems` (hnswscan.c): layered descent (ef = 1) then the layer-0
 /// search with `ef_search`.
 unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<SearchCandidate> {
-    let load_vec = scan_load_vec(state.support.precision);
-
-    // Get m and entry point
-    let mut m = 0usize;
-    let mut entry = None;
-    get_meta_page_info(index, state.base, Some(&mut m), Some(&mut entry));
-    state.m = m;
-
-    let Some(entry) = entry else {
-        return Vec::new();
-    };
-
-    // The entry element must outlive the search results (the candidates in
-    // `w` reference it until amgettuple drains them), so it lives in the
-    // scan's element arena like every other materialized element.
-    let entry_ptr = state.scratch.elements.alloc();
-    std::ptr::copy_nonoverlapping(&*entry, entry_ptr, 1);
-
     let q = if state.q.is_empty() {
         None
     } else {
@@ -103,14 +86,67 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
         })
         .flatten();
 
+    let ef = (HNSW_EF_SEARCH.get() as usize).max(1);
+    let (w, m) = region_candidates(
+        index,
+        state.base,
+        &state.support,
+        q,
+        ef,
+        &mut state.visited,
+        &mut state.scratch,
+        state.qstate.as_ref(),
+        &mut state.tuples,
+    );
+    state.m = m;
+    w
+}
+
+/// One-shot materialized search over an hnswsq region (the standalone AM's
+/// whole index, or an embedded AgentVec HOT segment at `base`): layered
+/// descent (ef = 1) then the layer-0 search with `ef`.
+///
+/// Returns the candidates in furthest-first order (drain from the back),
+/// with their encoded values materialized in `scratch`'s arena, and the
+/// region's `m`.  [`emit_candidate`] turns each result into the value the
+/// scan would publish.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn region_candidates(
+    index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
+    support: &Support,
+    q: Option<&[f32]>,
+    ef: usize,
+    visited: &mut Visited,
+    scratch: &mut SearchScratch,
+    qstate: Option<&Sq8QueryState>,
+    tuples: &mut i64,
+) -> (Vec<SearchCandidate>, usize) {
+    let load_vec = scan_load_vec(support.precision);
+
+    // Get m and entry point
+    let mut m = 0usize;
+    let mut entry = None;
+    get_meta_page_info(index, base, Some(&mut m), Some(&mut entry));
+
+    let Some(entry) = entry else {
+        return (Vec::new(), m);
+    };
+
+    // The entry element must outlive the search results (the candidates in
+    // `w` reference it until the caller drains them), so it lives in the
+    // caller's element arena like every other materialized element.
+    let entry_ptr = scratch.elements.alloc();
+    std::ptr::copy_nonoverlapping(&*entry, entry_ptr, 1);
+
     let mut ep = vec![entry_candidate(
         std::ptr::null_mut(),
         entry_ptr,
         q,
         Some(index),
-        &state.support,
+        support,
         load_vec,
-        state.qstate.as_ref(),
+        qstate,
     )];
     let entry_level = (*entry_ptr).level as usize;
 
@@ -120,7 +156,7 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
         let w = search_layer(
             std::ptr::null_mut(),
             Some(index),
-            &state.support,
+            support,
             m,
             q,
             &ep,
@@ -128,22 +164,21 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
             lc,
             load_vec,
             None,
-            &mut state.visited,
+            visited,
             None,
             true,
             None,
-            &mut state.scratch,
-            state.qstate.as_ref(),
+            scratch,
+            qstate,
         );
         ep = w;
     }
 
-    let ef = (HNSW_EF_SEARCH.get() as usize).max(1);
     let mut discarded: CandidateHeap = CandidateHeap::with_capacity(ef + 1);
     let w = search_layer(
         std::ptr::null_mut(),
         Some(index),
-        &state.support,
+        support,
         m,
         q,
         &ep,
@@ -151,22 +186,15 @@ unsafe fn get_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<
         0,
         load_vec,
         None,
-        &mut state.visited,
-        if state.discarded.is_some() {
-            Some(&mut discarded)
-        } else {
-            None
-        },
+        visited,
+        Some(&mut discarded),
         true,
-        Some(&mut state.tuples),
-        &mut state.scratch,
-        state.qstate.as_ref(),
+        Some(tuples),
+        scratch,
+        qstate,
     );
-    if state.discarded.is_some() {
-        state.discarded = Some(discarded);
-    }
-
-    w
+    drop(discarded);
+    (w, m)
 }
 
 /// `ResumeScanItems` (hnswscan.c): continue the layer-0 search from the
@@ -225,14 +253,29 @@ fn scan_memory(state: &ScanState) -> usize {
 /// provable lower bound for the quantized layouts (see the module docs and
 /// the old engine's scan for the error-bound derivation).
 unsafe fn emit_distance(state: &ScanState, sc: &SearchCandidate) -> f64 {
+    emit_candidate(&state.support, &state.q, state.norm_q, sc)
+}
+
+/// The value a scan publishes for one materialized candidate: the exact
+/// operator value for the `plain` layout, and a provable per-element lower
+/// bound in the operator's units for the quantized layouts (`clamped`
+/// elements emit -infinity).  This is the single source of the emission
+/// contract for both the `hnswsq` AM scan and AgentVec's merged scan over an
+/// embedded HOT segment.
+pub unsafe fn emit_candidate(
+    support: &Support,
+    q: &[f32],
+    norm_q: f32,
+    sc: &SearchCandidate,
+) -> f64 {
     let base = std::ptr::null_mut();
     let element = crate::access_method::hnswsq::ptr::access::<Element>(base, sc.element);
-    let vec_bytes = state.support.codec.vector_bytes();
+    let vec_bytes = support.codec.vector_bytes();
 
-    if !state.recheck_orderby {
+    if support.precision == HnswPrecision::Plain {
         // Lossless layout: the stored distance IS the operator's value (L2
         // additionally applies the sqrt the operator applies).
-        return match state.support.dist_type {
+        return match support.dist_type {
             DistanceType::L2 => (sc.distance.max(0.0)).sqrt() as f64,
             _ => sc.distance as f64,
         };
@@ -240,48 +283,45 @@ unsafe fn emit_distance(state: &ScanState, sc: &SearchCandidate) -> f64 {
 
     // Quantized: per-element error bound, in the operator's units.
     let value = get_value(base, element, vec_bytes);
-    let mut decoded = vec![0.0f32; state.support.codec.dim()];
-    state
-        .support
-        .codec
-        .decode_into(value, decoded.as_mut_slice());
+    let mut decoded = vec![0.0f32; support.codec.dim()];
+    support.codec.decode_into(value, decoded.as_mut_slice());
     let norm_v = decoded.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-    let rel_err = quantize::relative_element_error(state.support.precision);
-    let rel_margin = match state.support.precision {
+    let rel_err = quantize::relative_element_error(support.precision);
+    let rel_margin = match support.precision {
         quantize::HnswPrecision::IeeeFp8 => 1.15,
         quantize::HnswPrecision::IeeeFp16 => 1.01,
         _ => 1.0,
     };
-    let sq_error_norm = state.support.codec.quant_error_norm();
+    let sq_error_norm = support.codec.quant_error_norm();
     let e = rel_err * rel_margin * norm_v + sq_error_norm;
-    let slack = 1e-4 * (1.0 + state.norm_q * norm_v);
+    let slack = 1e-4 * (1.0 + norm_q * norm_v);
 
     // The search distance may come from an integer-distance form
     // (hnswsq.sq8_distance) whose quantity differs from the operator's
     // distance over the decoded vector; the lower-bound proof below needs
     // the true decoded distance, so recompute it per emitted tuple (a scan
     // emits only ~LIMIT tuples — cheap).
-    let d = match state.support.dist_type {
+    let d = match support.dist_type {
         DistanceType::L2 => {
             let mut acc = 0.0f32;
-            for i in 0..state.support.codec.dim() {
-                let diff = state.q[i] - decoded[i];
+            for i in 0..support.codec.dim() {
+                let diff = q[i] - decoded[i];
                 acc += diff * diff;
             }
             acc
         }
         DistanceType::Cosine => {
             let mut dot = 0.0f32;
-            for i in 0..state.support.codec.dim() {
-                dot += state.q[i] * decoded[i];
+            for i in 0..support.codec.dim() {
+                dot += q[i] * decoded[i];
             }
             (1.0 - dot).max(0.0)
         }
         DistanceType::InnerProduct => {
             let mut dot = 0.0f32;
-            for i in 0..state.support.codec.dim() {
-                dot += state.q[i] * decoded[i];
+            for i in 0..support.codec.dim() {
+                dot += q[i] * decoded[i];
             }
             -dot
         }
@@ -294,17 +334,17 @@ unsafe fn emit_distance(state: &ScanState, sc: &SearchCandidate) -> f64 {
         return f64::NEG_INFINITY;
     }
 
-    match state.support.dist_type {
+    match support.dist_type {
         DistanceType::L2 => {
             let sqrt_d = d.max(0.0).sqrt();
             let lb = d - 2.0 * sqrt_d * e - e * e - slack * (1.0 + sqrt_d);
             (lb.max(0.0).sqrt()) as f64
         }
         DistanceType::Cosine => {
-            let lb = d - state.norm_q.max(1.0) * e - slack;
+            let lb = d - norm_q.max(1.0) * e - slack;
             (lb.max(0.0)) as f64
         }
-        DistanceType::InnerProduct => (d - state.norm_q * e - slack) as f64,
+        DistanceType::InnerProduct => (d - norm_q * e - slack) as f64,
     }
 }
 
@@ -317,7 +357,7 @@ pub unsafe extern "C-unwind" fn ambeginscan(
 ) -> pg_sys::IndexScanDesc {
     let scan = pg_sys::RelationGetIndexScan(index, nkeys, norderbys);
     let support = init_support(index, HNSW_STANDALONE_BASE);
-    let m = get_m(index);
+    let (m, _ef_construction) = region_params(index, HNSW_STANDALONE_BASE);
     let tmp_ctx = PgMemoryContexts::new("hnswsq scan temporary context");
 
     let n = norderbys.max(1) as usize;

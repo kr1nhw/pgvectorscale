@@ -28,15 +28,24 @@ use crate::access_method::agentvec::flat;
 use crate::access_method::agentvec::meta_page::AgentVecMetaPage;
 use crate::access_method::agentvec::options::TSVAgentVecOptions;
 use crate::access_method::distance::{preprocess_cosine, DistanceType};
+use crate::access_method::hnswsq::options::{HNSW_EF_SEARCH, HNSW_SQ8_DISTANCE};
+use crate::access_method::hnswsq::quantize::HnswPrecision;
+use crate::access_method::hnswsq::types::{Element, Visited};
+use crate::access_method::hnswsq::utils::SearchScratch;
+use crate::access_method::hnswsq::utils;
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::util::ItemPointer;
 
 /// A (distance, heap tid) candidate ordered by distance, used as the element
-/// type of the bounded top-N max-heap.
+/// type of the bounded top-N max-heap.  `exact` is false for candidates whose
+/// distance is a lower bound (HNSW quantized layouts, IVF estimates): those
+/// are emitted with `xs_recheckorderby = true` and their bound as the orderby
+/// value, so the executor's reorder queue restores the exact ordering.
 #[derive(PartialEq)]
 struct DistTid {
-    dist: f32,
+    dist: f64,
     tid: ItemPointer,
+    exact: bool,
 }
 
 impl Eq for DistTid {}
@@ -49,8 +58,9 @@ impl PartialOrd for DistTid {
 
 impl Ord for DistTid {
     fn cmp(&self, other: &Self) -> Ordering {
-        // total_cmp gives a total order on f32 (including NaN); tie-break by
-        // tid so Ord stays consistent with the derived PartialEq/Eq.
+        // total_cmp gives a total order on f64 (including NaN and -infinity,
+        // which clamped HNSW elements emit); tie-break by tid so Ord stays
+        // consistent with the derived PartialEq/Eq.
         self.dist
             .total_cmp(&other.dist)
             .then_with(|| self.tid.cmp(&other.tid))
@@ -65,7 +75,7 @@ pub struct AgentVecScanState {
     /// evaluate itself and therefore requires the executor to recheck.
     has_keys: bool,
     /// Materialized candidates in ascending distance order.
-    results: Vec<(f32, ItemPointer)>,
+    results: Vec<(f64, ItemPointer, bool)>,
     /// Position in `results`.
     result_index: usize,
     /// Whether `results` has been materialized for the current scan keys.
@@ -151,6 +161,14 @@ pub unsafe extern "C-unwind" fn amrescan(
 }
 
 /// Materialize the candidates for the current scan keys.
+///
+/// One snapshot of the directory, then per-algorithm execution:
+/// * `FLAT` segments contribute exact distances (every live entry when
+///   `search_candidates` is 0);
+/// * `HNSW` segments run the embedded hnswsq region's one-shot search with
+///   `ef = search_candidates` (or `hnswsq.ef_search` when unbounded) and
+///   contribute their per-element values: exact for the `plain` layout,
+///   provable lower bounds for the quantized layouts.
 unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanState) {
     let index_rel = PgRelation::from_pg((*scan).indexRelation);
     let meta = AgentVecMetaPage::fetch(&index_rel);
@@ -158,56 +176,129 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
     let distance_fn = meta.get_distance_type().get_distance_function();
     let bound = options.get_search_candidates();
     let dim = meta.get_num_dimensions() as usize;
+    let norm_q = state.query.iter().map(|x| x * x).sum::<f32>().sqrt();
 
     let directory = meta.load_directory(&index_rel);
-    let mut all: Vec<(f32, ItemPointer)> = Vec::new();
+    let mut all: Vec<(f64, ItemPointer, bool)> = Vec::new();
     let mut heap: BinaryHeap<DistTid> = BinaryHeap::new();
     // Reused across entries so the scan performs one allocation, not one per
     // candidate.
     let mut vector_scratch: Vec<f32> = Vec::with_capacity(dim);
 
-    for segment in directory.searchable() {
-        match segment.algorithm() {
-            SegmentAlgorithm::Flat => {}
-            other => error!(
-                "agentvec: segment {} uses {} storage, which this version cannot search",
-                segment.segment_id,
-                other.as_str()
-            ),
-        }
-        let header = AgentVecSegmentHeader::load(&index_rel, segment.header);
-        for chain_start in header.chain_starts() {
-            flat::for_each_entry(&index_rel, chain_start, |_block, _offset, bytes| {
-                if flat::decode_state(bytes) != flat::STATE_LIVE {
-                    return;
-                }
-                let decoded = flat::decode_vector_into(bytes, &mut vector_scratch);
-                if decoded != dim {
-                    panic!(
-                        "agentvec: segment {} has a {}-dimensional entry, expected {}",
-                        segment.segment_id, decoded, dim
-                    );
-                }
-                let dist = distance_fn(&state.query, &vector_scratch);
-                let candidate = DistTid {
-                    dist,
-                    tid: flat::decode_tid(bytes),
-                };
-                match bound {
-                    // Exhaustive: exact ordered scan, so query semantics never
-                    // depend on a candidate bound.
-                    None => all.push((candidate.dist, candidate.tid)),
-                    Some(k) => {
-                        if heap.len() < k {
-                            heap.push(candidate);
-                        } else if let Some(mut worst) = heap.peek_mut() {
-                            if candidate.dist < worst.dist {
-                                *worst = candidate;
-                            }
-                        }
+    let mut push = |all: &mut Vec<(f64, ItemPointer, bool)>,
+                    heap: &mut BinaryHeap<DistTid>,
+                    candidate: DistTid| {
+        match bound {
+            None => all.push((candidate.dist, candidate.tid, candidate.exact)),
+            Some(k) => {
+                if heap.len() < k {
+                    heap.push(candidate);
+                } else if let Some(mut worst) = heap.peek_mut() {
+                    if candidate.dist < worst.dist {
+                        *worst = candidate;
                     }
                 }
-            });
+            }
+        }
+    };
+
+    for segment in directory.searchable() {
+        match segment.algorithm() {
+            SegmentAlgorithm::Flat => {
+                let header = AgentVecSegmentHeader::load(&index_rel, segment.header);
+                for chain_start in header.chain_starts() {
+                    flat::for_each_entry(&index_rel, chain_start, |_block, _offset, bytes| {
+                        if flat::decode_state(bytes) != flat::STATE_LIVE {
+                            return;
+                        }
+                        let decoded = flat::decode_vector_into(bytes, &mut vector_scratch);
+                        if decoded != dim {
+                            panic!(
+                                "agentvec: segment {} has a {}-dimensional entry, expected {}",
+                                segment.segment_id, decoded, dim
+                            );
+                        }
+                        let dist = distance_fn(&state.query, &vector_scratch);
+                        push(
+                            &mut all,
+                            &mut heap,
+                            DistTid {
+                                dist: dist as f64,
+                                tid: flat::decode_tid(bytes),
+                                exact: true,
+                            },
+                        );
+                    });
+                }
+            }
+            SegmentAlgorithm::Hnsw => {
+                let base = segment.code_root.block_number;
+                let support = utils::init_support(index_rel.as_ptr(), base);
+                let q = if state.query.is_empty() {
+                    None
+                } else {
+                    Some(state.query.as_slice())
+                };
+                let ef = match bound {
+                    Some(k) => k,
+                    None => (HNSW_EF_SEARCH.get() as usize).max(1),
+                };
+                // SQ8: quantize the query once per segment search (the same
+                // convention as the hnswsq AM scan).
+                let qstate = q
+                    .map(|q| utils::sq8_query_state(&support, q, HNSW_SQ8_DISTANCE.get()))
+                    .flatten();
+
+                let mut m = 0usize;
+                utils::get_meta_page_info(index_rel.as_ptr(), base, Some(&mut m), None);
+                let mut visited = Visited::new(1000 * m * 2);
+                let mut scratch = SearchScratch::new(m);
+                let mut tuples: i64 = 0;
+                let (candidates, _m) = crate::access_method::hnswsq::scan::region_candidates(
+                    index_rel.as_ptr(),
+                    base,
+                    &support,
+                    q,
+                    ef,
+                    &mut visited,
+                    &mut scratch,
+                    qstate.as_ref(),
+                    &mut tuples,
+                );
+                let exact = support.precision == HnswPrecision::Plain;
+                // The search returns furthest-first; drain from the back so
+                // candidates enter the merge in ascending bound order.
+                for sc in candidates.into_iter().rev() {
+                    let element =
+                        crate::access_method::hnswsq::ptr::access::<Element>(
+                            std::ptr::null_mut(),
+                            sc.element,
+                        );
+                    if (*element).deleted != 0 {
+                        continue;
+                    }
+                    let dist =
+                        crate::access_method::hnswsq::scan::emit_candidate(
+                            &support,
+                            &state.query,
+                            norm_q,
+                            &sc,
+                        );
+                    push(
+                        &mut all,
+                        &mut heap,
+                        DistTid {
+                            dist,
+                            tid: ItemPointer::with_item_pointer_data((*element).heaptid),
+                            exact,
+                        },
+                    );
+                }
+            }
+            SegmentAlgorithm::IvfRaBitQ => error!(
+                "agentvec: segment {} uses ivf_rabitq storage, which this phase cannot search",
+                segment.segment_id
+            ),
         }
     }
 
@@ -219,7 +310,7 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
         Some(_) => heap
             .into_sorted_vec()
             .into_iter()
-            .map(|c| (c.dist, c.tid))
+            .map(|c| (c.dist, c.tid, c.exact))
             .collect(),
     };
     state.results_computed = true;
@@ -247,7 +338,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
     if state.result_index >= state.results.len() {
         return false;
     }
-    let (distance, heap_tid) = state.results[state.result_index];
+    let (distance, heap_tid, exact) = state.results[state.result_index];
     state.result_index += 1;
 
     let mut tid_data = pg_sys::ItemPointerData::default();
@@ -256,12 +347,28 @@ pub unsafe extern "C-unwind" fn amgettuple(
     // This AM evaluates no index quals of its own: anything the planner passed
     // as a scan key must be rechecked against the heap tuple.
     (*scan).xs_recheck = state.has_keys;
-    // FLAT distances are exact and use the same formula as the ordering
-    // operator, so the order is trustworthy and no recheck is needed.  (An
-    // approximate segment algorithm must set this to true and supply
-    // `xs_orderbyvals` as float8 datums.)
-    (*scan).xs_recheckorderby = false;
-    let _ = distance;
+
+    if exact {
+        // FLAT and HNSW-plain distances are exact and use the same formula as
+        // the ordering operator, so the order is trustworthy and no recheck
+        // is needed.
+        (*scan).xs_recheckorderby = false;
+        (*scan).xs_orderbyvals = std::ptr::null_mut();
+        (*scan).xs_orderbynulls = std::ptr::null_mut();
+    } else {
+        // Approximate: the value is a lower bound (HNSW quantized layouts, and
+        // later IVF estimates).  Publish it as a float8 datum — the ordering
+        // operator's type — so the executor's reorder queue can compare it
+        // against the recomputed exact value.
+        (*scan).xs_recheckorderby = true;
+        let orderbyvals =
+            pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>()) as *mut pg_sys::Datum;
+        let orderbynulls = pg_sys::palloc(std::mem::size_of::<bool>()) as *mut bool;
+        *orderbyvals = pg_sys::Datum::from(distance.to_bits() as usize);
+        *orderbynulls = false;
+        (*scan).xs_orderbyvals = orderbyvals;
+        (*scan).xs_orderbynulls = orderbynulls;
+    }
 
     true
 }
