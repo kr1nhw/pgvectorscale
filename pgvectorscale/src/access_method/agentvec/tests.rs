@@ -535,6 +535,96 @@ mod tests {
         Ok(())
     }
 
+    /// The synchronous maintenance entry point converts every sealed
+    /// segment of an index, bounded by the migration budget.
+    #[pg_test]
+    fn test_agentvec_run_maintenance_converts_all_sealed() -> spi::Result<()> {
+        Spi::run(
+            "CREATE TABLE t_av_maint(id int, v vector(8));
+             INSERT INTO t_av_maint
+                SELECT g, ('[' || g || ',0,0,0,0,0,0,0]')::vector FROM generate_series(1, 90) AS g;
+             CREATE INDEX idx_av_maint ON t_av_maint USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_max_rows = 30);",
+        )?;
+        force_index_scan();
+
+        let converted =
+            Spi::get_one::<i64>("SELECT agentvec_run_maintenance('idx_av_maint')")?.expect("n");
+        assert_eq!(converted, 60, "two sealed segments of 30 rows");
+        let warm: i64 = Spi::get_one::<i64>(
+            "SELECT count(*) FROM agentvec_index_info('idx_av_maint') WHERE algorithm = 'ivf_rabitq'",
+        )?
+        .expect("count");
+        assert_eq!(warm, 2, "both sealed segments converted");
+
+        // Idempotent: nothing left to convert.
+        let again =
+            Spi::get_one::<i64>("SELECT agentvec_run_maintenance('idx_av_maint')")?.expect("n");
+        assert_eq!(again, 0);
+
+        assert_eq!(
+            search_ids("t_av_maint", "v", "<->", "[0,0,0,0,0,0,0,0]", 3),
+            vec![1, 2, 3]
+        );
+        Ok(())
+    }
+
+    /// The per-index maintenance schedule gate: `agentvec_maybe_maintain`
+    /// converts only when the index's `maintenance_interval` has elapsed
+    /// since the last pass (fresh indexes start as just-maintained).  The
+    /// worker itself calls this same gate; it is exercised end-to-end in the
+    /// scratch instance because the pg_test harness runs every test in a
+    /// transaction that never commits, so a separate worker backend cannot
+    /// see the test's index.
+    #[pg_test]
+    fn test_agentvec_maybe_maintain_schedule() -> spi::Result<()> {
+        Spi::run(
+            "CREATE TABLE t_av_sched(id int, v vector(8));
+             INSERT INTO t_av_sched
+                SELECT g, ('[' || g || ',0,0,0,0,0,0,0]')::vector FROM generate_series(1, 60) AS g;
+             CREATE INDEX idx_av_sched ON t_av_sched USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_max_rows = 30);",
+        )?;
+
+        // Fresh index: not due yet (default 60 s interval).
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT agentvec_maybe_maintain('idx_av_sched')")?.expect("n"),
+            0,
+            "a fresh index must not be maintained before its interval"
+        );
+        Spi::run("SELECT pg_sleep(0.2)")?;
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT agentvec_maybe_maintain('idx_av_sched')")?.expect("n"),
+            0,
+            "still not due"
+        );
+
+        // Force maintenance (marks the index maintained) and seal another
+        // segment.
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT agentvec_run_maintenance('idx_av_sched')")?.expect("n"),
+            30
+        );
+        Spi::run(
+            "INSERT INTO t_av_sched
+                SELECT g, ('[' || g || ',0,0,0,0,0,0,0]')::vector FROM generate_series(61, 90) AS g;",
+        )?;
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT agentvec_maybe_maintain('idx_av_sched')")?.expect("n"),
+            0,
+            "not due again after the forced pass"
+        );
+
+        // An interval of 0 means "always due".
+        Spi::run("ALTER INDEX idx_av_sched SET (maintenance_interval = 0)")?;
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT agentvec_maybe_maintain('idx_av_sched')")?.expect("n"),
+            30,
+            "due immediately with interval 0"
+        );
+        Ok(())
+    }
+
     /// With nothing sealed, the conversion is a no-op.
     #[pg_test]
     fn test_agentvec_consolidate_noop() -> spi::Result<()> {

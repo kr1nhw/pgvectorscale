@@ -53,10 +53,15 @@ pub mod pg_test {
 
     #[cfg(feature = "build_parallel")]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        vec!["maintenance_work_mem = '640MB'"]
+        vec![
+            "maintenance_work_mem = '640MB'",
+            // The maintenance worker must not convert sealed segments of
+            // in-flight tests; the worker's own test re-enables it per session.
+            "agentvec.maintenance_worker = off",
+        ]
     }
     #[cfg(not(feature = "build_parallel"))]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        vec![]
+        vec!["agentvec.maintenance_worker = off"]
     }
 }

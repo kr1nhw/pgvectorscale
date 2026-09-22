@@ -33,6 +33,7 @@ pub mod consolidate;
 pub mod directory;
 pub mod flat;
 pub mod insert;
+pub mod maintenance;
 pub mod meta_page;
 pub mod options;
 pub mod router;

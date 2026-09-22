@@ -46,7 +46,7 @@ fn agentvec_consolidate(index: PgRelation) -> i64 {
     unsafe { consolidate_inner(&index) }
 }
 
-unsafe fn consolidate_inner(index: &PgRelation) -> i64 {
+pub(super) unsafe fn consolidate_inner(index: &PgRelation) -> i64 {
     let meta = AgentVecMetaPage::fetch(index);
     let options = TSVAgentVecOptions::from_relation(index);
 

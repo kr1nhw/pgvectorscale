@@ -94,6 +94,10 @@ pub unsafe extern "C-unwind" fn ambuild(
         meta.set_num_tuples(state.nrows);
     });
 
+    // Phase 4: make sure this database has a maintenance worker (no-op when
+    // one is already running or dynamic background workers are unavailable).
+    crate::access_method::agentvec::maintenance::launch_worker_for_current_database();
+
     let mut result = PgBox::<pg_sys::IndexBuildResult>::alloc0();
     result.heap_tuples = state.nrows as f64;
     result.index_tuples = state.nrows as f64;

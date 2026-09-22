@@ -286,6 +286,10 @@ impl TSVAgentVecOptions {
 
 static mut RELOPT_KIND_AGENTVEC: pg_sys::relopt_kind::Type = 0;
 
+/// Whether `ambuild` launches the per-database maintenance background worker
+/// (tests turn it off; `agentvec_run_maintenance()` stays available either way).
+pub static MAINTENANCE_WORKER_ENABLED: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
+
 /// Register the `agentvec` reloptions.  Called from `_PG_init`.
 pub unsafe fn init() {
     RELOPT_KIND_AGENTVEC = pg_sys::add_reloption_kind();
@@ -402,6 +406,15 @@ pub unsafe fn init() {
         DEFAULT_SEARCH_CANDIDATES,
         0,
         2_000_000_000,
+    );
+
+    pgrx::GucRegistry::define_bool_guc(
+        c"agentvec.maintenance_worker",
+        c"Run the agentvec maintenance background worker",
+        c"When off, maintenance runs only through agentvec_run_maintenance().",
+        &MAINTENANCE_WORKER_ENABLED,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
     );
 }
 

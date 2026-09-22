@@ -71,6 +71,9 @@ pub struct AgentVecMetaPage {
     generation: u64,
     /// Rows the index counts as indexed (maintained approximately).
     num_tuples: u64,
+    /// Timestamp (µs) of the last maintenance pass (0 = never maintained;
+    /// `ambuild` initializes it so a fresh index is not due immediately).
+    last_maintenance_at: i64,
 }
 
 impl AgentVecMetaPage {
@@ -95,6 +98,7 @@ impl AgentVecMetaPage {
             epoch: 1,
             generation: 0,
             num_tuples: 0,
+            last_maintenance_at: pg_sys::GetCurrentTimestamp(),
         };
         meta.store(index, true);
         meta
@@ -250,6 +254,16 @@ impl AgentVecMetaPage {
     /// Set the approximate indexed row count.
     pub fn set_num_tuples(&mut self, num_tuples: u64) {
         self.num_tuples = num_tuples;
+    }
+
+    /// Timestamp (µs) of the last maintenance pass.
+    pub fn get_last_maintenance_at(&self) -> i64 {
+        self.last_maintenance_at
+    }
+
+    /// Record a maintenance pass at the current time.
+    pub fn mark_maintained(&mut self) {
+        self.last_maintenance_at = unsafe { pg_sys::GetCurrentTimestamp() };
     }
 
     /// The published directory of this index.
