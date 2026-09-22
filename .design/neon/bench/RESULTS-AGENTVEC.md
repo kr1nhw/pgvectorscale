@@ -58,14 +58,33 @@ payload is **37 MB** (22x smaller than the 819 MB plain index); total index
 | 16 | 0.926 | ~300 |
 | 32 | 0.921 | ~300 |
 
-Known gaps (phase-8 territory, documented not hidden):
+The ~300 ms plateau is the estimate pass over 100k-entry lists
+(`ivf_lists=100`); a finer partition removes it — `ivf_lists=1000`
+(1k-entry lists, search_candidates=100):
 
-* The WARM scan's FastScan estimate pass over 100k-entry lists dominates
-  (~300 ms at any probe count; the standalone ivfrq engine measured ~5.5 ms
-  p50 at p8 on 100M with the same list sizes) — the shared `for_each_candidate`
-  path needs the same per-entry cost profile as the ivf AM scan.
-* Recall caps at ~0.93 (ivf_lists=100 partition quality on 1M rows);
-  `lists`/`probes` tuning plus the phase-12 recoding raise it.
+| probes | recall@10 | q ms (LIMIT 10) |
+|---|---|---|
+| 8 | 0.793 | 1.8 |
+| 16 | 0.858 | 1.9 |
+| 32 | 0.908 | 2.1 |
+| 64 | 0.936 | 2.6 |
+| 128 | 0.943 | 3.4 |
+
+Build 71 s + consolidate 20 s, total 432 MB (53% of plain).  vs hnswsq
+plain's 2.7 ms / 0.991 recall@ef160: at matched ~2.7 ms the compressed
+config reaches 0.936 at 47% less space — a real size/latency tradeoff
+curve; partition quality (phase-12 recoding) and the phase-8 rerank
+(bounding the unbounded scan) remain the levers to push recall up.
+
+## 3.1 Insert throughput at 1M scale (50k fresh rows, single backend)
+
+| engine | 50k inserts ms | rows/s |
+|---|---|---|
+| hnswsq plain | 9278 | 5390 |
+| agentvec HOT plain | 8887 | 5627 |
+
+Parity (agentvec 4% faster in this pass — same insert path plus the
+agentvec wrapper, amortized by the batch).
 
 ## 4. aarch64 parity (116.204.102.142, 16 vCPU, PG 17.11 release)
 
