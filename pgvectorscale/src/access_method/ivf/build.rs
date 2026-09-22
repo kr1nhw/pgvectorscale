@@ -11,7 +11,7 @@ use crate::access_method::ivf::centroid::{kmeans_plus_plus_init, lloyds_algorith
 use crate::access_method::ivf::centroid_page::IvfCentroidPage;
 use crate::access_method::ivf::entry::{seal_entries, IvfEntry};
 use crate::access_method::ivf::list_directory::IvfListDirectory;
-use crate::access_method::ivf::meta_page::IvfMetaPage;
+use crate::access_method::ivf::meta_page::{IvfMetaPage, IVF_STANDALONE_BASE};
 use crate::access_method::ivf::options::TSVIvfOptions;
 use crate::access_method::ivf::segment::{IvfListHeader, IvfSegment, IvfSegmentList};
 use crate::access_method::pg_vector::PgVectorInternal;
@@ -134,6 +134,7 @@ pub unsafe extern "C-unwind" fn ambuild(
     let mut meta_page = unsafe {
         IvfMetaPage::create(
             &index_rel,
+            IVF_STANDALONE_BASE,
             num_dimensions as u32,
             distance_type,
             num_lists as u16,
@@ -144,14 +145,14 @@ pub unsafe extern "C-unwind" fn ambuild(
     };
     let mut list_directory = IvfListDirectory::new(num_lists as u16);
     unsafe {
-        list_directory.store(&index_rel, true);
+        list_directory.store(&index_rel, IVF_STANDALONE_BASE, true);
     }
     let centroid_page = IvfCentroidPage::new(centroids.clone());
     let centroid_ptr = unsafe { centroid_page.store(&index_rel, None) };
     unsafe {
         meta_page.set_list_directory_pointer(ItemPointer::new(1, 1));
         meta_page.set_centroids_pointer(centroid_ptr);
-        meta_page.store(&index_rel, false);
+        meta_page.store(&index_rel, IVF_STANDALONE_BASE, false);
     }
 
     // ---- Pass 2: assign + quantize + seal in per-list batches. ----
@@ -202,7 +203,7 @@ pub unsafe extern "C-unwind" fn ambuild(
     }
 
     unsafe {
-        list_directory.store(&index_rel, false);
+        list_directory.store(&index_rel, IVF_STANDALONE_BASE, false);
         // Bulk smgr scans need the built entry blocks on disk first.
         pg_sys::FlushRelationBuffers(index_rel.as_ptr());
     }
@@ -318,6 +319,7 @@ fn write_empty_index(index: &PgRelation, options: &TSVIvfOptions, num_dimensions
     let mut meta = unsafe {
         IvfMetaPage::create(
             index,
+            IVF_STANDALONE_BASE,
             num_dimensions,
             DistanceType::L2,
             num_lists as u16,
@@ -329,7 +331,7 @@ fn write_empty_index(index: &PgRelation, options: &TSVIvfOptions, num_dimensions
 
     let mut list_directory = IvfListDirectory::new(num_lists as u16);
     unsafe {
-        list_directory.store(index, true);
+        list_directory.store(index, IVF_STANDALONE_BASE, true);
     }
 
     let centroid_page = IvfCentroidPage::new(Vec::new());
@@ -350,10 +352,10 @@ fn write_empty_index(index: &PgRelation, options: &TSVIvfOptions, num_dimensions
     }
 
     unsafe {
-        list_directory.store(index, false);
+        list_directory.store(index, IVF_STANDALONE_BASE, false);
         meta.set_list_directory_pointer(ItemPointer::new(1, 1));
         meta.set_centroids_pointer(centroid_ptr);
-        meta.store(index, false);
+        meta.store(index, IVF_STANDALONE_BASE, false);
     }
 }
 
@@ -494,6 +496,7 @@ pub fn build_ivf_index_serial(
     let mut meta_page = unsafe {
         crate::access_method::ivf::meta_page::IvfMetaPage::create(
             index,
+            IVF_STANDALONE_BASE,
             num_dimensions,
             distance_type,
             num_lists as u16,
@@ -506,7 +509,7 @@ pub fn build_ivf_index_serial(
     // Step 5: Write an empty list directory at block 1.
     let mut list_directory = IvfListDirectory::new(num_lists as u16);
     unsafe {
-        list_directory.store(index, true);
+        list_directory.store(index, IVF_STANDALONE_BASE, true);
     }
 
     // Step 6: Write the centroid page (a dynamic block after the directory) and
@@ -516,7 +519,7 @@ pub fn build_ivf_index_serial(
     unsafe {
         meta_page.set_list_directory_pointer(ItemPointer::new(1, 1));
         meta_page.set_centroids_pointer(centroid_ptr);
-        meta_page.store(index, false);
+        meta_page.store(index, IVF_STANDALONE_BASE, false);
     }
 
     // Step 7: Seal each list into one immutable segment and write its header
@@ -550,7 +553,7 @@ pub fn build_ivf_index_serial(
 
     // Step 8: Rewrite list directory in place at block 1 with the header pointers.
     unsafe {
-        list_directory.store(index, false);
+        list_directory.store(index, IVF_STANDALONE_BASE, false);
         // Bulk smgr scans need the built entry blocks on disk first.
         pg_sys::FlushRelationBuffers(index.as_ptr());
     }

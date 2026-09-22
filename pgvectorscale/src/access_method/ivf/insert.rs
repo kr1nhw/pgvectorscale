@@ -16,7 +16,7 @@ use crate::access_method::ivf::entry::{
 };
 use crate::util::page::ReadablePage;
 use crate::access_method::ivf::list_directory::IvfListDirectory;
-use crate::access_method::ivf::meta_page::IvfMetaPage;
+use crate::access_method::ivf::meta_page::{IvfMetaPage, IVF_STANDALONE_BASE};
 use crate::access_method::ivf::options::IVF_SEAL_THRESHOLD;
 use crate::access_method::ivf::segment::{IvfFreeRange, IvfListHeader, IvfSegmentList};
 use crate::access_method::ivf::simd::find_nearest_centroids;
@@ -45,12 +45,12 @@ pub unsafe extern "C-unwind" fn aminsert(
     }
 
     let index_rel = unsafe { PgRelation::from_pg(index) };
-    let meta = IvfMetaPage::fetch(&index_rel);
+    let meta = IvfMetaPage::fetch(&index_rel, IVF_STANDALONE_BASE);
     let mut centroid_page = match meta.get_centroids_pointer() {
         Some(p) => IvfCentroidPage::load(&index_rel, p),
         None => IvfCentroidPage::new(Vec::new()),
     };
-    let list_directory = IvfListDirectory::load(&index_rel);
+    let list_directory = IvfListDirectory::load(&index_rel, IVF_STANDALONE_BASE);
 
     // Extract the vector.
     let datum = *values;

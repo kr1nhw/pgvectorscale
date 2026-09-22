@@ -77,8 +77,8 @@ impl IvfListDirectory {
         self.lists.get_mut(list_id as usize)
     }
 
-    /// Store the list directory to the index.
-    pub unsafe fn store(&self, index: &PgRelation, first_time: bool) {
+    /// Store the list directory at the AM's fixed slot (`base + 1`).
+    pub unsafe fn store(&self, index: &PgRelation, base: pg_sys::BlockNumber, first_time: bool) {
         let mut stats = crate::access_method::stats::WriteStats::default();
         let mut tape = if first_time {
             ChainTapeWriter::new(index, PageType::IvfListDirectory, &mut stats)
@@ -87,7 +87,7 @@ impl IvfListDirectory {
                 index,
                 PageType::IvfListDirectory,
                 &mut stats,
-                LIST_DIRECTORY_BLOCK_NUMBER,
+                base + 1,
             )
         };
 
@@ -95,21 +95,32 @@ impl IvfListDirectory {
         let off = tape.write(&bytes);
         assert_eq!(
             off,
-            ItemPointer::new(LIST_DIRECTORY_BLOCK_NUMBER, LIST_DIRECTORY_OFFSET)
+            ItemPointer::new(base + 1, LIST_DIRECTORY_OFFSET)
         );
     }
 
-    /// Load the list directory from the index.
-    pub fn load(index: &PgRelation) -> IvfListDirectory {
+    /// Store the list directory anywhere (embedded segments), returning its
+    /// pointer and block count.
+    pub unsafe fn store_new(&self, index: &PgRelation) -> (crate::util::ItemPointer, u32) {
+        let _ext_lock = crate::util::buffer::LockRelationForExtension::new(index);
+        let mut stats = crate::access_method::stats::WriteStats::default();
+        let mut tape = ChainTapeWriter::new(index, PageType::IvfListDirectory, &mut stats);
+        tape.write_counted(&self.serialize_to_vec())
+    }
+
+    /// Load the list directory from the AM's fixed slot (`base + 1`).
+    pub fn load(index: &PgRelation, base: pg_sys::BlockNumber) -> IvfListDirectory {
+        Self::load_at(index, crate::util::ItemPointer::new(base + 1, LIST_DIRECTORY_OFFSET))
+    }
+
+    /// Load a list directory from an arbitrary pointer (embedded segments).
+    pub fn load_at(index: &PgRelation, pointer: crate::util::ItemPointer) -> IvfListDirectory {
         unsafe {
             let mut stats = crate::access_method::stats::WriteStats::default();
             let mut tape = ChainItemReader::new(index, PageType::IvfListDirectory, &mut stats);
 
             let mut buf: Vec<u8> = Vec::new();
-            for item in tape.read(ItemPointer::new(
-                LIST_DIRECTORY_BLOCK_NUMBER,
-                LIST_DIRECTORY_OFFSET,
-            )) {
+            for item in tape.read(pointer) {
                 buf.extend_from_slice(item.get_data_slice());
             }
             rkyv::from_bytes::<IvfListDirectory>(&buf)

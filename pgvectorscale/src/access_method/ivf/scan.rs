@@ -15,7 +15,7 @@ use crate::access_method::distance::DistanceType;
 use crate::access_method::ivf::centroid_page::IvfCentroidPage;
 use crate::access_method::ivf::entry::IvfEntryReader;
 use crate::access_method::ivf::list_directory::IvfListDirectory;
-use crate::access_method::ivf::meta_page::IvfMetaPage;
+use crate::access_method::ivf::meta_page::{IvfMetaPage, IVF_STANDALONE_BASE};
 use crate::access_method::ivf::options::{IVF_PROBES, IVF_TOP_K};
 use crate::access_method::ivf::segment::{IvfListHeader, IvfSegmentList};
 use crate::access_method::ivf::simd::find_nearest_centroids;
@@ -131,7 +131,7 @@ pub unsafe extern "C-unwind" fn amrescan(
     scan_state.results_computed = false;
 
     let index_rel = unsafe { PgRelation::from_pg((*scan).indexRelation) };
-    let meta = IvfMetaPage::fetch(&index_rel);
+    let meta = IvfMetaPage::fetch(&index_rel, IVF_STANDALONE_BASE);
     let distance_type = meta.get_distance_type();
 
     // Extract query vector from orderbys (first orderby is the query vector).
@@ -164,13 +164,13 @@ pub unsafe extern "C-unwind" fn amgettuple(
         // executor's relation locks on the index.
         let (k1, k2) = crate::access_method::ivf::meta_page::advisory_keys(&index_rel);
         let _read_guard = AdvisoryLockGuard::acquire_shared(k1, k2);
-        let meta = IvfMetaPage::fetch(&index_rel);
+        let meta = IvfMetaPage::fetch(&index_rel, IVF_STANDALONE_BASE);
         let distance_type = meta.get_distance_type();
         let centroid_page = match meta.get_centroids_pointer() {
             Some(p) => IvfCentroidPage::load(&index_rel, p),
             None => IvfCentroidPage::new(Vec::new()),
         };
-        let list_directory = IvfListDirectory::load(&index_rel);
+        let list_directory = IvfListDirectory::load(&index_rel, IVF_STANDALONE_BASE);
 
         // Step 1: find nearest centroids (which lists to probe)
         let nearest = find_nearest_centroids(

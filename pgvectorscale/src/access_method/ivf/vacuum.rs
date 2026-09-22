@@ -5,7 +5,7 @@ use pgrx::*;
 use crate::access_method::ivf::centroid_page::IvfCentroidPage;
 use crate::access_method::ivf::entry::{seal_entries, IvfEntryReader};
 use crate::access_method::ivf::list_directory::IvfListDirectory;
-use crate::access_method::ivf::meta_page::IvfMetaPage;
+use crate::access_method::ivf::meta_page::{IvfMetaPage, IVF_STANDALONE_BASE};
 use crate::access_method::ivf::segment::{IvfFreeRange, IvfListHeader, IvfSegmentList};
 
 /// Bulk delete tuples from the IVF index.
@@ -29,12 +29,12 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     };
 
     let index_rel = unsafe { PgRelation::from_pg((*info).index) };
-    let meta = IvfMetaPage::fetch(&index_rel);
+    let meta = IvfMetaPage::fetch(&index_rel, IVF_STANDALONE_BASE);
     let _centroid_page = match meta.get_centroids_pointer() {
         Some(p) => IvfCentroidPage::load(&index_rel, p),
         None => IvfCentroidPage::new(Vec::new()),
     };
-    let mut list_directory = IvfListDirectory::load(&index_rel);
+    let mut list_directory = IvfListDirectory::load(&index_rel, IVF_STANDALONE_BASE);
 
     let reader = IvfEntryReader::new(&index_rel);
     let mut total_live = 0u64;
@@ -212,7 +212,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     }
 
     unsafe {
-        list_directory.store(&index_rel, false);
+        list_directory.store(&index_rel, IVF_STANDALONE_BASE, false);
         // `total_dead` counts index *tuples*, not pages: report it through
         // tuples_removed (f64, no truncation).  This AM never physically
         // truncates pages in bulkdelete — old segments are retired for reuse

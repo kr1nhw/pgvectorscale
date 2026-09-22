@@ -29,7 +29,10 @@ pub fn advisory_keys(index: &PgRelation) -> (i64, i64) {
 const IVF_MAGIC_NUMBER: u32 = 0x49564600; // "IVF\0"
 const IVF_VERSION: u32 = 2;
 
-const META_BLOCK_NUMBER: pg_sys::BlockNumber = 0;
+/// Base block of the standalone `ivf` access method's page region (metapage
+/// at 0, list directory at 1).
+pub const IVF_STANDALONE_BASE: pg_sys::BlockNumber = 0;
+
 const META_OFFSET: pgrx::pg_sys::OffsetNumber = 1;
 
 /// IVF metadata about the entire index.
@@ -163,9 +166,13 @@ impl IvfMetaPage {
         self.free_list_blocks
     }
 
-    /// Create a new IVF meta page and write it to block 0 of the index.
+    /// Create a new IVF meta page and write it to `base` of the index (0 for
+    /// the standalone AM; the segment base for an embedded AgentVec region).
+    /// The caller must hold the relation extension lock; `base` must be the
+    /// relation's current block count.
     pub unsafe fn create(
         index: &PgRelation,
+        base: pg_sys::BlockNumber,
         num_dimensions: u32,
         distance_type: DistanceType,
         lists: u16,
@@ -193,26 +200,32 @@ impl IvfMetaPage {
             generation: 0,
         };
 
-        meta.store(index, true);
+        meta.store(index, base, true);
         meta
     }
 
     /// Write the meta page to the index.  `first_time` writes a fresh page at
-    /// block 0; otherwise the existing page is rewritten in place.
-    pub unsafe fn store(&self, index: &PgRelation, first_time: bool) {
+    /// `base` (the relation must end exactly there); otherwise the existing
+    /// page at `base` is rewritten in place.
+    pub unsafe fn store(&self, index: &PgRelation, base: pg_sys::BlockNumber, first_time: bool) {
         assert_eq!(self.magic_number, IVF_MAGIC_NUMBER);
         assert_eq!(self.version, IVF_VERSION);
 
         let bytes = self.serialize_to_vec();
         if first_time {
+            assert_eq!(
+                pg_sys::RelationGetNumberOfBlocksInFork(index.as_ptr(), pg_sys::ForkNumber::MAIN_FORKNUM),
+                base,
+                "ivf: meta base does not match the relation end"
+            );
             let mut page = WritablePage::new(index, PageType::IvfMeta);
             let block = page.get_block_number();
             let off = page.add_item(&bytes);
             page.commit();
-            assert_eq!(block, META_BLOCK_NUMBER, "meta page must be block 0");
+            assert_eq!(block, base, "meta page must land at its base block");
             assert_eq!(off, META_OFFSET);
         } else {
-            let mut page = WritablePage::modify(index, META_BLOCK_NUMBER);
+            let mut page = WritablePage::modify(index, base);
             page.reinit(PageType::IvfMeta);
             page.add_item(&bytes);
             page.commit();
@@ -220,9 +233,9 @@ impl IvfMetaPage {
     }
 
     /// Read the meta page from the index.
-    pub fn fetch(index: &PgRelation) -> IvfMetaPage {
+    pub fn fetch(index: &PgRelation, base: pg_sys::BlockNumber) -> IvfMetaPage {
         unsafe {
-            let page = ReadablePage::read(index, META_BLOCK_NUMBER);
+            let page = ReadablePage::read(index, base);
             assert!(page.get_type() == PageType::IvfMeta);
             let item = page.get_item_unchecked(META_OFFSET);
             let result = rkyv::from_bytes::<IvfMetaPage>(item.get_data_slice())
@@ -240,8 +253,12 @@ impl IvfMetaPage {
     /// closure receives the current meta (parsed under the lock) and may do
     /// arbitrary work (e.g. appending to the retired list); the page is
     /// rewritten in place (WAL-logged) after the closure returns.
-    pub unsafe fn update<R, F: FnOnce(&mut IvfMetaPage) -> R>(index: &PgRelation, f: F) -> R {
-        let buffer = LockedBufferExclusive::read(index, META_BLOCK_NUMBER);
+    pub unsafe fn update<R, F: FnOnce(&mut IvfMetaPage) -> R>(
+        index: &PgRelation,
+        base: pg_sys::BlockNumber,
+        f: F,
+    ) -> R {
+        let buffer = LockedBufferExclusive::read(index, base);
         let page = pg_sys::BufferGetPage(**&buffer);
         let item_id = crate::util::ports::PageGetItemId(page, META_OFFSET);
         let item = crate::util::ports::PageGetItem(page, item_id);
@@ -313,7 +330,9 @@ impl IvfMetaPage {
         }
         let (k1, k2) = advisory_keys(index);
         let _guard = AdvisoryLockGuard::acquire_exclusive(k1, k2);
-        Self::update(index, |meta| {
+        // TODO(phase 10): reclamation must take the segment base and a
+        // per-segment advisory-lock discriminator; the AM path stays at 0.
+        Self::update(index, IVF_STANDALONE_BASE, |meta| {
             let mut list = match meta.get_free_list_pointer() {
                 Some(p) => IvfFreeList::load(index, p),
                 None => IvfFreeList::new(),
@@ -338,12 +357,17 @@ impl IvfMetaPage {
         // Fast path: no free list yet → fall back to extension without taking
         // the ExclusiveLock (which would otherwise stall behind every
         // concurrent inserter's RowExclusiveLock on the index relation).
-        if Self::fetch(index).get_free_list_pointer().is_none() {
+        if Self::fetch(index, IVF_STANDALONE_BASE)
+            .get_free_list_pointer()
+            .is_none()
+        {
             return None;
         }
         let (k1, k2) = advisory_keys(index);
         let _guard = AdvisoryLockGuard::acquire_exclusive(k1, k2);
-        Self::update(index, |meta| {
+        // TODO(phase 10): reclamation must take the segment base and a
+        // per-segment advisory-lock discriminator; the AM path stays at 0.
+        Self::update(index, IVF_STANDALONE_BASE, |meta| {
             let mut list = match meta.get_free_list_pointer() {
                 Some(p) => IvfFreeList::load(index, p),
                 None => IvfFreeList::new(),
@@ -376,7 +400,9 @@ impl IvfMetaPage {
         }
         let (k1, k2) = advisory_keys(index);
         let _guard = AdvisoryLockGuard::acquire_exclusive(k1, k2);
-        Self::update(index, |meta| {
+        // TODO(phase 10): reclamation must take the segment base and a
+        // per-segment advisory-lock discriminator; the AM path stays at 0.
+        Self::update(index, IVF_STANDALONE_BASE, |meta| {
             let mut list = match meta.get_free_list_pointer() {
                 Some(p) => IvfFreeList::load(index, p),
                 None => IvfFreeList::new(),
