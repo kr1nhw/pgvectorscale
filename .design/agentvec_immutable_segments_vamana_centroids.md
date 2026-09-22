@@ -119,3 +119,27 @@ nothing ever fetches a heap tuple through it.
   is a constant (exit condition = signal flags), worker SPI must run inside
   `BackgroundWorker::transaction`, and the worker must connect explicitly
   (`connect_worker_to_spi(Some(dbname))`) on PG18.
+
+## 7. CREATE INDEX bulk build (benchmark follow-up)
+
+`ambuild` now bulk-builds the initial HOT segment with the hnswsq
+streaming two-pass builder (`hnswsq::build::build_region`, base- and
+option-parameterized) instead of streaming rows through the incremental
+insert path.  Measured on the 1M BIGANN table: build 69 s vs 65 s for
+standalone hnswsq (the incremental path cost 1113 s — 17x); query latency
+within 2%, recall within 0.5 pt, size identical.  A heap larger than
+`hot_segment_max_rows` is sealed immediately (QueuedForMigration) and the
+first later insert opens the successor HOT segment; segmentation
+afterwards stays insert-driven.
+
+Bugs the benchmark exposed and fixed:
+
+* ~100 KB/row OOM leak in the shared hnswsq insert path
+  (`ElementArena::reset` chunk dealloc + the missing per-insert memory
+  context around the agentvec HOT insert).
+* "index returned tuples in wrong order" with FastScan estimates as
+  orderby hints → bounded scans exact-rerank at emission (top-k by
+  estimate, heap fetch, exact distance); unbounded scans keep -infinity
+  hints (phase 8 bounds them).
+* PG18 `ExecDropSingleTupleTableSlot` left the heap-fetch buffer pin
+  registered → explicit `ExecClearTuple` first.
