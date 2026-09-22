@@ -102,3 +102,20 @@ nothing ever fetches a heap tuple through it.
   converted segments (phase 3).
 * router: no decision without a region; decided sets contain only owned WARM ids and
   are capped by `router_top_m`; routed recall with more WARM segments than `router_top_m`.
+
+## 6. Maintenance worker (phase 4)
+
+* One dynamic background worker per database containing `agentvec` indexes,
+  launched on demand from `ambuild` (pg_stat_activity-guarded), connected via
+  `bgw_extra`, looping pass -> sleep(min maintenance_interval).  Registered
+  without restart; a crash is recovered by the next `ambuild`.
+* Per-index schedule gate: `AgentVecMetaPage.last_maintenance_at` (meta format
+  v2), initialized at CREATE INDEX; `agentvec_maybe_maintain(regclass)`
+  converts only once the index's `maintenance_interval` elapsed, then marks the
+  pass.  `agentvec_run_maintenance(regclass[, budget])` forces a bounded batch
+  (tests, ops, Neon fallback).
+* GUC `agentvec.maintenance_worker` (default on) — off in the pg_test suite.
+* Known pgrx 0.16 quirks worked around: `BackgroundWorker::worker_continue()`
+  is a constant (exit condition = signal flags), worker SPI must run inside
+  `BackgroundWorker::transaction`, and the worker must connect explicitly
+  (`connect_worker_to_spi(Some(dbname))`) on PG18.
