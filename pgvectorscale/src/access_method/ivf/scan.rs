@@ -94,6 +94,153 @@ fn extract_query_vector(datum: pg_sys::Datum, distance_type: DistanceType) -> Ve
     }
 }
 
+/// Visit every estimated candidate of one IVF payload — the standalone AM's
+/// whole index, or an embedded AgentVec WARM/COLD segment at `meta`'s base:
+/// the zero-copy FastScan over the probed lists' published segments plus the
+/// unsealed active buffers, handing each (estimate, heap tid) to `push`.
+/// `push` owns the bound (the AM's top-k heap; AgentVec's merged scan heap).
+#[allow(clippy::too_many_arguments)]
+/// Visit every estimated candidate of one IVF payload — the standalone AM's
+/// whole index, or an embedded AgentVec WARM/COLD segment at `meta`'s base:
+/// the zero-copy FastScan over the probed lists' published segments plus the
+/// unsealed active buffers, handing each (estimate, heap tid) to `push`.
+/// `push` owns the bound (the AM's top-k heap; AgentVec's merged scan heap).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn for_each_candidate(
+    index: &PgRelation,
+    meta: &IvfMetaPage,
+    centroid_page: &IvfCentroidPage,
+    list_directory: &IvfListDirectory,
+    query: &[f32],
+    nearest: &[usize],
+    mut push: impl FnMut(f32, ItemPointer),
+) {
+    let num_bits = meta.get_bq_num_bits_per_dimension();
+    let rotation_seed = meta.get_rotation_seed();
+    let quantizer =
+        RabitqQuantizer::new(num_bits, rotation_seed, meta.get_num_dimensions() as usize);
+    let reader = IvfEntryReader::new(index);
+    for &list_id in nearest {
+        if let Some(list_meta) = list_directory.get_list(list_id as u16) {
+            if !list_meta.header.is_valid() {
+                continue;
+            }
+            let header = IvfListHeader::load(index, list_meta.header);
+            let segment_list = IvfSegmentList::load(index, header.segment_list);
+            // A list with no published segments can still have entries in
+            // its (unsealed) active buffer, so only skip when both empty.
+            if segment_list.segments.is_empty() && header.active.is_none() {
+                continue;
+            }
+            let centroid = &centroid_page.centroids[list_id as usize];
+            let rq = quantizer.rotate_query_residual(centroid, query);
+            let fastscan = RabitqFastScan::new(&rq, num_bits, quantizer.dim());
+            for segment in &segment_list.segments {
+                if segment.start_page == pg_sys::InvalidBlockNumber || segment.num_blocks == 0 {
+                    continue;
+                }
+                reader.for_each_slice(segment.start_page, segment.num_blocks, |view| {
+                    if num_bits == 1 {
+                        // 1-bit: SIMD FastScan sum + fused SIMD estimate over
+                        // 32-row transposed batches.
+                        let mut sums = [0u16; 32];
+                        let mut dists = [0f32; 32];
+                        for batch in 0..view.num_batches() {
+                            fastscan.sum_batch(view.code_batch(batch), &mut sums);
+                            let base = batch * 32;
+                            let count = (view.len() - base).min(32);
+                            // The packed f32 regions are not guaranteed
+                            // 4-byte aligned, so copy them into aligned
+                            // stack buffers (byte-exact, no reordering).
+                            let mut scales = [0f32; 32];
+                            let mut sx2s = [0f32; 32];
+                            let mut mfs = [0f32; 32];
+                            view.copy_scales(base, &mut scales[..count]);
+                            view.copy_sums(base, &mut sx2s[..count]);
+                            view.copy_margin_factors(base, &mut mfs[..count]);
+                            fastscan.estimate_batch(
+                                &sums[..count],
+                                &scales[..count],
+                                &sx2s[..count],
+                                &mfs[..count],
+                                &mut dists[..count],
+                                count,
+                            );
+                            for r in 0..count {
+                                push(dists[r], view.tid(base + r));
+                            }
+                        }
+                    } else if num_bits == 2 {
+                        // 2-bit: SIMD FastScan over both bit-planes
+                        // (sign + ex), fused into one SIMD estimate per
+                        // 32-row transposed batch.
+                        let mut sums0 = [0u16; 32];
+                        let mut sums1 = [0u16; 32];
+                        let mut dists = [0f32; 32];
+                        for batch in 0..view.num_batches() {
+                            fastscan.sum_batch(view.code_batch_plane0(batch), &mut sums0);
+                            fastscan.sum_batch(view.code_batch_plane1(batch), &mut sums1);
+                            let base = batch * 32;
+                            let count = (view.len() - base).min(32);
+                            // See the 1-bit branch: the packed f32 regions
+                            // are not alignment-safe to alias, so copy.
+                            let mut scales = [0f32; 32];
+                            let mut sx2s = [0f32; 32];
+                            let mut mfs = [0f32; 32];
+                            view.copy_scales(base, &mut scales[..count]);
+                            view.copy_sums(base, &mut sx2s[..count]);
+                            view.copy_margin_factors(base, &mut mfs[..count]);
+                            fastscan.estimate_batch_2bit(
+                                &sums0[..count],
+                                &sums1[..count],
+                                &scales[..count],
+                                &sx2s[..count],
+                                &mfs[..count],
+                                &mut dists[..count],
+                                count,
+                            );
+                            for r in 0..count {
+                                push(dists[r], view.tid(base + r));
+                            }
+                        }
+                    } else {
+                        // 4/8-bit: SIMD ex-dot per entry (row-major).
+                        for i in 0..view.len() {
+                            let full_dot = fastscan.full_dot_multi(view.code(i));
+                            let d = fastscan.estimate_from_full_dot(
+                                full_dot,
+                                view.sum_of_x2(i),
+                                view.scale(i),
+                                view.margin_factor(i),
+                            );
+                            push(d, view.tid(i));
+                        }
+                    }
+                });
+            }
+            // Open (append) buffer: entries not yet sealed into a published
+            // segment are still visible — read them through the buffer
+            // manager (append-only pages, one row-major item per entry) with
+            // the scalar estimator.  This is the slow path; sealed segments
+            // use the SIMD FastScan path above.
+            if let Some(active) = header.active.as_ref() {
+                let entries = crate::access_method::ivf::entry::read_active_entries(index, active);
+                for e in &entries {
+                    let d = quantizer.estimate_l2_fields(
+                        e.code.num_bits,
+                        e.code.dim,
+                        &e.code.packed_code,
+                        e.code.sum_of_x2,
+                        e.code.l1_of_rotated,
+                        &rq,
+                    );
+                    push(d, e.heap_tid);
+                }
+            }
+        }
+    }
+}
+
 /// Begin a scan of the IVF index.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambeginscan(
@@ -180,167 +327,29 @@ pub unsafe extern "C-unwind" fn amgettuple(
             scan_state.probes,
         );
 
-        // Step 2: scan each probed list, estimating distances with RaBitQ.
-        // Iterate zero-copy over archived entries and keep only the top-K
-        // candidates (by estimate) in a bounded max-heap.
-        let num_bits = meta.get_bq_num_bits_per_dimension();
-        let rotation_seed = meta.get_rotation_seed();
-        let quantizer = RabitqQuantizer::new(num_bits, rotation_seed, meta.get_num_dimensions() as usize);
-        let reader = IvfEntryReader::new(&index_rel);
+        // Step 2: visit every estimated candidate of the probed lists; the AM
+        // keeps the top-K by estimate in a bounded heap (AgentVec's embedded
+        // scan passes its own merged bound instead).
         let top_k = (IVF_TOP_K.get() as usize).max(1);
         let mut heap: BinaryHeap<DistTid> = BinaryHeap::with_capacity(top_k.min(1024));
-        for list_id in nearest {
-            if let Some(list_meta) = list_directory.get_list(list_id as u16) {
-                if !list_meta.header.is_valid() {
-                    continue;
-                }
-                let header = IvfListHeader::load(&index_rel, list_meta.header);
-                let segment_list = IvfSegmentList::load(&index_rel, header.segment_list);
-                // A list with no published segments can still have entries in
-                // its (unsealed) active buffer, so only skip when both empty.
-                if segment_list.segments.is_empty() && header.active.is_none() {
-                    continue;
-                }
-                let centroid = &centroid_page.centroids[list_id as usize];
-                let rq = quantizer.rotate_query_residual(centroid, &scan_state.query);
-                let fastscan = RabitqFastScan::new(&rq, num_bits, quantizer.dim());
-                for segment in &segment_list.segments {
-                    if segment.start_page == pg_sys::InvalidBlockNumber || segment.num_blocks == 0 {
-                        continue;
-                    }                    reader.for_each_slice(segment.start_page, segment.num_blocks, |view| {
-                        if num_bits == 1 {
-                            // 1-bit: SIMD FastScan sum + fused SIMD estimate over
-                            // 32-row transposed batches.
-                            let mut sums = [0u16; 32];
-                            let mut dists = [0f32; 32];
-                            for batch in 0..view.num_batches() {
-                                fastscan.sum_batch(view.code_batch(batch), &mut sums);
-                                let base = batch * 32;
-                                let count = (view.len() - base).min(32);
-                                // The packed f32 regions are not guaranteed
-                                // 4-byte aligned, so copy them into aligned
-                                // stack buffers (byte-exact, no reordering).
-                                let mut scales = [0f32; 32];
-                                let mut sx2s = [0f32; 32];
-                                let mut mfs = [0f32; 32];
-                                view.copy_scales(base, &mut scales[..count]);
-                                view.copy_sums(base, &mut sx2s[..count]);
-                                view.copy_margin_factors(base, &mut mfs[..count]);
-                                fastscan.estimate_batch(
-                                    &sums[..count],
-                                    &scales[..count],
-                                    &sx2s[..count],
-                                    &mfs[..count],
-                                    &mut dists[..count],
-                                    count,
-                                );
-                                for r in 0..count {
-                                    let candidate =
-                                        DistTid { dist: dists[r], tid: view.tid(base + r) };
-                                    if heap.len() < top_k {
-                                        heap.push(candidate);
-                                    } else if let Some(mut worst) = heap.peek_mut() {
-                                        if candidate.dist < worst.dist {
-                                            *worst = candidate;
-                                        }
-                                    }
-                                }
-                            }
-                        } else if num_bits == 2 {
-                            // 2-bit: SIMD FastScan over both bit-planes
-                            // (sign + ex), fused into one SIMD estimate per
-                            // 32-row transposed batch.
-                            let mut sums0 = [0u16; 32];
-                            let mut sums1 = [0u16; 32];
-                            let mut dists = [0f32; 32];
-                            for batch in 0..view.num_batches() {
-                                fastscan.sum_batch(view.code_batch_plane0(batch), &mut sums0);
-                                fastscan.sum_batch(view.code_batch_plane1(batch), &mut sums1);
-                                let base = batch * 32;
-                                let count = (view.len() - base).min(32);
-                                // See the 1-bit branch: the packed f32 regions
-                                // are not alignment-safe to alias, so copy.
-                                let mut scales = [0f32; 32];
-                                let mut sx2s = [0f32; 32];
-                                let mut mfs = [0f32; 32];
-                                view.copy_scales(base, &mut scales[..count]);
-                                view.copy_sums(base, &mut sx2s[..count]);
-                                view.copy_margin_factors(base, &mut mfs[..count]);
-                                fastscan.estimate_batch_2bit(
-                                    &sums0[..count],
-                                    &sums1[..count],
-                                    &scales[..count],
-                                    &sx2s[..count],
-                                    &mfs[..count],
-                                    &mut dists[..count],
-                                    count,
-                                );
-                                for r in 0..count {
-                                    let candidate =
-                                        DistTid { dist: dists[r], tid: view.tid(base + r) };
-                                    if heap.len() < top_k {
-                                        heap.push(candidate);
-                                    } else if let Some(mut worst) = heap.peek_mut() {
-                                        if candidate.dist < worst.dist {
-                                            *worst = candidate;
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            // 4/8-bit: SIMD ex-dot per entry (row-major).
-                            for i in 0..view.len() {
-                                let full_dot = fastscan.full_dot_multi(view.code(i));
-                                let d = fastscan.estimate_from_full_dot(
-                                    full_dot,
-                                    view.sum_of_x2(i),
-                                    view.scale(i),
-                                    view.margin_factor(i),
-                                );
-                                let candidate = DistTid { dist: d, tid: view.tid(i) };
-                                if heap.len() < top_k {
-                                    heap.push(candidate);
-                                } else if let Some(mut worst) = heap.peek_mut() {
-                                    if candidate.dist < worst.dist {
-                                        *worst = candidate;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-                // Open (append) buffer: entries not yet sealed into a
-                // published segment are still visible — read them through the
-                // buffer manager (append-only pages, one row-major item per
-                // entry) with the scalar estimator.  This is the slow path;
-                // sealed segments use the SIMD FastScan path above.
-                if let Some(active) = header.active.as_ref() {
-                    let entries =
-                        crate::access_method::ivf::entry::read_active_entries(&index_rel, active);
-                    for e in &entries {
-                        let d = quantizer.estimate_l2_fields(
-                            e.code.num_bits,
-                            e.code.dim,
-                            &e.code.packed_code,
-                            e.code.sum_of_x2,
-                            e.code.l1_of_rotated,
-                            &rq,
-                        );
-                        let candidate = DistTid {
-                            dist: d,
-                            tid: e.heap_tid,
-                        };
-                        if heap.len() < top_k {
-                            heap.push(candidate);
-                        } else if let Some(mut worst) = heap.peek_mut() {
-                            if candidate.dist < worst.dist {
-                                *worst = candidate;
-                            }
-                        }
+        for_each_candidate(
+            &index_rel,
+            &meta,
+            &centroid_page,
+            &list_directory,
+            &scan_state.query,
+            &nearest,
+            |dist, tid| {
+                let candidate = DistTid { dist, tid };
+                if heap.len() < top_k {
+                    heap.push(candidate);
+                } else if let Some(mut worst) = heap.peek_mut() {
+                    if candidate.dist < worst.dist {
+                        *worst = candidate;
                     }
                 }
-            }
-        }
+            },
+        );
 
         // Step 3: emit the top-K candidates in ascending estimate order.  The
         // executor rechecks exact distances (xs_recheckorderby), so `top_k`

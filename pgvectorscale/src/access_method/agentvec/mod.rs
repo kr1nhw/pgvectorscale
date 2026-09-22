@@ -29,6 +29,7 @@
 //! committed writes immediately searchable.
 
 pub mod build;
+pub mod consolidate;
 pub mod directory;
 pub mod flat;
 pub mod insert;

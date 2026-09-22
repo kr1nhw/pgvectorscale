@@ -18,6 +18,8 @@ mod tests {
         AgentVecDirectory, AgentVecSegmentHeader, SegmentState,
     };
     use crate::access_method::agentvec::meta_page::AgentVecMetaPage;
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
 
     /// Open an index relation by name.
     fn index_relation(name: &str) -> PgRelation {
@@ -271,6 +273,212 @@ mod tests {
     /// test above drives.
     #[pg_test]
     fn agentvec_vacuum_mock_fn() -> spi::Result<()> {
+        Ok(())
+    }
+
+    /// Deterministic clustered rows + one query per cluster center.
+    fn gen_clustered(
+        n_clusters: usize,
+        per_cluster: usize,
+        dim: usize,
+        noise: f32,
+        seed: u64,
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let centers: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+        let mut rows = Vec::with_capacity(n_clusters * per_cluster);
+        for c in &centers {
+            for _ in 0..per_cluster {
+                rows.push(
+                    c.iter()
+                        .map(|x| x + (rng.gen::<f32>() - 0.5) * noise)
+                        .collect(),
+                );
+            }
+        }
+        let queries: Vec<Vec<f32>> = centers
+            .iter()
+            .map(|c| {
+                c.iter()
+                    .map(|x| x + (rng.gen::<f32>() - 0.5) * noise * 0.2)
+                    .collect()
+            })
+            .collect();
+        (rows, queries)
+    }
+
+    fn vec_literal(v: &[f32]) -> String {
+        let inner = v
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{inner}]")
+    }
+
+    /// Exact top-k ids for a query against an in-memory row set (the ground
+    /// truth the approximate segments are measured against).
+    fn exact_topk(rows: &[Vec<f32>], q: &[f32], k: usize) -> Vec<usize> {
+        let mut scored: Vec<(f32, usize)> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let d: f32 = v.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum();
+                (d, i)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        scored.into_iter().take(k).map(|(_, i)| i + 1).collect()
+    }
+
+    /// Whole-segment conversion: the oldest sealed HOT segment becomes one
+    /// immutable IVF-RaBitQ segment, the source is retired, no row is lost,
+    /// and searches span HOT + WARM in one query with exact results (the
+    /// executor recheck restores ordering of the returned candidates).
+    #[pg_test]
+    fn test_agentvec_consolidate_lifecycle_and_row_identity() -> spi::Result<()> {
+        Spi::run(
+            "CREATE TABLE t_av_conv(id int, v vector(8));
+             INSERT INTO t_av_conv
+                SELECT g, ('[' || g || ',0,0,0,0,0,0,0]')::vector FROM generate_series(1, 30) AS g;
+             CREATE INDEX idx_av_conv ON t_av_conv USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_max_rows = 10);",
+        )?;
+        force_index_scan();
+
+        let converted = Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_conv')")?
+            .expect("converted");
+        assert_eq!(converted, 10, "the oldest sealed segment holds 10 rows");
+
+        let warm = Spi::get_one::<i64>(
+            "SELECT count(*) FROM agentvec_index_info('idx_av_conv') WHERE algorithm = 'ivf_rabitq'",
+        )?
+        .expect("warm count");
+        let retired = Spi::get_one::<i64>(
+            "SELECT count(*) FROM agentvec_index_info('idx_av_conv') WHERE state = 'retired'",
+        )?
+        .expect("retired count");
+        let total = Spi::get_one::<i64>(
+            "SELECT sum(num_entries)::bigint FROM agentvec_index_info('idx_av_conv')",
+        )?
+        .expect("total count");
+        // 1 warm segment, 1 retired segment. `num_entries` counts physical
+        // rows: the retired HOT segment keeps its 10 entries until phase-10
+        // reclamation, so the index holds 30 HOT + 10 WARM copies. Retired
+        // segments are not searched, so no duplicate TIDs reach the scan.
+        assert_eq!((warm, retired, total), (1, 1, 40), "1 warm, 1 retired, no row lost");
+
+        // The converted segment is immutable and searchable.
+        assert_eq!(
+            search_ids("t_av_conv", "v", "<->", "[0,0,0,0,0,0,0,0]", 3),
+            vec![1, 2, 3],
+            "HOT + WARM in one query, exact order"
+        );
+        Ok(())
+    }
+
+    /// Recall of the converted IVF-RaBitQ segments against exact ground truth.
+    #[pg_test]
+    fn test_agentvec_consolidate_recall_vs_exact() -> spi::Result<()> {
+        let (rows, queries) = gen_clustered(4, 60, 16, 0.6, 424242);
+        let values = rows
+            .iter()
+            .map(|v| format!("('{}')", vec_literal(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        Spi::run(&format!(
+            "CREATE TABLE t_av_recall(id serial primary key, v vector(16));
+             INSERT INTO t_av_recall(v) VALUES {values};
+             CREATE INDEX idx_av_recall ON t_av_recall USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_max_rows = 60, ivf_lists = 8, ivf_probes = 8);"
+        ))?;
+        force_index_scan();
+
+        // 240 rows at 60/segment: three sealed HOT segments.
+        for _ in 0..3 {
+            let n = Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_recall')")?
+                .expect("converted");
+            assert_eq!(n, 60);
+        }
+
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for q in &queries {
+            let exact = exact_topk(&rows, q, 10);
+            let got = search_ids("t_av_recall", "v", "<->", &vec_literal(q), 10);
+            total += 10;
+            hits += got.iter().filter(|id| exact.contains(&(**id as usize))).count();
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(
+            recall >= 0.9,
+            "recall@10 of the converted segments must be >= 0.9, got {recall}"
+        );
+        Ok(())
+    }
+
+    /// With nothing sealed, the conversion is a no-op.
+    #[pg_test]
+    fn test_agentvec_consolidate_noop() -> spi::Result<()> {
+        Spi::run(
+            "CREATE TABLE t_av_noop(id int, v vector(2));
+             INSERT INTO t_av_noop VALUES (1, '[1,0]'), (2, '[2,0]');
+             CREATE INDEX idx_av_noop ON t_av_noop USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_max_rows = 100);",
+        )?;
+        let converted =
+            Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_noop')")?.expect("n");
+        assert_eq!(converted, 0, "nothing sealed, nothing converted");
+        let warm: i64 = Spi::get_one::<i64>(
+            "SELECT count(*) FROM agentvec_index_info('idx_av_noop') WHERE algorithm = 'ivf_rabitq'",
+        )?
+        .expect("count");
+        assert_eq!(warm, 0);
+        Ok(())
+    }
+
+    /// A segment left `Retiring` by a crashed claim self-heals: the next
+    /// conversion call picks it up.
+    #[pg_test]
+    fn test_agentvec_consolidate_selfheals_retiring() -> spi::Result<()> {
+        Spi::run(
+            "CREATE TABLE t_av_heal(id int, v vector(8));
+             INSERT INTO t_av_heal
+                SELECT g, ('[' || g || ',0,0,0,0,0,0,0]')::vector FROM generate_series(1, 25) AS g;
+             CREATE INDEX idx_av_heal ON t_av_heal USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_max_rows = 10);",
+        )?;
+        // Flip the oldest sealed segment to Retiring directly (simulating a
+        // claim whose build never published).
+        let index = index_relation("idx_av_heal");
+        let meta = AgentVecMetaPage::fetch(&index);
+        let directory = meta.load_directory(&index);
+        let victim = directory
+            .segments
+            .iter()
+            .find(|s| s.state() == SegmentState::QueuedForMigration)
+            .expect("a sealed segment")
+            .segment_id;
+        unsafe {
+            AgentVecMetaPage::update(&index, |m| {
+                let mut d = m.load_directory(&index);
+                let seg = d.get_mut(victim).expect("victim");
+                seg.state = SegmentState::Retiring as u8;
+                let (ptr, blocks) = d.store(&index);
+                m.set_directory(ptr, blocks);
+            });
+        }
+
+        let converted =
+            Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_heal')")?.expect("n");
+        assert_eq!(converted, 10, "the Retiring segment is reclaimed and converted");
+        let warm: i64 = Spi::get_one::<i64>(
+            "SELECT count(*) FROM agentvec_index_info('idx_av_heal') WHERE algorithm = 'ivf_rabitq'",
+        )?
+        .expect("count");
+        assert_eq!(warm, 1);
         Ok(())
     }
 

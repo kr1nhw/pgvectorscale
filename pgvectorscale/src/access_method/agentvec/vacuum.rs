@@ -122,10 +122,14 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                 total_live += live;
                 pg_sys::pfree(res as *mut std::os::raw::c_void);
             }
-            SegmentAlgorithm::IvfRaBitQ => error!(
-                "agentvec: segment {} uses ivf_rabitq storage, which this phase cannot vacuum",
-                segment.segment_id
-            ),
+            SegmentAlgorithm::IvfRaBitQ => {
+                // Immutable payload: no per-entry tombstones — the IVF SoA
+                // wire format has no state byte and stays untouched.  Dead
+                // rows are filtered by heap visibility; segment-level
+                // compaction (phase 10) is the structural fix.
+                let header = AgentVecSegmentHeader::load(&index_rel, segment.header);
+                total_live += header.live_entries();
+            }
         }
     }
 

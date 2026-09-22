@@ -365,6 +365,58 @@ pub unsafe fn region_params(
     (m, ef_construction)
 }
 
+/// Collect the live elements of a region's graph chain as `(heap tid,
+/// decoded vector)` pairs, oldest first.  The callback-free form matters: the
+/// entries are decoded into owned buffers with no page lock held across the
+/// loop body, so the caller (AgentVec's conversion job) may do arbitrary
+/// work with them.
+pub unsafe fn collect_elements(
+    index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
+    support: &Support,
+) -> Vec<(pg_sys::ItemPointerData, Vec<f32>)> {
+    let head = {
+        let buf = pg_sys::ReadBuffer(index, metapage_block(base));
+        pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+        let page = pg_sys::BufferGetPage(buf);
+        let head = (*page_get_meta(page)).graph_head;
+        pg_sys::UnlockReleaseBuffer(buf);
+        head
+    };
+
+    let mut out: Vec<(pg_sys::ItemPointerData, Vec<f32>)> = Vec::new();
+    let mut blkno = head;
+    let vec_bytes = support.codec.vector_bytes();
+    let mut scratch = vec![0.0f32; support.codec.dim()];
+    while blkno != pg_sys::InvalidBlockNumber {
+        let buf = pg_sys::ReadBuffer(index, blkno);
+        pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+        let page = pg_sys::BufferGetPage(buf);
+        let maxoff = PageGetMaxOffsetNumber(page);
+        let mut next = pg_sys::InvalidBlockNumber;
+        for off in 1..=maxoff as pg_sys::OffsetNumber {
+            let item_id = PageGetItemId(page, off);
+            if (*item_id).lp_len() == 0 {
+                continue;
+            }
+            let item = PageGetItem(page, item_id) as *const u8;
+            let tup = item.cast::<ElementTupleData>();
+            if (*tup).type_ != ELEMENT_TUPLE_TYPE || (*tup).deleted != 0 {
+                continue;
+            }
+            support.codec.decode_into(
+                std::slice::from_raw_parts(item.add(ELEMENT_TUPLE_VECTOR_OFFSET), vec_bytes),
+                &mut scratch,
+            );
+            out.push(((*tup).heaptid, scratch.clone()));
+        }
+        next = (*page_opaque(page)).nextblkno;
+        pg_sys::UnlockReleaseBuffer(buf);
+        blkno = next;
+    }
+    out
+}
+
 /// `HnswGetMetaPageInfo` — fetch m and/or the entry point from the metapage.
 pub unsafe fn get_meta_page_info(
     index: pg_sys::Relation,

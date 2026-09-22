@@ -152,6 +152,10 @@ pub unsafe extern "C-unwind" fn amrescan(
         let orderby = &*orderbys;
         if !orderby.sk_argument.is_null() {
             state.query = extract_query_vector(orderby.sk_argument, meta.get_distance_type());
+            let expected_dim = meta.get_num_dimensions() as usize;
+            if state.query.len() != expected_dim {
+                error!("different vector dimensions");
+            }
         }
     }
 
@@ -295,10 +299,69 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
                     );
                 }
             }
-            SegmentAlgorithm::IvfRaBitQ => error!(
-                "agentvec: segment {} uses ivf_rabitq storage, which this phase cannot search",
-                segment.segment_id
-            ),
+            SegmentAlgorithm::IvfRaBitQ => {
+                // The immutable IVF payload: the same composition the ivf AM
+                // scan performs, over the embedded region's meta/centroids/
+                // list directory.
+                let base = segment.code_root.block_number;
+                let ivf_meta = crate::access_method::ivf::meta_page::IvfMetaPage::fetch(
+                    &index_rel,
+                    base,
+                );
+                let Some(centroid_pointer) = ivf_meta.get_centroids_pointer() else {
+                    continue;
+                };
+                let centroid_page =
+                    crate::access_method::ivf::centroid_page::IvfCentroidPage::load(
+                        &index_rel,
+                        centroid_pointer,
+                    );
+                if centroid_page.centroids.is_empty() {
+                    continue;
+                }
+                let Some(list_directory_pointer) = ivf_meta.get_list_directory_pointer() else {
+                    continue;
+                };
+                let list_directory =
+                    crate::access_method::ivf::list_directory::IvfListDirectory::load_at(
+                        &index_rel,
+                        list_directory_pointer,
+                    );
+
+                let probes = options.get_ivf_probes() as usize;
+                let nearest = crate::access_method::ivf::simd::find_nearest_centroids(
+                    &state.query,
+                    &centroid_page.centroids,
+                    meta.get_distance_type(),
+                    probes,
+                );
+                crate::access_method::ivf::scan::for_each_candidate(
+                    &index_rel,
+                    &ivf_meta,
+                    &centroid_page,
+                    &list_directory,
+                    &state.query,
+                    &nearest,
+                    |_dist, tid| {
+                        // The RaBitQ estimate is not a guaranteed lower bound
+                        // (it can overshoot the exact distance, which would
+                        // make the executor raise "index returned tuples in
+                        // wrong order"); -infinity is the safe bound.  The
+                        // executor's reorder queue restores the exact order
+                        // of everything this scan returns; phase 8's exact
+                        // rerank replaces the bound with better values.
+                        push(
+                            &mut all,
+                            &mut heap,
+                            DistTid {
+                                dist: f64::NEG_INFINITY,
+                                tid,
+                                exact: false,
+                            },
+                        );
+                    },
+                );
+            }
         }
     }
 
