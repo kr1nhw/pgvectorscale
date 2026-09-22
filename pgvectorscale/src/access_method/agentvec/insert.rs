@@ -391,3 +391,70 @@ pub unsafe fn insert_entry(
     }
     error!("agentvec: could not resolve a HOT segment to insert into");
 }
+
+/// Fetch the exact heap vector of a live row — the conversion source for
+/// calibrated HOT layouts, whose inline bytes clamp.  Returns `None` when the
+/// row is not visible to the active snapshot (deleted or updated away while
+/// the conversion ran).
+pub unsafe fn fetch_heap_vector(
+    index: &PgRelation,
+    tid: pg_sys::ItemPointerData,
+    dim: usize,
+    distance_type: DistanceType,
+) -> Option<Vec<f32>> {
+    let heap_rel = pg_sys::table_open(
+        (*(*index.as_ptr()).rd_index).indrelid,
+        pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+    );
+    let result = {
+        // The heap tuple's attnum of the indexed vector column, from the
+        // index catalog's indkey (agentvec supports exactly one indexed
+        // column).  A buffer-heap-tuple slot deforms with ITS descriptor, so
+        // it must be the heap relation's descriptor, and the attnum must be
+        // the vector's position in the heap tuple.
+        let rd_index = (*index.as_ptr()).rd_index;
+        let attnum = *(*rd_index).indkey.values.as_ptr() as i32;
+        let slot = pg_sys::MakeSingleTupleTableSlot(
+            (*heap_rel).rd_att,
+            &pg_sys::TTSOpsBufferHeapTuple,
+        );
+        let mut htup: pg_sys::HeapTupleData = std::mem::zeroed();
+        // PG18's heap_fetch reads the TID from the tuple's t_self.
+        htup.t_self = tid;
+        let mut buffer: pg_sys::Buffer = 0;
+        let got = pg_sys::heap_fetch(
+            heap_rel,
+            pg_sys::GetActiveSnapshot(),
+            &mut htup,
+            &mut buffer,
+            true,
+        );
+        let out = if got {
+            // The slot takes ownership of the buffer pin and releases it on
+            // clear (the canonical heap_fetch + ExecStoreBufferHeapTuple
+            // pattern).
+            pg_sys::ExecStoreBufferHeapTuple(&mut htup, slot, buffer);
+            let mut isnull = false;
+            let datum = pg_sys::slot_getattr(slot, attnum, &mut isnull);
+            if isnull {
+                None
+            } else {
+                let mut vector = super::insert::extract_vector(datum, dim);
+                if distance_type == DistanceType::Cosine {
+                    preprocess_cosine(&mut vector);
+                }
+                Some(vector)
+            }
+        } else {
+            None
+        };
+        // Release the heap pin explicitly (PG18's ExecDropSingleTupleTableSlot
+        // does not guarantee the clear path).
+        pg_sys::ExecClearTuple(slot);
+        pg_sys::ExecDropSingleTupleTableSlot(slot);
+        out
+    };
+    pg_sys::table_close(heap_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+    result
+}
+

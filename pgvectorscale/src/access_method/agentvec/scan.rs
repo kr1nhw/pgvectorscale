@@ -360,32 +360,80 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
                     meta.get_distance_type(),
                     probes,
                 );
-                crate::access_method::ivf::scan::for_each_candidate(
-                    &index_rel,
-                    &ivf_meta,
-                    &centroid_page,
-                    &list_directory,
-                    &state.query,
-                    &nearest,
-                    |_dist, tid| {
-                        // The RaBitQ estimate is not a guaranteed lower bound
-                        // (it can overshoot the exact distance, which would
-                        // make the executor raise "index returned tuples in
-                        // wrong order"); -infinity is the safe bound.  The
-                        // executor's reorder queue restores the exact order
-                        // of everything this scan returns; phase 8's exact
-                        // rerank replaces the bound with better values.
-                        push(
-                            &mut all,
-                            &mut heap,
-                            DistTid {
-                                dist: f64::NEG_INFINITY,
+                // The RaBitQ estimate is not a guaranteed lower bound, so it
+                // cannot be the executor's orderby hint ("index returned
+                // tuples in wrong order" otherwise).  With a bounded scan the
+                // candidates are exact-reranked HERE: keep the top-k by
+                // estimate, heap-fetch their vectors, and emit exact
+                // distances (phase 8's rerank, done at emission).  The
+                // unbounded scan keeps -infinity hints (the executor's
+                // reorder queue restores order; phase 8 bounds it too).
+                if let Some(k) = bound {
+                    let mut est_heap: BinaryHeap<DistTid> = BinaryHeap::new();
+                    crate::access_method::ivf::scan::for_each_candidate(
+                        &index_rel,
+                        &ivf_meta,
+                        &centroid_page,
+                        &list_directory,
+                        &state.query,
+                        &nearest,
+                        |dist, tid| {
+                            let cand = DistTid {
+                                dist: dist as f64,
                                 tid,
                                 exact: false,
-                            },
-                        );
-                    },
-                );
+                            };
+                            if est_heap.len() < k {
+                                est_heap.push(cand);
+                            } else if let Some(mut worst) = est_heap.peek_mut() {
+                                if cand.dist < worst.dist {
+                                    *worst = cand;
+                                }
+                            }
+                        },
+                    );
+                    for cand in est_heap {
+                        let mut tid_data = pg_sys::ItemPointerData::default();
+                        cand.tid.to_item_pointer_data(&mut tid_data);
+                        if let Some(vector) = super::insert::fetch_heap_vector(
+                            &index_rel,
+                            tid_data,
+                            dim,
+                            meta.get_distance_type(),
+                        ) {
+                            let dist = distance_fn(&state.query, &vector);
+                            push(
+                                &mut all,
+                                &mut heap,
+                                DistTid {
+                                    dist: dist as f64,
+                                    tid: cand.tid,
+                                    exact: true,
+                                },
+                            );
+                        }
+                    }
+                } else {
+                    crate::access_method::ivf::scan::for_each_candidate(
+                        &index_rel,
+                        &ivf_meta,
+                        &centroid_page,
+                        &list_directory,
+                        &state.query,
+                        &nearest,
+                        |_dist, tid| {
+                            push(
+                                &mut all,
+                                &mut heap,
+                                DistTid {
+                                    dist: f64::NEG_INFINITY,
+                                    tid,
+                                    exact: false,
+                                },
+                            );
+                        },
+                    );
+                }
             }
         }
     }
