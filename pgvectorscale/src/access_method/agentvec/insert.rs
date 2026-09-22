@@ -217,9 +217,13 @@ pub unsafe fn open_initial_hot_segment(index: &PgRelation) -> u64 {
     let options = TSVAgentVecOptions::from_relation(index);
     AgentVecMetaPage::update(index, |meta| {
         let mut directory = meta.load_directory(index);
-        if directory.get(meta.get_hot_segment_id()).is_some() {
-            // Someone else created it while we waited for the meta lock.
-            return meta.get_hot_segment_id();
+        if let Some(seg) = directory.get(meta.get_hot_segment_id()) {
+            if seg.is_searchable() {
+                // Someone else created a live HOT while we waited for the
+                // meta lock.  (A retired bulk-built segment must NOT count:
+                // nothing would ever open its successor.)
+                return meta.get_hot_segment_id();
+            }
         }
         open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot, &options)
     })

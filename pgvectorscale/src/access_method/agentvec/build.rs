@@ -21,13 +21,6 @@ use crate::access_method::agentvec::{insert, AGENTVEC_DISTANCE_TYPE_PROC};
 use crate::access_method::distance::DistanceType;
 use crate::util::ItemPointer;
 
-/// Build state shared with the heap-scan callback.
-struct BuildState {
-    distance_type: DistanceType,
-    num_dimensions: usize,
-    nrows: u64,
-}
-
 /// The distance metric this index was created for, taken from the operator
 /// class's support function 1.
 fn index_distance_type(indexrel: pg_sys::Relation) -> DistanceType {
@@ -62,36 +55,105 @@ unsafe fn write_empty_index(index_rel: &PgRelation, distance_type: DistanceType,
 }
 
 /// Build a new AgentVec index over an existing heap.
+///
+/// The initial HOT segment is built with the hnswsq **bulk** builder
+/// (`hnswsq::build::build_region`) into a region whose base is the relation
+/// end — the same streaming two-pass build the standalone AM uses, so CREATE
+/// INDEX keeps the hnswsq build speed instead of paying the per-row insert
+/// path.  If the heap exceeds `hot_segment_max_rows` the segment is sealed
+/// immediately (QueuedForMigration) and the first later insert opens a fresh
+/// HOT segment; otherwise it stays the active HOT segment exactly like the
+/// incremental path's.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambuild(
     heap: pg_sys::Relation,
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
+    use crate::access_method::agentvec::directory::{
+        AgentVecSegmentHeader, AgentVecSegmentMeta, SegmentAlgorithm, SegmentLevel, SegmentState,
+    };
+    use crate::access_method::agentvec::insert::SEGMENT_FORMAT_HNSW_V1;
+
     let heap_rel = PgRelation::from_pg(heap);
     let index_rel = PgRelation::from_pg(index);
 
     let distance_type = index_distance_type(index);
     let num_dimensions = index_dimensions(&index_rel);
-    write_empty_index(&index_rel, distance_type, num_dimensions);
+    let options = TSVAgentVecOptions::from_relation(&index_rel);
 
-    let mut state = BuildState {
-        distance_type,
-        num_dimensions,
-        nrows: 0,
-    };
-    pg_sys::IndexBuildHeapScan(
-        heap_rel.as_ptr(),
+    // Scaffold: meta page (block 0); the region is built FIRST so its base
+    // is exactly the relation end (create_meta_page asserts it).  The
+    // segment header + directory items are written after the region — their
+    // placement is irrelevant, only the pointers matter.
+    AgentVecMetaPage::create(&index_rel, num_dimensions as u32, distance_type);
+    let base = pg_sys::RelationGetNumberOfBlocksInFork(
         index_rel.as_ptr(),
-        index_info,
-        Some(build_callback),
-        &mut state as *mut BuildState as *mut std::os::raw::c_void,
+        pg_sys::ForkNumber::MAIN_FORKNUM,
     );
 
-    // Record the row count on the meta page (approximate by construction: it
-    // counts rows appended, tombstoned ones included).
+
+    // The bulk build into the embedded region (also writes the region's
+    // metapage and, for calibrated layouts, the trained calibration chain).
+    let (reltuples, indtuples) = crate::access_method::hnswsq::build::build_region(
+        Some(heap_rel.as_ptr()),
+        index_rel.as_ptr(),
+        index_info,
+        base,
+        options.get_hot_m(),
+        options.get_hot_ef_construction(),
+        options.get_hot_precision(),
+        30_000,
+    );
+
+    // Publish the HOT segment that owns the region.
+    let segment_id = AgentVecMetaPage::update(&index_rel, |meta| {
+        let mut directory = meta.load_directory(&index_rel);
+        let segment_id = meta.take_next_segment_id();
+        let header = AgentVecSegmentHeader::new(SegmentLevel::Hot, SegmentAlgorithm::Hnsw);
+        let header_pointer = header.store_new(&index_rel);
+        let mut seg = AgentVecSegmentMeta::new(
+            segment_id,
+            0,
+            SegmentLevel::Hot,
+            SegmentState::Published,
+            SegmentAlgorithm::Hnsw,
+            crate::access_method::agentvec::directory::SegmentOwnership::Owned,
+            meta.get_epoch(),
+            header_pointer,
+            distance_type as u16,
+            num_dimensions as u32,
+            SEGMENT_FORMAT_HNSW_V1,
+        );
+        seg.code_root = ItemPointer::new(base, 1);
+        directory.segments.push(seg);
+        let (ptr, blocks) = directory.store(&index_rel);
+        meta.set_directory(ptr, blocks);
+        meta.set_hot_segment_id(segment_id);
+        segment_id
+    });
+
+    // Record the row counts; seal immediately when the segment exceeds the
+    // HOT cap (a later insert opens the successor HOT segment).
+    let seal = indtuples as u64 >= options.get_hot_segment_max_rows();
+    let header_block = AgentVecMetaPage::fetch(&index_rel)
+        .load_directory(&index_rel)
+        .get(segment_id)
+        .map(|seg| seg.header.block_number)
+        .expect("segment just created");
+    AgentVecSegmentHeader::update(&index_rel, header_block, |header| {
+        header.num_entries = indtuples as u64;
+    });
     AgentVecMetaPage::update(&index_rel, |meta| {
-        meta.set_num_tuples(state.nrows);
+        meta.set_num_tuples(reltuples as u64);
+        if seal {
+            let mut directory = meta.load_directory(&index_rel);
+            if let Some(seg) = directory.get_mut(segment_id) {
+                seg.state = SegmentState::QueuedForMigration as u8;
+            }
+            let (ptr, blocks) = directory.store(&index_rel);
+            meta.set_directory(ptr, blocks);
+        }
     });
 
     // Phase 4: make sure this database has a maintenance worker (no-op when
@@ -99,8 +161,8 @@ pub unsafe extern "C-unwind" fn ambuild(
     crate::access_method::agentvec::maintenance::launch_worker_for_current_database();
 
     let mut result = PgBox::<pg_sys::IndexBuildResult>::alloc0();
-    result.heap_tuples = state.nrows as f64;
-    result.index_tuples = state.nrows as f64;
+    result.heap_tuples = reltuples;
+    result.index_tuples = indtuples;
     result.into_pg()
 }
 
@@ -118,33 +180,4 @@ pub extern "C-unwind" fn ambuildempty(index: pg_sys::Relation) {
         let num_dimensions = index_dimensions(&index_rel);
         write_empty_index(&index_rel, distance_type, num_dimensions);
     }
-}
-
-/// Heap-scan callback: append one row.
-unsafe extern "C-unwind" fn build_callback(
-    index: pg_sys::Relation,
-    tid: pg_sys::ItemPointer,
-    values: *mut pg_sys::Datum,
-    isnull: *mut bool,
-    _tuple_is_alive: bool,
-    state: *mut std::os::raw::c_void,
-) {
-    if *isnull {
-        return;
-    }
-    let state = &mut *(state as *mut BuildState);
-    let index_rel = PgRelation::from_pg(index);
-    let options = TSVAgentVecOptions::from_relation(&index_rel);
-    let vector = insert::extract_vector(*values, state.num_dimensions);
-    // Bulk builds skip per-insert WAL (the build's whole page range is
-    // durable once the transaction commits).
-    insert::insert_entry(
-        &index_rel,
-        ItemPointer::with_item_pointer_data(*tid),
-        &vector,
-        state.distance_type,
-        &options,
-        true,
-    );
-    state.nrows += 1;
 }

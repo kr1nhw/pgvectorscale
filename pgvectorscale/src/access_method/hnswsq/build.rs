@@ -66,6 +66,9 @@ pub struct BuildState {
     pub heap: Option<pg_sys::Relation>,
     pub index: pg_sys::Relation,
     pub index_info: *mut pg_sys::IndexInfo,
+    /// First block of the region this build writes (standalone = 0; an
+    /// embedded AgentVec HOT region = its base).
+    pub region_base: pg_sys::BlockNumber,
     pub m: usize,
     pub ef_construction: usize,
     /// The leader's SQ8 distance mode; the parallel build shares it with
@@ -371,7 +374,7 @@ unsafe fn insert_tuple(
         pg_sys::LWLockRelease(std::ptr::addr_of_mut!((*graph).flush_lock));
         return crate::access_method::hnswsq::insert::insert_tuple_on_disk(
             build.index,
-            HNSW_STANDALONE_BASE,
+            build.region_base,
             &build.support,
             &build.encoded,
             heaptid,
@@ -403,7 +406,7 @@ unsafe fn insert_tuple(
 
         return crate::access_method::hnswsq::insert::insert_tuple_on_disk(
             build.index,
-            HNSW_STANDALONE_BASE,
+            build.region_base,
             &build.support,
             &build.encoded,
             heaptid,
@@ -616,10 +619,10 @@ unsafe fn create_graph_pages(build: &mut BuildState) {
     } else {
         Some(entry_point)
     };
-    update_meta_page(index, HNSW_STANDALONE_BASE, UPDATE_ENTRY_ALWAYS, entry_point_opt, insert_page, true);
+    update_meta_page(index, build.region_base, UPDATE_ENTRY_ALWAYS, entry_point_opt, insert_page, true);
 
     // Record where the graph chain starts (see the module docs).
-    let buf = pg_sys::ReadBuffer(index, metapage_block(HNSW_STANDALONE_BASE));
+    let buf = pg_sys::ReadBuffer(index, metapage_block(build.region_base));
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
     let mpage = pg_sys::BufferGetPage(buf);
     let metap = page_get_meta(mpage);
@@ -848,7 +851,7 @@ pub unsafe extern "C-unwind" fn hnswsq_parallel_build_main(
 
     // Worker state: same shape as the leader's, over the shared graph.  The
     // codec comes from the (already written) metapage and calibration chain.
-    let support = init_support(index, HNSW_STANDALONE_BASE);
+    let support = init_support(index, (*shared).region_base);
     debug_assert_eq!(get_precision(index), support.precision);
     let sq8_mode = crate::access_method::hnswsq::options::Sq8DistanceMode::from_i32(
         (*shared).sq8_distance_mode,
@@ -859,6 +862,9 @@ pub unsafe extern "C-unwind" fn hnswsq_parallel_build_main(
         pg_sys::BuildIndexInfo(index),
         support.codec.clone(),
         sq8_mode,
+        (*shared).m as usize,
+        (*shared).ef_construction as usize,
+        (*shared).region_base,
     );
     build.graph_ptr = &mut (*shared).graph;
     build.base = area;
@@ -937,6 +943,9 @@ unsafe fn begin_parallel(build: &mut BuildState, isconcurrent: bool, request: i3
     // Initialize immutable state
     (*shared).heaprelid = PgRelation::from_pg(build.heap.unwrap()).oid();
     (*shared).indexrelid = PgRelation::from_pg(build.index).oid();
+    (*shared).region_base = build.region_base;
+    (*shared).m = build.m as i32;
+    (*shared).ef_construction = build.ef_construction as i32;
     (*shared).isconcurrent = isconcurrent;
     pg_sys::ConditionVariableInit(std::ptr::addr_of_mut!((*shared).workersdonecv));
     pg_sys::SpinLockInit(std::ptr::addr_of_mut!((*shared).mutex));
@@ -1088,12 +1097,12 @@ pub unsafe fn init_build_state(
     index_info: *mut pg_sys::IndexInfo,
     codec: Codec,
     sq8_mode: crate::access_method::hnswsq::options::Sq8DistanceMode,
+    m: usize,
+    ef_construction: usize,
+    region_base: pg_sys::BlockNumber,
 ) -> Box<BuildState> {
     let index_rel = PgRelation::from_pg(index);
-    let options = Hnsw2Options::from_relation(&index_rel);
-    let precision = options.get_precision();
-    let m = options.get_m() as usize;
-    let ef_construction = options.get_ef_construction() as usize;
+    let precision = codec.precision();
 
     // Dimensions from the indexed column's typmod (vector(N) → N).
     let atttypmod = index_rel
@@ -1130,6 +1139,7 @@ pub unsafe fn init_build_state(
         heap,
         index,
         index_info,
+        region_base,
         m,
         ef_construction,
         sq8_mode,
@@ -1231,16 +1241,22 @@ unsafe fn relation_needs_wal(index: pg_sys::Relation) -> bool {
 }
 
 /// `BuildIndex` (hnswbuild.c).
-unsafe fn build_index(
+/// The bulk build into one hnswsq region at `region_base` — the standalone
+/// AM's `build_index` and AgentVec's embedded HOT-region build (whose base
+/// is the relation end, not block 0) share this body.  The region's
+/// metapage, calibration chain and pages are all written relative to
+/// `region_base`.
+pub unsafe fn build_region(
     heap: Option<pg_sys::Relation>,
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
+    region_base: pg_sys::BlockNumber,
+    m: usize,
+    ef_construction: usize,
+    precision: HnswPrecision,
+    sample_size: usize,
 ) -> (f64, f64) {
     let index_rel = PgRelation::from_pg(index);
-    let options = Hnsw2Options::from_relation(&index_rel);
-    let precision = options.get_precision();
-    let m = options.get_m() as usize;
-    let ef_construction = options.get_ef_construction() as usize;
     let dimensions = index_rel
         .tuple_desc()
         .get(0)
@@ -1253,7 +1269,6 @@ unsafe fn build_index(
     // start (they read the codec from it) — so: train in memory, write the
     // metapage, write the chain, record its pointer.
     let codec = if precision.needs_calibration() {
-        let sample_size = get_sample_size(index);
         let seed = HNSW_BUILD_SEED.get();
         let rng = if seed < 0 {
             rand::rngs::SmallRng::from_entropy()
@@ -1280,7 +1295,7 @@ unsafe fn build_index(
 
         create_meta_page(
             index,
-            HNSW_STANDALONE_BASE,
+            region_base,
             dimensions,
             m,
             ef_construction,
@@ -1288,12 +1303,12 @@ unsafe fn build_index(
             ItemPointer::new_invalid(),
         );
         let ptr = calib.store(&index_rel);
-        set_meta_calibration(index, HNSW_STANDALONE_BASE, ptr);
+        set_meta_calibration(index, region_base, ptr);
         Codec::new_sq8(&calib)
     } else {
         create_meta_page(
             index,
-            HNSW_STANDALONE_BASE,
+            region_base,
             dimensions,
             m,
             ef_construction,
@@ -1304,7 +1319,16 @@ unsafe fn build_index(
     };
 
     let sq8_mode = crate::access_method::hnswsq::options::HNSW_SQ8_DISTANCE.get();
-    let mut build = init_build_state(heap, index, index_info, codec, sq8_mode);
+    let mut build = init_build_state(
+        heap,
+        index,
+        index_info,
+        codec,
+        sq8_mode,
+        m,
+        ef_construction,
+        region_base,
+    );
 
     build_graph(&mut build);
 
@@ -1312,13 +1336,38 @@ unsafe fn build_index(
         pg_sys::log_newpage_range(
             index,
             pg_sys::ForkNumber::MAIN_FORKNUM,
-            0,
+            region_base,
             pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM),
             true,
         );
     }
 
     (build.reltuples, build.indtuples)
+}
+
+/// The standalone AM build: the same `build_region` with the AM's own
+/// reloptions and the fixed standalone base.
+unsafe fn build_index(
+    heap: Option<pg_sys::Relation>,
+    index: pg_sys::Relation,
+    index_info: *mut pg_sys::IndexInfo,
+) -> (f64, f64) {
+    let index_rel = PgRelation::from_pg(index);
+    let options = Hnsw2Options::from_relation(&index_rel);
+    let precision = options.get_precision();
+    let m = options.get_m() as usize;
+    let ef_construction = options.get_ef_construction() as usize;
+    let sample_size = unsafe { get_sample_size(index) };
+    build_region(
+        heap,
+        index,
+        index_info,
+        HNSW_STANDALONE_BASE,
+        m,
+        ef_construction,
+        precision,
+        sample_size,
+    )
 }
 
 /// `hnswbuild` (hnswbuild.c).

@@ -246,7 +246,8 @@ impl Sq8Calibration {
 /// per scan state) so the hot loop is a multiply + round + clamp.
 #[derive(Clone, Debug)]
 pub struct Codec {
-    precision: HnswPrecision,
+    /// The precision this codec implements.
+    pub precision: HnswPrecision,
     dim: usize,
     /// SQ8 only: per-dimension minimum.
     sq8_mins: Vec<f32>,

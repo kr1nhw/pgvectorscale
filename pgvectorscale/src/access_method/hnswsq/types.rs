@@ -282,6 +282,9 @@ pub struct Graph {
 pub struct Shared {
     pub heaprelid: pg_sys::Oid,
     pub indexrelid: pg_sys::Oid,
+    pub region_base: pg_sys::BlockNumber,
+    pub m: i32,
+    pub ef_construction: i32,
     pub isconcurrent: bool,
     pub workersdonecv: pg_sys::ConditionVariable,
     pub mutex: pg_sys::slock_t,

@@ -350,9 +350,11 @@ mod tests {
         )?;
         force_index_scan();
 
+        // CREATE INDEX bulk-builds ONE segment (the whole table), sealed
+        // because it exceeds hot_segment_max_rows.
         let converted = Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_conv')")?
             .expect("converted");
-        assert_eq!(converted, 10, "the oldest sealed segment holds 10 rows");
+        assert_eq!(converted, 30, "the bulk-built segment holds all 30 rows");
 
         let warm = Spi::get_one::<i64>(
             "SELECT count(*) FROM agentvec_index_info('idx_av_conv') WHERE algorithm = 'ivf_rabitq'",
@@ -370,7 +372,7 @@ mod tests {
         // rows: the retired HOT segment keeps its 10 entries until phase-10
         // reclamation, so the index holds 30 HOT + 10 WARM copies. Retired
         // segments are not searched, so no duplicate TIDs reach the scan.
-        assert_eq!((warm, retired, total), (1, 1, 40), "1 warm, 1 retired, no row lost");
+        assert_eq!((warm, retired, total), (1, 1, 60), "1 warm, 1 retired, no row lost");
 
         // The converted segment is immutable and searchable.
         assert_eq!(
@@ -398,12 +400,11 @@ mod tests {
         ))?;
         force_index_scan();
 
-        // 240 rows at 60/segment: three sealed HOT segments.
-        for _ in 0..3 {
-            let n = Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_recall')")?
-                .expect("converted");
-            assert_eq!(n, 60);
-        }
+        // CREATE INDEX bulk-builds one 240-row segment (sealed); convert it.
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_recall')")?.expect("n"),
+            240
+        );
 
         let mut hits = 0usize;
         let mut total = 0usize;
@@ -448,12 +449,11 @@ mod tests {
             assert!(decided.is_none(), "no region means no decision");
         }
 
-        for _ in 0..2 {
-            assert_eq!(
-                Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_route')")?.expect("n"),
-                40
-            );
-        }
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_route')")?.expect("n"),
+            120,
+            "one bulk-built segment"
+        );
 
         let index = index_relation("idx_av_route");
         let meta = AgentVecMetaPage::fetch(&index);
@@ -470,13 +470,13 @@ mod tests {
             })
             .map(|s| s.segment_id)
             .collect();
-        assert_eq!(warm.len(), 2, "two converted segments");
+        assert_eq!(warm.len(), 1, "one converted segment");
 
         let decided = unsafe {
             router::route(&index, &[0.0; 8], &directory, &options, router_base)
         }
         .expect("the router must decide once it has nodes");
-        assert_eq!(decided.len(), 2, "top_m = 2 activates at most 2");
+        assert_eq!(decided.len(), 1, "top_m = 2 activates at most the 1 available");
         assert!(
             decided.iter().all(|id| warm.contains(id)),
             "only owned WARM segments may be activated, got {decided:?}"
@@ -504,14 +504,15 @@ mod tests {
             .join(",");
         Spi::run(&format!(
             "CREATE TABLE t_av_rr(id serial primary key, v vector(16));
-             INSERT INTO t_av_rr(v) VALUES {values};
              CREATE INDEX idx_av_rr ON t_av_rr USING agentvec (v vector_l2_ops)
                 WITH (hot_segment_max_rows = 60, ivf_lists = 8, ivf_probes = 8,
-                      router_top_m = 3);"
+                      router_top_m = 3);
+             INSERT INTO t_av_rr(v) VALUES {values};"
         ))?;
         force_index_scan();
 
-        // 360 rows: five sealed segments, each converted (the sixth stays HOT).
+        // Insert-driven segmentation: five sealed 60-row segments (the
+        // sixth stays HOT), each converted.
         for _ in 0..5 {
             assert_eq!(
                 Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_rr')")?.expect("n"),
@@ -550,12 +551,12 @@ mod tests {
 
         let converted =
             Spi::get_one::<i64>("SELECT agentvec_run_maintenance('idx_av_maint')")?.expect("n");
-        assert_eq!(converted, 60, "two sealed segments of 30 rows");
+        assert_eq!(converted, 90, "the bulk-built segment holds all 90 rows");
         let warm: i64 = Spi::get_one::<i64>(
             "SELECT count(*) FROM agentvec_index_info('idx_av_maint') WHERE algorithm = 'ivf_rabitq'",
         )?
         .expect("count");
-        assert_eq!(warm, 2, "both sealed segments converted");
+        assert_eq!(warm, 1, "the sealed segment converted");
 
         // Idempotent: nothing left to convert.
         let again =
@@ -599,15 +600,16 @@ mod tests {
             "still not due"
         );
 
-        // Force maintenance (marks the index maintained) and seal another
-        // segment.
+        // Force maintenance (marks the index maintained and converts the
+        // bulk-built 60-row segment).
         assert_eq!(
             Spi::get_one::<i64>("SELECT agentvec_run_maintenance('idx_av_sched')")?.expect("n"),
-            30
+            60
         );
+        // 31 more rows: the new HOT segment seals on the 31st insert.
         Spi::run(
             "INSERT INTO t_av_sched
-                SELECT g, ('[' || g || ',0,0,0,0,0,0,0]')::vector FROM generate_series(61, 90) AS g;",
+                SELECT g, ('[' || g || ',0,0,0,0,0,0,0]')::vector FROM generate_series(61, 91) AS g;",
         )?;
         assert_eq!(
             Spi::get_one::<i64>("SELECT agentvec_maybe_maintain('idx_av_sched')")?.expect("n"),
@@ -679,7 +681,7 @@ mod tests {
 
         let converted =
             Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_heal')")?.expect("n");
-        assert_eq!(converted, 10, "the Retiring segment is reclaimed and converted");
+        assert_eq!(converted, 25, "the Retiring bulk-built segment is reclaimed and converted");
         let warm: i64 = Spi::get_one::<i64>(
             "SELECT count(*) FROM agentvec_index_info('idx_av_heal') WHERE algorithm = 'ivf_rabitq'",
         )?
