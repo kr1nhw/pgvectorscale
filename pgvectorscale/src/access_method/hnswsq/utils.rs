@@ -1307,14 +1307,19 @@ impl ElementArena {
     /// Rewind for reuse: keep one chunk's worth of arena memory and start
     /// allocating from its beginning again (all previously returned pointers
     /// are dead).  The insert path calls this per insert instead of
-    /// reallocating a 64 KiB chunk every row.
+    /// reallocating a 64 KiB chunk every row.  The dropped chunks hold raw
+    /// pointers, so they must be deallocated explicitly — `Vec::truncate`
+    /// alone would leak ~64 KiB per insert.
     pub fn reset(&mut self) {
         if self.chunks.is_empty() {
             // Never allocated: leave the bump positioned so the next alloc
             // creates the first chunk.
             self.next = ELEMENT_ARENA_CHUNK;
         } else {
-            self.chunks.truncate(1);
+            let layout = std::alloc::Layout::array::<Element>(ELEMENT_ARENA_CHUNK).unwrap();
+            for chunk in self.chunks.drain(1..) {
+                unsafe { std::alloc::dealloc(chunk.cast::<u8>(), layout) };
+            }
             self.next = 0;
         }
         self.len = 0;

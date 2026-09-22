@@ -66,6 +66,7 @@ pub unsafe extern "C-unwind" fn aminsert(
         &vector,
         meta.get_distance_type(),
         &options,
+        false,
     );
 
     false
@@ -308,6 +309,7 @@ pub unsafe fn insert_entry(
     vector: &[f32],
     distance_type: DistanceType,
     options: &TSVAgentVecOptions,
+    building: bool,
 ) -> u64 {
     // Vectors are stored in the representation the distance function expects:
     // cosine distance is computed on unit vectors (see `distance_cosine`),
@@ -348,27 +350,38 @@ pub unsafe fn insert_entry(
                 // HNSW: append into the embedded hnswsq region, then bump the
                 // segment's counter.  `stored` is already cosine-normalized
                 // where the metric requires it, matching hnswsq's own insert
-                // convention.
-                let base = hot.code_root.block_number;
-                let support =
-                    crate::access_method::hnswsq::utils::init_support(index.as_ptr(), base);
-                let mut encoded = vec![0u8; support.codec.vector_bytes()];
-                let clamped = support.codec.encode_into(&stored, &mut encoded);
-                let mut tid_data = pg_sys::ItemPointerData::default();
-                heap_tid.to_item_pointer_data(&mut tid_data);
-                crate::access_method::hnswsq::insert::insert_tuple_on_disk(
-                    index.as_ptr(),
-                    base,
-                    &support,
-                    &encoded,
-                    &tid_data,
-                    false,
-                    clamped,
-                );
-                AgentVecSegmentHeader::update(index, hot.header.block_number, |header| {
-                    header.num_entries += 1;
+                // convention.  The whole insert runs in a per-insert memory
+                // context like hnswsq's aminsert: the search pallocs one
+                // element-sized buffer per neighbor it loads (the hnswsq
+                // insert path frees them with its per-insert context), and
+                // without the reset they accumulate ~100 KB/row in bulk
+                // builds.
+                let mut insert_ctx =
+                    pgrx::PgMemoryContexts::new("agentvec hnsw insert temporary context");
+                let segment_id = insert_ctx.switch_to(|_| {
+                    let base = hot.code_root.block_number;
+                    let support =
+                        crate::access_method::hnswsq::utils::init_support(index.as_ptr(), base);
+                    let mut encoded = vec![0u8; support.codec.vector_bytes()];
+                    let clamped = support.codec.encode_into(&stored, &mut encoded);
+                    let mut tid_data = pg_sys::ItemPointerData::default();
+                    heap_tid.to_item_pointer_data(&mut tid_data);
+                    crate::access_method::hnswsq::insert::insert_tuple_on_disk(
+                        index.as_ptr(),
+                        base,
+                        &support,
+                        &encoded,
+                        &tid_data,
+                        building,
+                        clamped,
+                    );
+                    AgentVecSegmentHeader::update(index, hot.header.block_number, |header| {
+                        header.num_entries += 1;
+                    });
+                    hot.segment_id
                 });
-                return hot.segment_id;
+                drop(insert_ctx);
+                return segment_id;
             }
         }
     }

@@ -136,12 +136,15 @@ unsafe extern "C-unwind" fn build_callback(
     let index_rel = PgRelation::from_pg(index);
     let options = TSVAgentVecOptions::from_relation(&index_rel);
     let vector = insert::extract_vector(*values, state.num_dimensions);
+    // Bulk builds skip per-insert WAL (the build's whole page range is
+    // durable once the transaction commits).
     insert::insert_entry(
         &index_rel,
         ItemPointer::with_item_pointer_data(*tid),
         &vector,
         state.distance_type,
         &options,
+        true,
     );
     state.nrows += 1;
 }
