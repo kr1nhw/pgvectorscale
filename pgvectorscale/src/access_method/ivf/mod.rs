@@ -138,7 +138,7 @@ BEGIN
 
     IF have_l2_ops = 0 THEN
         CREATE OPERATOR CLASS vector_l2_ops
-        FOR TYPE vector USING ivf AS
+        DEFAULT FOR TYPE vector USING ivf AS
             OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
             FUNCTION 1 distance_type_l2();
     END IF;
@@ -214,11 +214,22 @@ pub unsafe extern "C-unwind" fn ivf_amcostestimate(
     // expose stale TIDs to index-only heap fetches.  Refuse to estimate so the
     // planner never chooses it for non-ORDER-BY queries.
     if path_ref.indexorderbys.is_null() || pg_sys::list_length(path_ref.indexorderbys) == 0 {
-        *index_startup_cost = f64::MAX;
-        *index_total_cost = f64::MAX;
-        *index_selectivity = 1.0;
+        *index_startup_cost = f64::INFINITY;
+        *index_total_cost = f64::INFINITY;
+        *index_selectivity = 0.0;
         *index_correlation = 0.0;
-        *index_pages = 1.0;
+        *index_pages = 0.0;
+        #[cfg(feature = "pg18")]
+        {
+            // PG 18 compares per-path `disabled_nodes` BEFORE cost, so an
+            // infinite-cost path still wins against a path whose scan type
+            // the user disabled (`SET enable_seqscan = off` carries one
+            // disabled node; this path carried none, so count(*) was planned
+            // through the index and failed).  Two disabled nodes restores the
+            // "never choose me" behaviour — the same fix agentvec and
+            // pgvector's HNSW apply.
+            (*path).path.disabled_nodes = 2;
+        }
         return;
     }
 

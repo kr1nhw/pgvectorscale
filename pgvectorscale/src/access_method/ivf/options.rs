@@ -289,8 +289,7 @@ pub unsafe extern "C-unwind" fn amoptions(
     reloptions: pg_sys::Datum,
     validate: bool,
 ) -> *mut pg_sys::bytea {
-    warning!("IVF amoptions: entering");
-    
+
     fn make_relopt_parse_elt(
         optname: &str,
         opttype: pg_sys::relopt_type::Type,
@@ -357,6 +356,54 @@ mod tests {
     use super::*;
     use crate::access_method::storage::StorageType;
     use pgrx::*;
+
+    /// `EXPLAIN (COSTS OFF)` as a single string.
+    fn plan_for(query: &str) -> spi::Result<String> {
+        Spi::connect(|client| {
+            let table = client.select(&format!("EXPLAIN (COSTS OFF) {query}"), None, &[])?;
+            let mut plan = String::new();
+            for row in table {
+                if let Some(line) = row.get::<String>(1)? {
+                    plan.push_str(&line);
+                    plan.push('\n');
+                }
+            }
+            Ok::<String, spi::Error>(plan)
+        })
+    }
+
+    /// The index answers ORDER BY queries only: a count(*) must be planned
+    /// without it and must return the true count — including under
+    /// `enable_seqscan = off`, where the planner has to fall back to a
+    /// disabled seq scan rather than to an infinite-cost index path.
+    #[pg_test]
+    fn test_ivf_planner_uses_index_only_for_order_by() -> spi::Result<()> {
+        Spi::run(
+            "CREATE TABLE t_ivf_plan(id int, v vector(128));
+             INSERT INTO t_ivf_plan VALUES (1, (SELECT array_agg(1.0)::vector FROM generate_series(1,128))),
+                                          (2, (SELECT array_agg(2.0)::vector FROM generate_series(1,128)));
+             CREATE INDEX idx_ivf_plan ON t_ivf_plan USING ivf (v vector_l2_ops) WITH (lists = 2);",
+        )?;
+        Spi::run("SET enable_seqscan = off")?;
+
+        let unordered = plan_for("SELECT count(*) FROM t_ivf_plan")?;
+        assert!(
+            !unordered.contains("idx_ivf_plan"),
+            "a count(*) plan must not use the ivf index, got:\n{unordered}"
+        );
+        let count = Spi::get_one::<i64>("SELECT count(*) FROM t_ivf_plan")?.expect("count");
+        assert_eq!(count, 2, "count(*) must return the true row count");
+
+        let ordered = plan_for(
+            "SELECT id FROM t_ivf_plan
+               ORDER BY v <-> (SELECT array_agg(0.0)::vector FROM generate_series(1,128)) LIMIT 1",
+        )?;
+        assert!(
+            ordered.contains("idx_ivf_plan"),
+            "an ORDER BY query must use the ivf index, got:\n{ordered}"
+        );
+        Ok(())
+    }
 
     #[pg_test]
     unsafe fn test_ivf_options_defaults() -> spi::Result<()> {

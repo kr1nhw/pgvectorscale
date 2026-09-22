@@ -369,7 +369,11 @@ pub unsafe extern "C-unwind" fn amgettuple(
             let orderbyvals =
                 pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>()) as *mut pg_sys::Datum;
             let orderbynulls = pg_sys::palloc(std::mem::size_of::<bool>()) as *mut bool;
-            *orderbyvals = pg_sys::Datum::from(distance.to_bits() as usize);
+            // The ORDER BY operators return float8: publish the bound as an
+            // f64 datum (the f32-bits-in-a-Datum form the executor read here
+            // before was a denormal, not the distance).
+            let bound = distance as f64;
+            *orderbyvals = pg_sys::Datum::from(bound.to_bits() as usize);
             *orderbynulls = false;
             (*scan).xs_orderbyvals = orderbyvals;
             (*scan).xs_orderbynulls = orderbynulls;
