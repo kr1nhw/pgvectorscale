@@ -7,6 +7,8 @@
 //! magic, version, extension version
 //! distance type, dimensions
 //! directory pointer (+ block count)   -> block 1, republished copy-on-write
+//! router region base (0 = none)       -> embedded hnswsq Vamana graph over
+//!                                         owned IVF segments' centroids
 //! next_segment_id, hot_segment_id
 //! epoch, generation, num_tuples
 //! ```
@@ -36,7 +38,7 @@ pub const META_BLOCK_NUMBER: pg_sys::BlockNumber = 0;
 pub const META_OFFSET: pg_sys::OffsetNumber = 1;
 
 const AGENTVEC_MAGIC_NUMBER: u32 = 0x4156_4543; // "AVEC"
-const AGENTVEC_FORMAT_VERSION: u32 = 1;
+const AGENTVEC_FORMAT_VERSION: u32 = 2;
 
 /// Index-wide AgentVec metadata.
 #[derive(Clone, Debug, PartialEq, Archive, Deserialize, Serialize, Readable, Writeable)]
@@ -56,6 +58,9 @@ pub struct AgentVecMetaPage {
     directory: ItemPointer,
     /// Blocks the current directory item occupies (0 = unknown).
     directory_blocks: u32,
+    /// Base block of the router region (embedded hnswsq Vamana graph over
+    /// owned IVF segments' centroids); 0 = not created yet.
+    router_base: pg_sys::BlockNumber,
     /// Id to hand to the next segment created.
     next_segment_id: u64,
     /// Id of the segment foreground inserts currently target.
@@ -84,6 +89,7 @@ impl AgentVecMetaPage {
             num_dimensions,
             directory: ItemPointer::new_invalid(),
             directory_blocks: 0,
+            router_base: 0,
             next_segment_id: 1,
             hot_segment_id: 0,
             epoch: 1,
@@ -179,6 +185,16 @@ impl AgentVecMetaPage {
     /// Blocks the published directory item occupies.
     pub fn get_directory_blocks(&self) -> u32 {
         self.directory_blocks
+    }
+
+    /// Base block of the router region (0 = none).
+    pub fn get_router_base(&self) -> pg_sys::BlockNumber {
+        self.router_base
+    }
+
+    /// Record the router region's base block.
+    pub fn set_router_base(&mut self, router_base: pg_sys::BlockNumber) {
+        self.router_base = router_base;
     }
 
     pub fn get_next_segment_id(&self) -> u64 {

@@ -43,7 +43,7 @@ const DEFAULT_IVF_LISTS: i32 = 100;
 /// IVF lists probed per query (Phase 3).
 const DEFAULT_IVF_PROBES: i32 = 10;
 
-/// Maximum segments the deterministic router activates per query (Phase 7).
+/// Maximum segments the deterministic router activates per query (active: phase 7).
 const DEFAULT_ROUTER_TOP_M: i32 = 8;
 
 /// Maximum segments activated per logical group (Phase 7).
@@ -356,7 +356,7 @@ pub unsafe fn init() {
     );
     add_int_reloption(
         "router_top_m",
-        "Maximum segments the router activates per query (reserved: phase 7)",
+        "Maximum segments the router activates per query (phase 7)",
         DEFAULT_ROUTER_TOP_M,
         1,
         32768,

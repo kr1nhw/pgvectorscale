@@ -35,6 +35,7 @@ pub mod flat;
 pub mod insert;
 pub mod meta_page;
 pub mod options;
+pub mod router;
 pub mod scan;
 #[cfg(any(test, feature = "pg_test"))]
 pub mod tests;

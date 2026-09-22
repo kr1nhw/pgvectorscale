@@ -20,7 +20,8 @@ use crate::access_method::agentvec::directory::{
 };
 use crate::access_method::agentvec::meta_page::AgentVecMetaPage;
 use crate::access_method::agentvec::options::TSVAgentVecOptions;
-use crate::access_method::distance::DistanceType;
+use crate::access_method::agentvec::router;
+use crate::access_method::distance::{preprocess_cosine, DistanceType};
 use crate::access_method::ivf::centroid::{kmeans_plus_plus_init, lloyds_algorithm};
 use crate::access_method::ivf::centroid_page::IvfCentroidPage;
 use crate::access_method::ivf::entry::{seal_entries, IvfEntry};
@@ -75,10 +76,25 @@ unsafe fn consolidate_inner(index: &PgRelation) -> i64 {
         return 0;
     };
 
-    // Collect the live rows of the embedded region (decoded inline).
+    // Collect the live rows of the embedded region (decoded inline).  For
+    // calibrated layouts the inline bytes clamp: the provisional incremental
+    // calibration collapses every out-of-range component, so the decoded
+    // vectors are unusable for re-encoding — fetch exact vectors from the
+    // heap for those instead (rows that vanished concurrently are dropped).
     let base = code_root.block_number;
     let support = crate::access_method::hnswsq::utils::init_support(index.as_ptr(), base);
-    let rows = crate::access_method::hnswsq::utils::collect_elements(index.as_ptr(), base, &support);
+    let distance_type = meta.get_distance_type();
+    let dim = meta.get_num_dimensions() as usize;
+    let inline_rows =
+        crate::access_method::hnswsq::utils::collect_elements(index.as_ptr(), base, &support);
+    let rows: Vec<(pg_sys::ItemPointerData, Vec<f32>)> = if support.precision.needs_calibration() {
+        inline_rows
+            .into_iter()
+            .filter_map(|(tid, _)| fetch_heap_vector(index, tid, dim, distance_type).map(|v| (tid, v)))
+            .collect()
+    } else {
+        inline_rows
+    };
 
     if rows.is_empty() {
         // Nothing live: just retire the source.
@@ -94,8 +110,6 @@ unsafe fn consolidate_inner(index: &PgRelation) -> i64 {
     }
 
     // Train centroids on a bounded sample, assign, and RaBitQ-encode.
-    let distance_type = meta.get_distance_type();
-    let dim = meta.get_num_dimensions() as usize;
     let lists = options.get_ivf_lists() as usize;
     let num_bits = options.get_rabitq_bits();
     let mut rng = SmallRng::from_entropy();
@@ -125,12 +139,21 @@ unsafe fn consolidate_inner(index: &PgRelation) -> i64 {
         per_list,
     );
 
+    // Publish the segment's centroids to the router Vamana graph *before*
+    // the directory swap: after the swap the segment is always routable,
+    // while a crash before it leaves orphaned centroid nodes that the
+    // router drops by id.  The id is pre-allocated under the meta lock so
+    // the router nodes and the published segment agree even when two
+    // consolidations interleave.
+    let segment_id = AgentVecMetaPage::update(index, |m| m.take_next_segment_id());
+    let router_base = router::ensure_router_region(index, dim as u32);
+    router::add_segment_centroids(index, router_base, segment_id, &centroids);
+
     // Publish: retire the source and add the new WARM segment in ONE
     // directory republication.
     let num_rows = rows.len() as u64;
     AgentVecMetaPage::update(index, |m| {
         let mut directory = m.load_directory(index);
-        let segment_id = m.take_next_segment_id();
         let epoch = m.bump_epoch();
         if let Some(seg) = directory.get_mut(source_id) {
             seg.state = SegmentState::Retired as u8;
@@ -253,4 +276,68 @@ fn reservoir_sample(rows: &[(pg_sys::ItemPointerData, Vec<f32>)], want: usize) -
         }
     }
     sample
+}
+
+/// Fetch the exact heap vector of a live row — the conversion source for
+/// calibrated HOT layouts, whose inline bytes clamp.  Returns `None` when the
+/// row is not visible to the active snapshot (deleted or updated away while
+/// the conversion ran).
+unsafe fn fetch_heap_vector(
+    index: &PgRelation,
+    tid: pg_sys::ItemPointerData,
+    dim: usize,
+    distance_type: DistanceType,
+) -> Option<Vec<f32>> {
+    let heap_rel = pg_sys::table_open(
+        (*(*index.as_ptr()).rd_index).indrelid,
+        pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+    );
+    let result = {
+        // The heap tuple's attnum of the indexed vector column, from the
+        // index catalog's indkey (agentvec supports exactly one indexed
+        // column).  A buffer-heap-tuple slot deforms with ITS descriptor, so
+        // it must be the heap relation's descriptor, and the attnum must be
+        // the vector's position in the heap tuple.
+        let rd_index = (*index.as_ptr()).rd_index;
+        let attnum = *(*rd_index).indkey.values.as_ptr() as i32;
+        let slot = pg_sys::MakeSingleTupleTableSlot(
+            (*heap_rel).rd_att,
+            &pg_sys::TTSOpsBufferHeapTuple,
+        );
+        let mut htup: pg_sys::HeapTupleData = std::mem::zeroed();
+        // PG18's heap_fetch reads the TID from the tuple's t_self.
+        htup.t_self = tid;
+        let mut buffer: pg_sys::Buffer = 0;
+        let got = pg_sys::heap_fetch(
+            heap_rel,
+            pg_sys::GetActiveSnapshot(),
+            &mut htup,
+            &mut buffer,
+            true,
+        );
+        let out = if got {
+            // The slot takes ownership of the buffer pin and releases it on
+            // clear (the canonical heap_fetch + ExecStoreBufferHeapTuple
+            // pattern).
+            pg_sys::ExecStoreBufferHeapTuple(&mut htup, slot, buffer);
+            let mut isnull = false;
+            let datum = pg_sys::slot_getattr(slot, attnum, &mut isnull);
+            if isnull {
+                None
+            } else {
+                let mut vector = super::insert::extract_vector(datum, dim);
+                if distance_type == DistanceType::Cosine {
+                    preprocess_cosine(&mut vector);
+                }
+                Some(vector)
+            }
+        } else {
+            None
+        };
+        // ExecDropSingleTupleTableSlot clears the slot (and the buffer pin).
+        pg_sys::ExecDropSingleTupleTableSlot(slot);
+        out
+    };
+    pg_sys::table_close(heap_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+    result
 }

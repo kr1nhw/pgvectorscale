@@ -284,7 +284,11 @@ pub unsafe fn extract_vector(datum: pg_sys::Datum, expected_dim: usize) -> Vec<f
     let pg_vec = detoasted.cast::<PgVectorInternal>();
     let dim = (*pg_vec).dim as usize;
     let vector = (*pg_vec).to_slice().to_vec();
-    pg_sys::pfree(detoasted.cast());
+    // Some PostgreSQL builds return the original pointer for non-toasted
+    // data; only free what was actually copied.
+    if detoasted != datum.cast_mut_ptr() {
+        pg_sys::pfree(detoasted.cast());
+    }
     if dim != expected_dim {
         error!(
             "agentvec: vector has {} dimensions, index expects {}",

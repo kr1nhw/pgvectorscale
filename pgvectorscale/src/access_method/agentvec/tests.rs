@@ -15,9 +15,11 @@ mod tests {
     use pgrx::*;
 
     use crate::access_method::agentvec::directory::{
-        AgentVecDirectory, AgentVecSegmentHeader, SegmentState,
+        AgentVecDirectory, AgentVecSegmentHeader, SegmentOwnership, SegmentState,
     };
     use crate::access_method::agentvec::meta_page::AgentVecMetaPage;
+    use crate::access_method::agentvec::options::TSVAgentVecOptions;
+    use crate::access_method::agentvec::router;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
@@ -415,6 +417,120 @@ mod tests {
         assert!(
             recall >= 0.9,
             "recall@10 of the converted segments must be >= 0.9, got {recall}"
+        );
+        Ok(())
+    }
+
+    /// The router activates only a subset of the owned WARM segments:
+    /// `router::route` returns the top `router_top_m` segment ids, drawn
+    /// exclusively from owned IvfRaBitQ segments, and its size is capped.
+    #[pg_test]
+    fn test_agentvec_router_returns_segment_subset() -> spi::Result<()> {
+        Spi::run(
+            "CREATE TABLE t_av_route(id int, v vector(8));
+             INSERT INTO t_av_route
+                SELECT g, ('[' || g || ',0,0,0,0,0,0,0]')::vector FROM generate_series(1, 120) AS g;
+             CREATE INDEX idx_av_route ON t_av_route USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_max_rows = 40, router_top_m = 2);",
+        )?;
+
+        // Before any conversion there is no router region: the router must
+        // fall back to "search everything".
+        {
+            let index = index_relation("idx_av_route");
+            let meta = AgentVecMetaPage::fetch(&index);
+            assert_eq!(meta.get_router_base(), 0, "no router region yet");
+            let directory = meta.load_directory(&index);
+            let options = TSVAgentVecOptions::from_relation(&index);
+            let decided = unsafe {
+                router::route(&index, &[0.0; 8], &directory, &options, meta.get_router_base())
+            };
+            assert!(decided.is_none(), "no region means no decision");
+        }
+
+        for _ in 0..2 {
+            assert_eq!(
+                Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_route')")?.expect("n"),
+                40
+            );
+        }
+
+        let index = index_relation("idx_av_route");
+        let meta = AgentVecMetaPage::fetch(&index);
+        let router_base = meta.get_router_base();
+        assert_ne!(router_base, 0, "the router region exists after conversion");
+        let directory = meta.load_directory(&index);
+        let options = TSVAgentVecOptions::from_relation(&index);
+        let warm: Vec<u64> = directory
+            .segments
+            .iter()
+            .filter(|s| {
+                s.algorithm() == crate::access_method::agentvec::directory::SegmentAlgorithm::IvfRaBitQ
+                    && s.ownership() == SegmentOwnership::Owned
+            })
+            .map(|s| s.segment_id)
+            .collect();
+        assert_eq!(warm.len(), 2, "two converted segments");
+
+        let decided = unsafe {
+            router::route(&index, &[0.0; 8], &directory, &options, router_base)
+        }
+        .expect("the router must decide once it has nodes");
+        assert_eq!(decided.len(), 2, "top_m = 2 activates at most 2");
+        assert!(
+            decided.iter().all(|id| warm.contains(id)),
+            "only owned WARM segments may be activated, got {decided:?}"
+        );
+
+        // The routed query still returns exact top-N (2 of 3 segments stay
+        // searchable: 1 HOT + 2 WARM, all activated).
+        force_index_scan();
+        assert_eq!(
+            search_ids("t_av_route", "v", "<->", "[0,0,0,0,0,0,0,0]", 3),
+            vec![1, 2, 3]
+        );
+        Ok(())
+    }
+
+    /// Recall of routed queries: with more WARM segments than `router_top_m`,
+    /// the router prunes segment searches and the results stay good.
+    #[pg_test]
+    fn test_agentvec_router_multi_segment_recall() -> spi::Result<()> {
+        let (rows, queries) = gen_clustered(6, 60, 16, 0.6, 131313);
+        let values = rows
+            .iter()
+            .map(|v| format!("('{}')", vec_literal(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        Spi::run(&format!(
+            "CREATE TABLE t_av_rr(id serial primary key, v vector(16));
+             INSERT INTO t_av_rr(v) VALUES {values};
+             CREATE INDEX idx_av_rr ON t_av_rr USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_max_rows = 60, ivf_lists = 8, ivf_probes = 8,
+                      router_top_m = 3);"
+        ))?;
+        force_index_scan();
+
+        // 360 rows: five sealed segments, each converted (the sixth stays HOT).
+        for _ in 0..5 {
+            assert_eq!(
+                Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_rr')")?.expect("n"),
+                60
+            );
+        }
+
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for q in &queries {
+            let exact = exact_topk(&rows, q, 10);
+            let got = search_ids("t_av_rr", "v", "<->", &vec_literal(q), 10);
+            total += 10;
+            hits += got.iter().filter(|id| exact.contains(&(**id as usize))).count();
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(
+            recall >= 0.85,
+            "recall@10 with 3 of 5 WARM segments routed must be >= 0.85, got {recall}"
         );
         Ok(())
     }

@@ -23,10 +23,13 @@ use std::collections::BinaryHeap;
 
 use pgrx::*;
 
-use crate::access_method::agentvec::directory::{AgentVecSegmentHeader, SegmentAlgorithm};
+use crate::access_method::agentvec::directory::{
+    AgentVecSegmentHeader, SegmentAlgorithm, SegmentOwnership,
+};
 use crate::access_method::agentvec::flat;
 use crate::access_method::agentvec::meta_page::AgentVecMetaPage;
 use crate::access_method::agentvec::options::TSVAgentVecOptions;
+use crate::access_method::agentvec::router;
 use crate::access_method::distance::{preprocess_cosine, DistanceType};
 use crate::access_method::hnswsq::options::{HNSW_EF_SEARCH, HNSW_SQ8_DISTANCE};
 use crate::access_method::hnswsq::quantize::HnswPrecision;
@@ -106,7 +109,9 @@ unsafe fn extract_query_vector(datum: pg_sys::Datum, distance_type: DistanceType
     let detoasted = pg_sys::pg_detoast_datum_copy(datum.cast_mut_ptr());
     let pg_vec = detoasted.cast::<PgVectorInternal>();
     let mut vector = (*pg_vec).to_slice().to_vec();
-    pg_sys::pfree(detoasted.cast());
+    if detoasted != datum.cast_mut_ptr() {
+        pg_sys::pfree(detoasted.cast());
+    }
 
     if distance_type == DistanceType::Cosine {
         preprocess_cosine(&mut vector);
@@ -183,6 +188,17 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
     let norm_q = state.query.iter().map(|x| x * x).sum::<f32>().sqrt();
 
     let directory = meta.load_directory(&index_rel);
+    // The deterministic router (phase 3.5): navigate the centroid Vamana
+    // graph once per scan and activate only the top `router_top_m` owned IVF
+    // segments.  HOT/FLAT segments are always searched; external segments
+    // have no owned centroids and are activated as a whole.
+    let routed = router::route(
+        &index_rel,
+        &state.query,
+        &directory,
+        &options,
+        meta.get_router_base(),
+    );
     let mut all: Vec<(f64, ItemPointer, bool)> = Vec::new();
     let mut heap: BinaryHeap<DistTid> = BinaryHeap::new();
     // Reused across entries so the scan performs one allocation, not one per
@@ -300,6 +316,15 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
                 }
             }
             SegmentAlgorithm::IvfRaBitQ => {
+                // The router may have deactivated this segment: `route`
+                // returns None (search all) when it cannot decide.
+                if segment.ownership() == SegmentOwnership::Owned {
+                    if let Some(active) = &routed {
+                        if !active.contains(&segment.segment_id) {
+                            continue;
+                        }
+                    }
+                }
                 // The immutable IVF payload: the same composition the ivf AM
                 // scan performs, over the embedded region's meta/centroids/
                 // list directory.
