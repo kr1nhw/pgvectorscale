@@ -67,8 +67,25 @@ Known gaps (phase-8 territory, documented not hidden):
 * Recall caps at ~0.93 (ivf_lists=100 partition quality on 1M rows);
   `lists`/`probes` tuning plus the phase-12 recoding raise it.
 
-## 4. Remaining runs
+## 4. aarch64 parity (116.204.102.142, 16 vCPU, PG 17.11 release)
 
-* 100M A/B on 113.44.106.182 (hnswsq plain baseline building ~2 h; agentvec
-  bulk build + recall/latency queued after it).
-* aarch64 (116.204.102.142) release build done; parity run pending.
+Same 1M dataset (subset of the box's 10M BIGANN table; exact top-10
+ground truth computed within the 1M subset in SQL).  Release build of the
+same commit.
+
+| config | build s | size bytes | recall@10 ef10/40/160/640 | q0 ef40 ms (3 runs) |
+|---|---|---|---|---|
+| hnswsq plain | 209 | 819,216,384 | 0.781 / 0.942 / 0.993 / 1.000 | 6.35 / 4.19 / 4.13 |
+| agentvec HOT plain | 213 (1.02x) | 819,249,152 | 0.776 / 0.939 / 0.993 / 1.000 | 8.48 / 4.40 / 4.39 |
+
+Build 1.02x, size identical (+32 KB), recall/latency parity — the
+"not worse than hnswsq" goal holds on aarch64 too.  (The first attempt on
+this box OOM-killed exactly like the old x86 builds because its extension
+predated the leak fixes; rebuilt from the fixed commit.)
+
+## 5. Remaining run
+
+* 100M A/B on 113.44.106.182 (hnswsq plain baseline ~2 h + agentvec bulk
+  build + recall/latency queued after it) — in flight; the box was
+  unreachable from the office network at collection time, results to be
+  appended when access returns.
