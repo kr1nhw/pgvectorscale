@@ -285,34 +285,92 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
                     qstate.as_ref(),
                     &mut tuples,
                 );
-                let exact = support.precision == HnswPrecision::Plain;
                 // The search returns furthest-first; drain from the back so
                 // candidates enter the merge in ascending bound order.
-                for sc in candidates.into_iter().rev() {
-                    let element =
-                        crate::access_method::hnswsq::ptr::access::<Element>(
-                            std::ptr::null_mut(),
-                            sc.element,
-                        );
-                    if (*element).deleted != 0 {
-                        continue;
-                    }
-                    let dist =
-                        crate::access_method::hnswsq::scan::emit_candidate(
+                if let Some(k) = bound {
+                    // Bounded scans rerank every segment exactly: keep the
+                    // top-k by the quantized bound, heap-fetch their vectors,
+                    // and emit exact distances — the whole stream is then
+                    // exact (no mixed recheckorderby, which the executor's
+                    // reorder machinery does not support).
+                    let mut est_heap: BinaryHeap<DistTid> = BinaryHeap::new();
+                    for sc in candidates.into_iter().rev() {
+                        let element =
+                            crate::access_method::hnswsq::ptr::access::<Element>(
+                                std::ptr::null_mut(),
+                                sc.element,
+                            );
+                        if (*element).deleted != 0 {
+                            continue;
+                        }
+                        let dist = crate::access_method::hnswsq::scan::emit_candidate(
                             &support,
                             &state.query,
                             norm_q,
                             &sc,
                         );
-                    push(
-                        &mut all,
-                        &mut heap,
-                        DistTid {
+                        let cand = DistTid {
                             dist,
                             tid: ItemPointer::with_item_pointer_data((*element).heaptid),
-                            exact,
-                        },
-                    );
+                            exact: false,
+                        };
+                        if est_heap.len() < k {
+                            est_heap.push(cand);
+                        } else if let Some(mut worst) = est_heap.peek_mut() {
+                            if cand.dist < worst.dist {
+                                *worst = cand;
+                            }
+                        }
+                    }
+                    for cand in est_heap {
+                        let mut tid_data = pg_sys::ItemPointerData::default();
+                        cand.tid.to_item_pointer_data(&mut tid_data);
+                        if let Some(vector) = super::insert::fetch_heap_vector(
+                            &index_rel,
+                            tid_data,
+                            dim,
+                            meta.get_distance_type(),
+                        ) {
+                            let dist = distance_fn(&state.query, &vector);
+                            push(
+                                &mut all,
+                                &mut heap,
+                                DistTid {
+                                    dist: dist as f64,
+                                    tid: cand.tid,
+                                    exact: true,
+                                },
+                            );
+                        }
+                    }
+                } else {
+                    let exact = support.precision == HnswPrecision::Plain;
+                    for sc in candidates.into_iter().rev() {
+                        let element =
+                            crate::access_method::hnswsq::ptr::access::<Element>(
+                                std::ptr::null_mut(),
+                                sc.element,
+                            );
+                        if (*element).deleted != 0 {
+                            continue;
+                        }
+                        let dist =
+                            crate::access_method::hnswsq::scan::emit_candidate(
+                                &support,
+                                &state.query,
+                                norm_q,
+                                &sc,
+                            );
+                        push(
+                            &mut all,
+                            &mut heap,
+                            DistTid {
+                                dist,
+                                tid: ItemPointer::with_item_pointer_data((*element).heaptid),
+                                exact,
+                            },
+                        );
+                    }
                 }
             }
             SegmentAlgorithm::IvfRaBitQ => {
@@ -449,6 +507,18 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
             .map(|c| (c.dist, c.tid, c.exact))
             .collect(),
     };
+    // Mixed scans must not mix tuples with and without `xs_recheckorderby`:
+    // the executor's `IndexNextWithReorder` calls `cmp_orderbyvals` on every
+    // tuple it pulls while reordering and dereferences `xs_orderbyvals`
+    // (NULL for exact tuples) — a bulk IVF segment (exact emission-time
+    // rerank) plus a quantized HOT segment in one scan segfaults otherwise.
+    // When any candidate is approximate, downgrade the whole stream: the
+    // exact distances stay exact, they just become orderby hints.
+    if state.results.iter().any(|(_, _, exact)| !exact) {
+        for entry in state.results.iter_mut() {
+            entry.2 = false;
+        }
+    }
     state.results_computed = true;
 }
 

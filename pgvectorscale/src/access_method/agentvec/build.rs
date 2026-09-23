@@ -54,16 +54,30 @@ unsafe fn write_empty_index(index_rel: &PgRelation, distance_type: DistanceType,
     insert::open_initial_hot_segment(index_rel);
 }
 
+/// Finish a build: record the row count and launch the maintenance worker.
+unsafe fn return_finish(
+    index_rel: &PgRelation,
+    reltuples: f64,
+    indtuples: f64,
+) -> *mut pg_sys::IndexBuildResult {
+    AgentVecMetaPage::update(index_rel, |meta| {
+        meta.set_num_tuples(reltuples as u64);
+    });
+    crate::access_method::agentvec::maintenance::launch_worker_for_current_database();
+    let mut result = PgBox::<pg_sys::IndexBuildResult>::alloc0();
+    result.heap_tuples = reltuples;
+    result.index_tuples = indtuples;
+    result.into_pg()
+}
+
 /// Build a new AgentVec index over an existing heap.
 ///
-/// The initial HOT segment is built with the hnswsq **bulk** builder
-/// (`hnswsq::build::build_region`) into a region whose base is the relation
-/// end — the same streaming two-pass build the standalone AM uses, so CREATE
-/// INDEX keeps the hnswsq build speed instead of paying the per-row insert
-/// path.  If the heap exceeds `hot_segment_max_rows` the segment is sealed
-/// immediately (QueuedForMigration) and the first later insert opens a fresh
-/// HOT segment; otherwise it stays the active HOT segment exactly like the
-/// incremental path's.
+/// The bulk load builds the payload DIRECTLY as an immutable IVF-RaBitQ
+/// segment (the `ivf` AM's streaming two-pass build, Lance-style: reservoir
+/// sample -> k-means -> per-list batched seal, memory bounded by
+/// `num_lists x SEGMENT_ENTRIES`).  The HNSW HOT path is only for live
+/// inserts (`aminsert`), whose sealed segments the maintenance worker
+/// later converts into further WARM segments.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambuild(
     heap: pg_sys::Relation,
@@ -71,8 +85,10 @@ pub unsafe extern "C-unwind" fn ambuild(
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
     use crate::access_method::agentvec::directory::{
-        AgentVecSegmentHeader, AgentVecSegmentMeta, SegmentAlgorithm, SegmentLevel, SegmentState,
+        AgentVecSegmentHeader, AgentVecSegmentMeta, SegmentAlgorithm, SegmentLevel,
+        SegmentOwnership, SegmentState,
     };
+    use crate::access_method::agentvec::consolidate::SEGMENT_FORMAT_IVF_V1;
     use crate::access_method::agentvec::insert::SEGMENT_FORMAT_HNSW_V1;
 
     let heap_rel = PgRelation::from_pg(heap);
@@ -82,88 +98,141 @@ pub unsafe extern "C-unwind" fn ambuild(
     let num_dimensions = index_dimensions(&index_rel);
     let options = TSVAgentVecOptions::from_relation(&index_rel);
 
-    // Scaffold: meta page (block 0); the region is built FIRST so its base
-    // is exactly the relation end (create_meta_page asserts it).  The
-    // segment header + directory items are written after the region — their
-    // placement is irrelevant, only the pointers matter.
+    // Scaffold: meta page (block 0); the payload region starts at the
+    // relation end right after it.
     AgentVecMetaPage::create(&index_rel, num_dimensions as u32, distance_type);
     let base = pg_sys::RelationGetNumberOfBlocksInFork(
         index_rel.as_ptr(),
         pg_sys::ForkNumber::MAIN_FORKNUM,
     );
 
-
-    // The bulk build into the embedded region (also writes the region's
-    // metapage and, for calibrated layouts, the trained calibration chain).
-    let (reltuples, indtuples) = crate::access_method::hnswsq::build::build_region(
-        Some(heap_rel.as_ptr()),
-        index_rel.as_ptr(),
-        index_info,
-        base,
-        options.get_hot_m(),
-        options.get_hot_ef_construction(),
-        options.get_hot_precision(),
-        30_000,
-    );
-
-    // Publish the HOT segment that owns the region.
-    let segment_id = AgentVecMetaPage::update(&index_rel, |meta| {
-        let mut directory = meta.load_directory(&index_rel);
-        let segment_id = meta.take_next_segment_id();
-        let header = AgentVecSegmentHeader::new(SegmentLevel::Hot, SegmentAlgorithm::Hnsw);
-        let header_pointer = header.store_new(&index_rel);
-        let mut seg = AgentVecSegmentMeta::new(
-            segment_id,
-            0,
-            SegmentLevel::Hot,
-            SegmentState::Published,
-            SegmentAlgorithm::Hnsw,
-            crate::access_method::agentvec::directory::SegmentOwnership::Owned,
-            meta.get_epoch(),
-            header_pointer,
-            distance_type as u16,
-            num_dimensions as u32,
-            SEGMENT_FORMAT_HNSW_V1,
+    // RaBitQ needs >= 8 dimensions (its 1-bit rotation layout); tiny-dim
+    // indexes bulk-build an HNSW HOT segment instead (the incremental
+    // path's limits are irrelevant at these sizes).
+    if num_dimensions < 8 {
+        let (reltuples, indtuples) = crate::access_method::hnswsq::build::build_region(
+            Some(heap_rel.as_ptr()),
+            index_rel.as_ptr(),
+            index_info,
+            base,
+            options.get_hot_m(),
+            options.get_hot_ef_construction(),
+            options.get_hot_precision(),
+            30_000,
         );
-        seg.code_root = ItemPointer::new(base, 1);
-        directory.segments.push(seg);
-        let (ptr, blocks) = directory.store(&index_rel);
-        meta.set_directory(ptr, blocks);
-        meta.set_hot_segment_id(segment_id);
-        segment_id
-    });
-
-    // Record the row counts; seal immediately when the segment exceeds the
-    // HOT cap (a later insert opens the successor HOT segment).
-    let seal = indtuples as u64 >= options.get_hot_segment_max_rows();
-    let header_block = AgentVecMetaPage::fetch(&index_rel)
-        .load_directory(&index_rel)
-        .get(segment_id)
-        .map(|seg| seg.header.block_number)
-        .expect("segment just created");
-    AgentVecSegmentHeader::update(&index_rel, header_block, |header| {
-        header.num_entries = indtuples as u64;
-    });
-    AgentVecMetaPage::update(&index_rel, |meta| {
-        meta.set_num_tuples(reltuples as u64);
-        if seal {
+        let segment_id = AgentVecMetaPage::update(&index_rel, |meta| {
             let mut directory = meta.load_directory(&index_rel);
-            if let Some(seg) = directory.get_mut(segment_id) {
-                seg.state = SegmentState::QueuedForMigration as u8;
-            }
+            let segment_id = meta.take_next_segment_id();
+            let header = AgentVecSegmentHeader::new(SegmentLevel::Hot, SegmentAlgorithm::Hnsw);
+            let header_pointer = header.store_new(&index_rel);
+            let mut seg = AgentVecSegmentMeta::new(
+                segment_id,
+                0,
+                SegmentLevel::Hot,
+                SegmentState::Published,
+                SegmentAlgorithm::Hnsw,
+                SegmentOwnership::Owned,
+                meta.get_epoch(),
+                header_pointer,
+                distance_type as u16,
+                num_dimensions as u32,
+                SEGMENT_FORMAT_HNSW_V1,
+            );
+            seg.code_root = ItemPointer::new(base, 1);
+            directory.segments.push(seg);
             let (ptr, blocks) = directory.store(&index_rel);
             meta.set_directory(ptr, blocks);
+            meta.set_hot_segment_id(segment_id);
+            segment_id
+        });
+        AgentVecSegmentHeader::update(&index_rel, {
+            AgentVecMetaPage::fetch(&index_rel)
+                .load_directory(&index_rel)
+                .get(segment_id)
+                .expect("segment just created")
+                .header
+                .block_number
+        }, |header| {
+            header.num_entries = indtuples as u64;
+        });
+        return return_finish(&index_rel, reltuples, indtuples);
+    }
+    let (reltuples, indtuples, centroids, directory_ptr) =
+        crate::access_method::ivf::build::build_embedded_region(
+            heap_rel.as_ptr(),
+            index_rel.as_ptr(),
+            index_info,
+            base,
+            options.get_ivf_lists() as usize,
+            options.get_rabitq_bits(),
+            distance_type,
+            30_000,
+        );
+
+    let bulk_segment_id = if indtuples > 0.0 {
+        // Publish the bulk payload as a WARM IVF-RaBitQ segment.
+        let segment_id = AgentVecMetaPage::update(&index_rel, |meta| {
+            let mut directory = meta.load_directory(&index_rel);
+            let segment_id = meta.take_next_segment_id();
+            let header =
+                AgentVecSegmentHeader::new(SegmentLevel::Warm, SegmentAlgorithm::IvfRaBitQ);
+            let header_pointer = header.store_new(&index_rel);
+            let mut seg = AgentVecSegmentMeta::new(
+                segment_id,
+                0,
+                SegmentLevel::Warm,
+                SegmentState::Published,
+                SegmentAlgorithm::IvfRaBitQ,
+                SegmentOwnership::Owned,
+                meta.get_epoch(),
+                header_pointer,
+                distance_type as u16,
+                num_dimensions as u32,
+                SEGMENT_FORMAT_IVF_V1,
+            );
+            seg.code_root = ItemPointer::new(base, 1);
+            seg.posting_root = directory_ptr;
+            seg.vector_count = indtuples as u64;
+            directory.segments.push(seg);
+            let (ptr, blocks) = directory.store(&index_rel);
+            meta.set_directory(ptr, blocks);
+            segment_id
+        });
+        AgentVecSegmentHeader::update(&index_rel, {
+            AgentVecMetaPage::fetch(&index_rel)
+                .load_directory(&index_rel)
+                .get(segment_id)
+                .expect("segment just created")
+                .header
+                .block_number
+        }, |header| {
+            header.num_entries = indtuples as u64;
+        });
+
+        // Register the segment's centroids in the router Vamana graph.
+        if !centroids.is_empty() {
+            let router_base = crate::access_method::agentvec::router::ensure_router_region(
+                &index_rel,
+                num_dimensions as u32,
+            );
+            crate::access_method::agentvec::router::add_segment_centroids(
+                &index_rel,
+                router_base,
+                segment_id,
+                &centroids,
+            );
         }
-    });
+        Some(segment_id)
+    } else {
+        None
+    };
 
-    // Phase 4: make sure this database has a maintenance worker (no-op when
-    // one is already running or dynamic background workers are unavailable).
-    crate::access_method::agentvec::maintenance::launch_worker_for_current_database();
+    // Always open an empty HOT segment for live inserts (the design's
+    // invariant: a HOT segment exists from day one; bulk rows never go
+    // through it).
+    let _hot_id = insert::open_initial_hot_segment(&index_rel);
 
-    let mut result = PgBox::<pg_sys::IndexBuildResult>::alloc0();
-    result.heap_tuples = reltuples;
-    result.index_tuples = indtuples;
-    result.into_pg()
+    return_finish(&index_rel, reltuples, indtuples)
 }
 
 /// Build an empty index image.

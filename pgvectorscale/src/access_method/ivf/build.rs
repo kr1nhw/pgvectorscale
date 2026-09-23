@@ -10,6 +10,7 @@ use crate::access_method::distance::DistanceType;
 use crate::access_method::ivf::centroid::{kmeans_plus_plus_init, lloyds_algorithm};
 use crate::access_method::ivf::centroid_page::IvfCentroidPage;
 use crate::access_method::ivf::entry::{seal_entries, IvfEntry};
+use crate::access_method::storage::StorageType;
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::{IvfMetaPage, IVF_STANDALONE_BASE};
 use crate::access_method::ivf::options::TSVIvfOptions;
@@ -212,6 +213,133 @@ pub unsafe extern "C-unwind" fn ambuild(
     pg_result.heap_tuples = reltuples;
     pg_result.index_tuples = num_tuples as f64;
     pg_result.into_pg()
+}
+
+/// The same streaming two-pass build, into an EMBEDDED region at `base`
+/// (AgentVec's bulk path: `ambuild` builds the payload directly as an
+/// immutable IVF-RaBitQ segment instead of streaming rows through the
+/// incremental HNSW HOT path).  Lance-style memory model: pass 1 keeps only
+/// a reservoir sample for K-means, pass 2 assigns/quantizes/seals rows in
+/// per-list batches (`SEGMENT_ENTRIES` in flight per list) — a 100M-row
+/// build needs ~`num_lists × SEGMENT_ENTRIES` entries of memory, not the
+/// dataset.  Returns the row counts, the trained centroids (the caller
+/// registers them in its router), and the list-directory pointer.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn build_embedded_region(
+    heap: pg_sys::Relation,
+    index: pg_sys::Relation,
+    index_info: *mut pg_sys::IndexInfo,
+    base: pg_sys::BlockNumber,
+    num_lists: usize,
+    num_bits: u8,
+    distance_type: DistanceType,
+    sample_size: usize,
+) -> (f64, f64, Vec<Vec<f32>>, ItemPointer) {
+    let heap_rel = PgRelation::from_pg(heap);
+    let index_rel = PgRelation::from_pg(index);
+
+    // ---- Pass 1: reservoir-sample the heap (bounded memory). ----
+    let mut sample_state = SampleState {
+        sample: Vec::with_capacity(sample_size.min(DEFAULT_SAMPLE_SIZE)),
+        sample_size,
+        nrows: 0,
+        rng: SmallRng::from_entropy(),
+    };
+    pg_sys::IndexBuildHeapScan(
+        heap_rel.as_ptr(),
+        index_rel.as_ptr(),
+        index_info,
+        Some(sample_callback),
+        &mut sample_state,
+    );
+    let reltuples = sample_state.nrows as f64;
+
+    if sample_state.sample.is_empty() {
+        return (reltuples, 0.0, Vec::new(), ItemPointer::new_invalid());
+    }
+
+    // ---- K-means on the sample. ----
+    let mut rng = SmallRng::from_entropy();
+    let rotation_seed: u64 = rng.gen();
+    let quantizer = RabitqQuantizer::new(num_bits, rotation_seed, index_rel
+        .tuple_desc().get(0).map(|a| a.atttypmod as usize).unwrap_or(0));
+    let mut centroids = kmeans_plus_plus_init(&sample_state.sample, num_lists, distance_type);
+    centroids = lloyds_algorithm(
+        &sample_state.sample,
+        &mut centroids,
+        MAX_KMEANS_ITERATIONS,
+        distance_type,
+    );
+    drop(sample_state);
+
+    // ---- Write meta + centroid page at the embedded base. ----
+    let mut meta_page = IvfMetaPage::create(
+        &index_rel,
+        base,
+        index_rel.tuple_desc().get(0).map(|a| a.atttypmod as usize).unwrap_or(0) as u32,
+        distance_type,
+        num_lists as u16,
+        StorageType::RabitqCompression,
+        num_bits,
+        rotation_seed,
+    );
+    let mut list_directory = IvfListDirectory::new(num_lists as u16);
+    let centroid_page = IvfCentroidPage::new(centroids.clone());
+    let centroid_ptr = centroid_page.store(&index_rel, None);
+    meta_page.set_centroids_pointer(centroid_ptr);
+
+    // ---- Pass 2: assign + quantize + seal in per-list batches. ----
+    let mut assign_state = AssignState {
+        centroids,
+        quantizer,
+        distance_type,
+        index: index_rel.as_ptr(),
+        list_buffers: (0..num_lists).map(|_| Vec::new()).collect(),
+        segments: (0..num_lists).map(|_| Vec::new()).collect(),
+    };
+    pg_sys::IndexBuildHeapScan(
+        heap_rel.as_ptr(),
+        index_rel.as_ptr(),
+        index_info,
+        Some(assign_callback),
+        &mut assign_state,
+    );
+
+    // Flush the remaining per-list buffers and publish one segment list +
+    // header per list.
+    let mut num_tuples = 0u64;
+    for list_id in 0..num_lists {
+        let entries = std::mem::take(&mut assign_state.list_buffers[list_id]);
+        if !entries.is_empty() {
+            let segment = seal_entries(&index_rel, entries);
+            if !segment.is_empty() {
+                assign_state.segments[list_id].push(segment);
+            }
+        }
+        let count: u64 = assign_state.segments[list_id]
+            .iter()
+            .map(|s| s.num_entries)
+            .sum();
+        num_tuples += count;
+
+        let segment_list = IvfSegmentList::new(std::mem::take(&mut assign_state.segments[list_id]));
+        let (segment_list_ptr, segment_list_blocks) = segment_list.store(&index_rel);
+        let header = IvfListHeader::new(segment_list_ptr, segment_list_blocks);
+        let header_ptr = header.store_new(&index_rel);
+        if let Some(list_meta) = list_directory.get_list_mut(list_id as u16) {
+            list_meta.header = header_ptr;
+            list_meta.num_tuples = count;
+        }
+    }
+
+    let (list_directory_ptr, _blocks) = list_directory.store_new(&index_rel);
+    meta_page.set_list_directory_pointer(list_directory_ptr);
+    meta_page.store(&index_rel, base, false);
+
+    // Bulk smgr scans need the built entry blocks on disk first.
+    pg_sys::FlushRelationBuffers(index_rel.as_ptr());
+
+    (reltuples, num_tuples as f64, assign_state.centroids, list_directory_ptr)
 }
 
 /// Pass-1 callback: reservoir sampling (Algorithm R) with a row counter.
