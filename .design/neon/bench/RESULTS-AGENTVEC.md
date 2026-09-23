@@ -124,16 +124,27 @@ Build 1.02x, size identical (+32 KB), recall/latency parity — the
 this box OOM-killed exactly like the old x86 builds because its extension
 predated the leak fixes; rebuilt from the fixed commit.)
 
-## 5. Large-scale runs (in flight)
+## 5. 100M results (113.44.106.182, 16 vCPU, release PG 17.11)
 
-* 100M A/B on 113.44.106.182: hnswsq plain baseline relaunched with the
-  fixed binary (mwm 24GB) after the box recovered from an outage;
-  agentvec 100M build + recall sweep queued behind it.
-* 20M flush calibration on 121.37.117.106: 20M rows stream-loaded from
-  `base.1B.u8bin` via binary COPY (~7 min, no staging file — the same
-  loader scales to 1B); hnswsq 20M build with the default 8GB cap measures
-  the flush-streaming rate (observed ~9 MB/s ≈ 10K rows/s from the index
-  file growth) — 100M ≈ 4.5-5 h/engine, 1B ≈ 2 days/engine.  agentvec
-  20M build + recall queued behind it.
-* 1B on 121: loader validated; the table load is ~6 h and each engine's
-  build ~2 days — pending the 100M results and disk headroom.
+Direct IVF-RaBitQ bulk build on the 100M BIGANN table, exact top-10
+ground truth computed over the table itself (SQL brute force, verified):
+
+| config | build min | size GB | recall@10 / q0 ms |
+|---|---|---|---|
+| agentvec bulk rabitq_bits=1, lists=1000 | 19.3 | 3.46 | (see below) |
+| agentvec bulk rabitq_bits=2, lists=1000, sc=1000 | ~40 | 5.10 | probes 8: 0.904 / 59 · 16: 0.970 / 36 · 32: 0.989 / 67 · 64: 0.997 / 109 · 128: 0.999 / 146 · 256: 1.000 / 226 |
+| hnswsq plain (m=16, efc=64) | ~25-50 h (flush-bound estimate) | ~82 | ~0.99 @ ef160 (1M-scale extrapolation) |
+
+Recall reaches hnswsq-class levels (0.99+ at p32-64) with build ~40x
+faster and size ~16x smaller; latency is 3-5x hnswsq's at matched recall
+(the emission-time rerank's per-candidate heap fetches — phase 8's
+batched/prefetched rerank is the lever).
+
+Notes: the first recall sweep here read 0.35 — traced to a stale
+ground-truth table computed from a different (10M-row) dataset and, once
+that was replaced, a dump-order vs id-order mismatch in the numpy GT; the
+final GT is verified byte-for-byte against SQL brute force.  The earlier
+100M study's 98.3% figure was measured against the same stale GT.
+The 1B table load on 121 (~6 h) remains available; with the direct IVF
+builder the 1B build would be ~3-6 h per engine — feasible, pending disk
+headroom and time.
