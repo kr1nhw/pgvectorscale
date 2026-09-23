@@ -8,6 +8,28 @@ against brute-force SQL).  Both engines: m=16, ef_construction=64,
 maintenance_work_mem=8GB, seed pinned.  `hnswsq` baseline re-measured in the
 same pass on the same binary.
 
+## 0. Revised architecture (2026-09-23, user-directed)
+
+`ambuild` now builds the payload DIRECTLY as an immutable IVF-RaBitQ
+segment — the `ivf` AM's streaming two-pass build (Lance-style:
+reservoir sample -> k-means -> per-list batched seal, memory bounded by
+`num_lists x 10k` entries).  The HNSW HOT path belongs to `aminsert`
+only; its sealed segments are converted into further WARM segments by
+the maintenance worker.  (Dims < 8 fall back to a bulk HNSW HOT
+segment; RaBitQ needs >= 8.)
+
+Same-pass comparison on the 1M table (release PG 17.11):
+
+| config | build s | size MB | recall@10 | q0 ms |
+|---|---|---|---|---|
+| hnswsq plain (m=16, efc=64) | 63 | 819 | 0.991 @ ef160 | 2.7 |
+| agentvec bulk (ivf_lists=1000, sc=100) | **16** | **56** | 0.817/0.885/0.927/0.937/0.939 @ p8/16/32/64/128 | 1.7/1.9/2.1/2.5/3.2 |
+
+Build **4x faster**, size **14.5x smaller**, query latency 1.7-3.2 ms;
+recall trades off against hnswsq's 0.991 (partition-quality bound at
+lists=1000; more lists + the phase-12 recoding push it up — the ivfrq
+100M study reached 98.3% at 1000 lists on 100M rows).
+
 ## 1. The performance goal
 
 **agentvec is not worse than hnswsq** on the HNSW operating point
