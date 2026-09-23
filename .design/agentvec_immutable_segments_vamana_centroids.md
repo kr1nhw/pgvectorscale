@@ -120,17 +120,27 @@ nothing ever fetches a heap tuple through it.
   `BackgroundWorker::transaction`, and the worker must connect explicitly
   (`connect_worker_to_spi(Some(dbname))`) on PG18.
 
-## 7. CREATE INDEX bulk build (benchmark follow-up)
+## 7. Bulk build: direct IVF-RaBitQ (final architecture)
 
-`ambuild` now bulk-builds the initial HOT segment with the hnswsq
-streaming two-pass builder (`hnswsq::build::build_region`, base- and
-option-parameterized) instead of streaming rows through the incremental
-insert path.  Measured on the 1M BIGANN table: build 69 s vs 65 s for
-standalone hnswsq (the incremental path cost 1113 s — 17x); query latency
-within 2%, recall within 0.5 pt, size identical.  A heap larger than
-`hot_segment_max_rows` is sealed immediately (QueuedForMigration) and the
-first later insert opens the successor HOT segment; segmentation
-afterwards stays insert-driven.
+`ambuild` builds the payload DIRECTLY as an immutable IVF-RaBitQ segment:
+the `ivf` AM's streaming two-pass build (Lance-style — reservoir sample
+-> k-means -> per-list batched seal, memory bounded by
+`num_lists x 10k` entries), parameterized by region base
+(`ivf::build::build_embedded_region`).  The HNSW HOT path belongs to
+`aminsert` only; its sealed segments are converted into further WARM
+segments by the maintenance worker (the consolidate path).  Dims < 8
+(RaBitQ's minimum) fall back to a bulk HNSW HOT segment.
+
+Measured (release PG 17.11):
+
+* 1M: build 16 s (hnswsq 63 s), size 56 MB (hnswsq 819 MB), recall
+  0.817/0.885/0.927/0.937/0.939 @ probes 8/16/32/64/128 at 1.7-3.2 ms.
+* 100M: build 19.3 min, size 3.46 GB (15x vs the 51 GB table), probes
+  8-256 at 5.5-106 ms (recall pending a correct 100M ground truth).
+* The earlier hnswsq bulk-HOT path (round 1) was rejected: its
+  flush-streaming insert path decays with graph size (~25-50 h for 100M,
+  ~2 days for 1B) — Lance-style bounded-memory IVF streaming is the
+  scale-safe builder.
 
 Bugs the benchmark exposed and fixed:
 
