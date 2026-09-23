@@ -102,9 +102,16 @@ Build 1.02x, size identical (+32 KB), recall/latency parity — the
 this box OOM-killed exactly like the old x86 builds because its extension
 predated the leak fixes; rebuilt from the fixed commit.)
 
-## 5. Remaining run
+## 5. Large-scale runs (in flight)
 
-* 100M A/B on 113.44.106.182 (hnswsq plain baseline ~2 h + agentvec bulk
-  build + recall/latency queued after it) — in flight; the box was
-  unreachable from the office network at collection time, results to be
-  appended when access returns.
+* 100M A/B on 113.44.106.182: hnswsq plain baseline relaunched with the
+  fixed binary (mwm 24GB) after the box recovered from an outage;
+  agentvec 100M build + recall sweep queued behind it.
+* 20M flush calibration on 121.37.117.106: 20M rows stream-loaded from
+  `base.1B.u8bin` via binary COPY (~7 min, no staging file — the same
+  loader scales to 1B); hnswsq 20M build with the default 8GB cap measures
+  the flush-streaming rate (observed ~9 MB/s ≈ 10K rows/s from the index
+  file growth) — 100M ≈ 4.5-5 h/engine, 1B ≈ 2 days/engine.  agentvec
+  20M build + recall queued behind it.
+* 1B on 121: loader validated; the table load is ~6 h and each engine's
+  build ~2 days — pending the 100M results and disk headroom.
