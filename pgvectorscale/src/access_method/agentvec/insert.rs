@@ -430,10 +430,12 @@ pub unsafe fn fetch_heap_vector(
             true,
         );
         let out = if got {
-            // The slot takes ownership of the buffer pin and releases it on
-            // clear (the canonical heap_fetch + ExecStoreBufferHeapTuple
-            // pattern).
-            pg_sys::ExecStoreBufferHeapTuple(&mut htup, slot, buffer);
+            // Transfer OUR heap_fetch pin to the slot (ExecStorePinnedBufferHeapTuple,
+            // transfer_pin=true): plain ExecStoreBufferHeapTuple pins the buffer
+            // AGAIN in PG17.11+/PG18, and the clear below then releases only that
+            // second pin — leaking the heap_fetch pin (one per fetched candidate,
+            // "resource was not closed" warnings at statement end).
+            pg_sys::ExecStorePinnedBufferHeapTuple(&mut htup, slot, buffer);
             let mut isnull = false;
             let datum = pg_sys::slot_getattr(slot, attnum, &mut isnull);
             if isnull {
@@ -448,8 +450,7 @@ pub unsafe fn fetch_heap_vector(
         } else {
             None
         };
-        // Release the heap pin explicitly (PG18's ExecDropSingleTupleTableSlot
-        // does not guarantee the clear path).
+        // Release the slot's pin (the transferred heap_fetch pin) explicitly.
         pg_sys::ExecClearTuple(slot);
         pg_sys::ExecDropSingleTupleTableSlot(slot);
         out
