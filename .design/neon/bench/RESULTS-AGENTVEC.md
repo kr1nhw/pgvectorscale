@@ -145,6 +145,78 @@ ground-truth table computed from a different (10M-row) dataset and, once
 that was replaced, a dump-order vs id-order mismatch in the numpy GT; the
 final GT is verified byte-for-byte against SQL brute force.  The earlier
 100M study's 98.3% figure was measured against the same stale GT.
-The 1B table load on 121 (~6 h) remains available; with the direct IVF
-builder the 1B build would be ~3-6 h per engine — feasible, pending disk
-headroom and time.
+
+## 6. BIGANN-1B results (121.37.117.106, 32 vCPU/121GB, release PG 17.11)
+
+Direct IVF-RaBitQ bulk build on 1,000,000,000 rows (dim 128) from
+`base.1B.u8bin` (u8 -> float32, no offset), index
+`agentvec (ivf_lists=2000, rabitq_bits=1, search_candidates=1000,
+hot_segment_max_rows=50000)`:
+
+| stage | seconds | notes |
+|---|---|---|
+| COPY 522 GB (server-side binary COPY, unlogged) | 5074 | ~103 MB/s, disk-bound |
+| ALTER TABLE SET LOGGED | 9417 | full rewrite |
+| ADD PRIMARY KEY (1B bigints) | 4850 | |
+| **CREATE INDEX agentvec** | **19819 (5.5 h)** | **index 32.1 GB**; table 585 GB |
+
+Recall@10 vs exact top-10 ground truth (200 queries, see GT note), sweep of
+`search_candidates` (sc, the emission-time exact-rerank window) x
+`ivf_probes` (p):
+
+| sc \ p | 8 | 16 | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|---|---|
+| 1000 | 0.774 | 0.837 | 0.871 | 0.8815 | 0.875 | 0.8685 | — |
+| 2000 | — | — | — | 0.935 | 0.933 | 0.9295 | 0.9285 |
+| 4000 | — | — | — | 0.9725 | 0.9725 | 0.9715 | 0.970 |
+| 8000 | — | — | — | — | — | **0.9905** | 0.9895 |
+
+q1 ms (LIMIT 10): sc=1000: 31/51/104/178/345/613 at p8..256; sc=4000:
+~350-715 at p64..512; sc=8000: 699 at p256.  (Latency is dominated by the
+rerank's per-candidate heap fetches — sc sequential fetches per query —
+which is exactly phase 8's batched/prefetched rerank target.)
+
+hnswsq context: a 1B hnswsq build is not practical on this box — the 100M
+build was ~25-50 h flush-bound and ~82 GB, so 1B would be ~250-500 h and
+~820 GB.  agentvec builds 1B in **5.5 h at 32 GB** and reaches
+hnswsq-class recall (**0.9905** at sc=8000/p=256, ~700 ms) vs hnswsq's
+~0.991/ef160 (~30 ms at 100M).  The goal "not worse than hnswsq" holds on
+build time and size by orders of magnitude and on recall within 0.1 pt at
+the raised-knob operating point; latency is ~20x hnswsq's at matched
+recall and remains the open gap (phase-8 batched rerank).
+
+The probe-sweep shape also shows the estimate window, not the probe count,
+is the recall limiter at this scale: at fixed sc, recall is flat-to-
+slightly-declining in p (estimate crowding — with 500k-entry lists, more
+probes flood the top-sc estimate heap with false positives), so
+`search_candidates` must scale with the list size.
+
+### GT note (important)
+
+The bundled `GT_1B/bigann-1B` does NOT match this
+`base.1B.u8bin`/`query.public.10K.u8bin` pairing: for qid=0 the GT's
+top-10 ids sit at L2 distances 244k-356k while a full-brute-force scan
+finds the true top-10 at 80k-87k (zero overlap at id offsets 0 and +1).
+Instead, exact top-10 ground truth was computed for a 200-query subset by
+chunked matmul over all 1B vectors (25M-vector chunks), and
+cross-validated against an independent full-scan brute force (sets match
+exactly).
+
+### Bugs the 1B run exposed (fixed)
+
+* **Buffer-pin leak in the emission-time rerank** (`fetch_heap_vector`):
+  `ExecStoreBufferHeapTuple` pins the buffer a second time
+  (transfer_pin=false) in PG17.11+/PG18, so the slot clear released only
+  that second pin — one leaked heap pin per reranked candidate (100
+  "resource was not closed" warnings per smoke query).  At 1B with
+  sc=1000 the recall statement would have pinned ~2.5M buffers (20 GB)
+  against a 4 GB shared_buffers pool and died.  Fixed with
+  `ExecStorePinnedBufferHeapTuple` (commit `b3ed72d`); verified 100->0
+  leaked pins on PG17 and PG18.
+* **Never replace a loaded .so in place**: `cp` over
+  `vectorscale-0.9.0.so` truncates+rewrites the same inode; backends with
+  the old mapping fault in new bytes at old offsets and crash the
+  maintenance worker (SIGILL 48 s after one install, SIGSEGV after
+  another), and any worker crash forces a full crash-restart that rolls
+  back in-flight work (the first 1B COPY died at its commit this way).
+  Use atomic rename (or swap only while the server is down).
