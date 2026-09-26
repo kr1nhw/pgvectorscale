@@ -330,7 +330,9 @@ impl AgentVecDirectory {
 
     /// Look up a segment by its stable id, mutably.
     pub fn get_mut(&mut self, segment_id: SegmentId) -> Option<&mut AgentVecSegmentMeta> {
-        self.segments.iter_mut().find(|s| s.segment_id == segment_id)
+        self.segments
+            .iter_mut()
+            .find(|s| s.segment_id == segment_id)
     }
 
     /// The segments a scan should read, in directory order.
@@ -460,7 +462,8 @@ impl AgentVecSegmentHeader {
     pub fn seal_active(&mut self) -> bool {
         match self.active.take() {
             Some(active) => {
-                self.sealed.push(FlatRun::new(active.first_page, active.num_entries));
+                self.sealed
+                    .push(FlatRun::new(active.first_page, active.num_entries));
                 self.version += 1;
                 true
             }

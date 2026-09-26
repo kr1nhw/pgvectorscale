@@ -90,12 +90,16 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                     // atomic header rewrite.  Taking the header lock and then
                     // the page locks keeps this path's order (header -> page) the
                     // same as the insert path's.
-                    AgentVecSegmentHeader::update(&index_rel, segment.header.block_number, |header| {
-                        for (block, offset) in to_tombstone {
-                            flat::mark_dead(&index_rel, block, offset);
-                        }
-                        header.dead_entries += num_dead;
-                    });
+                    AgentVecSegmentHeader::update(
+                        &index_rel,
+                        segment.header.block_number,
+                        |header| {
+                            for (block, offset) in to_tombstone {
+                                flat::mark_dead(&index_rel, block, offset);
+                            }
+                            header.dead_entries += num_dead;
+                        },
+                    );
                     total_dead += num_dead;
                 }
             }
@@ -113,9 +117,13 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                 );
                 let removed = (*res).tuples_removed as u64;
                 if removed > 0 {
-                    AgentVecSegmentHeader::update(&index_rel, segment.header.block_number, |header| {
-                        header.dead_entries += removed;
-                    });
+                    AgentVecSegmentHeader::update(
+                        &index_rel,
+                        segment.header.block_number,
+                        |header| {
+                            header.dead_entries += removed;
+                        },
+                    );
                 }
                 total_dead += removed;
                 let live = AgentVecSegmentHeader::load(&index_rel, segment.header).live_entries();

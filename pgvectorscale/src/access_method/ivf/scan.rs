@@ -86,7 +86,6 @@ fn extract_query_vector(datum: pg_sys::Datum, distance_type: DistanceType) -> Ve
         let mut vec = (*pg_vec).to_slice().to_vec();
         pg_sys::pfree(detoasted.cast());
 
-
         if distance_type == DistanceType::Cosine {
             crate::access_method::distance::preprocess_cosine(&mut vec);
         }

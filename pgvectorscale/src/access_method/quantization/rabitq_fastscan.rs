@@ -23,10 +23,7 @@ pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7
 /// `num_chunks` lookups dequantizes as `sum·range_scale + num_chunks·qmin`.
 pub fn quantize_table(table: &[f32]) -> (Vec<u8>, f32, f32) {
     let qmin = table.iter().copied().fold(f32::INFINITY, f32::min);
-    let qmax = table
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let qmax = table.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let range = qmax - qmin;
     let factor = if range > 0.0 { 255.0 / range } else { 0.0 };
     let q = table
@@ -119,7 +116,9 @@ pub fn estimate_batch(
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: only selected when AVX2 was detected.
             unsafe {
-                estimate_batch_avx2(sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n);
+                estimate_batch_avx2(
+                    sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n,
+                );
                 return;
             }
         }
@@ -128,11 +127,15 @@ pub fn estimate_batch(
     {
         // NEON is baseline on aarch64.
         unsafe {
-            estimate_batch_neon(sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n);
+            estimate_batch_neon(
+                sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n,
+            );
             return;
         }
     }
-    estimate_batch_scalar(sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n);
+    estimate_batch_scalar(
+        sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n,
+    );
 }
 
 #[inline]
@@ -151,8 +154,8 @@ fn estimate_batch_scalar(
     for i in 0..n {
         let sum = sums[i] as f32;
         let scale = scales[i];
-        let d = (a_full * scale * sum + b_full * scale + rq_sum + sx2[i] - mf[i] * rq_margin)
-            .max(0.0);
+        let d =
+            (a_full * scale * sum + b_full * scale + rq_sum + sx2[i] - mf[i] * rq_margin).max(0.0);
         out[i] = d;
     }
 }
@@ -190,7 +193,18 @@ unsafe fn estimate_batch_neon(
         vst1q_f32(out.as_mut_ptr().add(i), vmaxq_f32(acc, zero));
         i += 4;
     }
-    estimate_batch_scalar(&sums[i..], &scales[i..], &sx2[i..], &mf[i..], a_full, b_full, rq_sum, rq_margin, &mut out[i..], n - i);
+    estimate_batch_scalar(
+        &sums[i..],
+        &scales[i..],
+        &sx2[i..],
+        &mf[i..],
+        a_full,
+        b_full,
+        rq_sum,
+        rq_margin,
+        &mut out[i..],
+        n - i,
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -228,7 +242,18 @@ unsafe fn estimate_batch_avx2(
         _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_max_ps(acc, zero));
         i += 8;
     }
-    estimate_batch_scalar(&sums[i..], &scales[i..], &sx2[i..], &mf[i..], a_full, b_full, rq_sum, rq_margin, &mut out[i..], n - i);
+    estimate_batch_scalar(
+        &sums[i..],
+        &scales[i..],
+        &sx2[i..],
+        &mf[i..],
+        a_full,
+        b_full,
+        rq_sum,
+        rq_margin,
+        &mut out[i..],
+        n - i,
+    );
 }
 
 /// Fused L2 estimate for 2-bit rows from the two bit-plane sums.
@@ -257,7 +282,9 @@ pub fn estimate_batch_2bit(
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: only selected when AVX2 was detected.
             unsafe {
-                estimate_batch_2bit_avx2(sums0, sums1, scales, sx2, mf, a2, b2, rq_sum, rq_margin, out, n);
+                estimate_batch_2bit_avx2(
+                    sums0, sums1, scales, sx2, mf, a2, b2, rq_sum, rq_margin, out, n,
+                );
                 return;
             }
         }
@@ -266,11 +293,15 @@ pub fn estimate_batch_2bit(
     {
         // NEON is baseline on aarch64.
         unsafe {
-            estimate_batch_2bit_neon(sums0, sums1, scales, sx2, mf, a2, b2, rq_sum, rq_margin, out, n);
+            estimate_batch_2bit_neon(
+                sums0, sums1, scales, sx2, mf, a2, b2, rq_sum, rq_margin, out, n,
+            );
             return;
         }
     }
-    estimate_batch_2bit_scalar(sums0, sums1, scales, sx2, mf, a2, b2, rq_sum, rq_margin, out, n);
+    estimate_batch_2bit_scalar(
+        sums0, sums1, scales, sx2, mf, a2, b2, rq_sum, rq_margin, out, n,
+    );
 }
 
 #[inline]
@@ -331,7 +362,19 @@ unsafe fn estimate_batch_2bit_neon(
         vst1q_f32(out.as_mut_ptr().add(i), vmaxq_f32(acc, zero));
         i += 4;
     }
-    estimate_batch_2bit_scalar(&sums0[i..], &sums1[i..], &scales[i..], &sx2[i..], &mf[i..], a2, b2, rq_sum, rq_margin, &mut out[i..], n - i);
+    estimate_batch_2bit_scalar(
+        &sums0[i..],
+        &sums1[i..],
+        &scales[i..],
+        &sx2[i..],
+        &mf[i..],
+        a2,
+        b2,
+        rq_sum,
+        rq_margin,
+        &mut out[i..],
+        n - i,
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -375,7 +418,19 @@ unsafe fn estimate_batch_2bit_avx2(
         _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_max_ps(acc, zero));
         i += 8;
     }
-    estimate_batch_2bit_scalar(&sums0[i..], &sums1[i..], &scales[i..], &sx2[i..], &mf[i..], a2, b2, rq_sum, rq_margin, &mut out[i..], n - i);
+    estimate_batch_2bit_scalar(
+        &sums0[i..],
+        &sums1[i..],
+        &scales[i..],
+        &sx2[i..],
+        &mf[i..],
+        a2,
+        b2,
+        rq_sum,
+        rq_margin,
+        &mut out[i..],
+        n - i,
+    );
 }
 
 /// Sum the quantized table for one 32-row transposed batch.
@@ -425,8 +480,7 @@ pub fn sum_batch_scalar(codes: &[u8], code_len: usize, table: &[u8], out: &mut [
             let lo = PERM0[j];
             let hi = PERM0[j] + 16;
             out[lo] = out[lo].saturating_add(current[low_cur] as u16 + next[low_next] as u16);
-            out[hi] =
-                out[hi].saturating_add(current[high_cur] as u16 + next[high_next] as u16);
+            out[hi] = out[hi].saturating_add(current[high_cur] as u16 + next[high_next] as u16);
         }
     }
 }
@@ -544,7 +598,9 @@ mod tests {
         let code_len = 16usize;
         let n_rows = 100usize;
 
-        let table_f32: Vec<f32> = (0..code_len * 32).map(|_| rng.gen_range(-3.0..3.0)).collect();
+        let table_f32: Vec<f32> = (0..code_len * 32)
+            .map(|_| rng.gen_range(-3.0..3.0))
+            .collect();
         let (table_u8, qmin, range_scale) = quantize_table(&table_f32);
 
         let codes: Vec<u8> = (0..n_rows * code_len).map(|_| rng.gen::<u8>()).collect();
@@ -594,8 +650,30 @@ mod tests {
             let (a_full, b_full, rq_sum, rq_margin) = (0.01, -2.5, 5e5, 700.0);
             let mut out_simd = vec![0.0f32; n];
             let mut out_scalar = vec![0.0f32; n];
-            estimate_batch(&sums, &scales, &sx2, &mf, a_full, b_full, rq_sum, rq_margin, &mut out_simd, n);
-            estimate_batch_scalar(&sums, &scales, &sx2, &mf, a_full, b_full, rq_sum, rq_margin, &mut out_scalar, n);
+            estimate_batch(
+                &sums,
+                &scales,
+                &sx2,
+                &mf,
+                a_full,
+                b_full,
+                rq_sum,
+                rq_margin,
+                &mut out_simd,
+                n,
+            );
+            estimate_batch_scalar(
+                &sums,
+                &scales,
+                &sx2,
+                &mf,
+                a_full,
+                b_full,
+                rq_sum,
+                rq_margin,
+                &mut out_scalar,
+                n,
+            );
             for i in 0..n {
                 assert!(
                     (out_simd[i] - out_scalar[i]).abs() <= 1e-3 * out_scalar[i].abs().max(1.0),
@@ -610,7 +688,8 @@ mod tests {
         let n_batches = n_rows.div_ceil(BATCH_SIZE);
         for batch in 0..n_batches {
             let mut out = [0u16; BATCH_SIZE];
-            let cbatch = &transposed[batch * code_len * BATCH_SIZE..(batch + 1) * code_len * BATCH_SIZE];
+            let cbatch =
+                &transposed[batch * code_len * BATCH_SIZE..(batch + 1) * code_len * BATCH_SIZE];
             sum_batch(cbatch, code_len, &table_u8, &mut out);
             for r in 0..BATCH_SIZE {
                 let row = batch * BATCH_SIZE + r;

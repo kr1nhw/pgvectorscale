@@ -118,7 +118,9 @@ mod tests {
         let mut region = [0u8; 256];
         let base = region.as_mut_ptr();
 
-        let mut hp = HnswPtr { ptr: std::ptr::null_mut() };
+        let mut hp = HnswPtr {
+            ptr: std::ptr::null_mut(),
+        };
         unsafe {
             assert!(is_null(std::ptr::null_mut(), hp));
             assert!(is_null(base, hp));
@@ -138,7 +140,9 @@ mod tests {
             assert_eq!(offset(hp), 64);
 
             // Equal under each convention
-            let mut hp2 = HnswPtr { ptr: std::ptr::null_mut() };
+            let mut hp2 = HnswPtr {
+                ptr: std::ptr::null_mut(),
+            };
             store(base, &mut hp2, slot_b);
             assert!(equal(base, hp, hp2));
             // Note: comparing under the OTHER convention reads the union's
@@ -157,7 +161,9 @@ mod tests {
     fn test_relptr_exact_offsets() {
         let mut region = [0u8; 128];
         let base = region.as_mut_ptr();
-        let mut hp = HnswPtr { ptr: std::ptr::null_mut() };
+        let mut hp = HnswPtr {
+            ptr: std::ptr::null_mut(),
+        };
         unsafe {
             store(base, &mut hp, base.add(17).cast::<u8>());
             assert_eq!(offset(hp), 17);

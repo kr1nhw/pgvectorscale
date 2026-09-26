@@ -34,8 +34,8 @@ use crate::access_method::distance::{preprocess_cosine, DistanceType};
 use crate::access_method::hnswsq::options::{HNSW_EF_SEARCH, HNSW_SQ8_DISTANCE};
 use crate::access_method::hnswsq::quantize::HnswPrecision;
 use crate::access_method::hnswsq::types::{Element, Visited};
-use crate::access_method::hnswsq::utils::SearchScratch;
 use crate::access_method::hnswsq::utils;
+use crate::access_method::hnswsq::utils::SearchScratch;
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::util::ItemPointer;
 
@@ -129,8 +129,8 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     let scan = pg_sys::RelationGetIndexScan(index, nkeys, norderbys);
 
     let state = AgentVecScanState::new();
-    let state_ptr = pg_sys::palloc0(std::mem::size_of::<AgentVecScanState>())
-        as *mut AgentVecScanState;
+    let state_ptr =
+        pg_sys::palloc0(std::mem::size_of::<AgentVecScanState>()) as *mut AgentVecScanState;
     *state_ptr = state;
     (*scan).opaque = state_ptr as *mut std::os::raw::c_void;
 
@@ -295,11 +295,10 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
                     // reorder machinery does not support).
                     let mut est_heap: BinaryHeap<DistTid> = BinaryHeap::new();
                     for sc in candidates.into_iter().rev() {
-                        let element =
-                            crate::access_method::hnswsq::ptr::access::<Element>(
-                                std::ptr::null_mut(),
-                                sc.element,
-                            );
+                        let element = crate::access_method::hnswsq::ptr::access::<Element>(
+                            std::ptr::null_mut(),
+                            sc.element,
+                        );
                         if (*element).deleted != 0 {
                             continue;
                         }
@@ -346,21 +345,19 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
                 } else {
                     let exact = support.precision == HnswPrecision::Plain;
                     for sc in candidates.into_iter().rev() {
-                        let element =
-                            crate::access_method::hnswsq::ptr::access::<Element>(
-                                std::ptr::null_mut(),
-                                sc.element,
-                            );
+                        let element = crate::access_method::hnswsq::ptr::access::<Element>(
+                            std::ptr::null_mut(),
+                            sc.element,
+                        );
                         if (*element).deleted != 0 {
                             continue;
                         }
-                        let dist =
-                            crate::access_method::hnswsq::scan::emit_candidate(
-                                &support,
-                                &state.query,
-                                norm_q,
-                                &sc,
-                            );
+                        let dist = crate::access_method::hnswsq::scan::emit_candidate(
+                            &support,
+                            &state.query,
+                            norm_q,
+                            &sc,
+                        );
                         push(
                             &mut all,
                             &mut heap,
@@ -387,18 +384,15 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
                 // scan performs, over the embedded region's meta/centroids/
                 // list directory.
                 let base = segment.code_root.block_number;
-                let ivf_meta = crate::access_method::ivf::meta_page::IvfMetaPage::fetch(
-                    &index_rel,
-                    base,
-                );
+                let ivf_meta =
+                    crate::access_method::ivf::meta_page::IvfMetaPage::fetch(&index_rel, base);
                 let Some(centroid_pointer) = ivf_meta.get_centroids_pointer() else {
                     continue;
                 };
-                let centroid_page =
-                    crate::access_method::ivf::centroid_page::IvfCentroidPage::load(
-                        &index_rel,
-                        centroid_pointer,
-                    );
+                let centroid_page = crate::access_method::ivf::centroid_page::IvfCentroidPage::load(
+                    &index_rel,
+                    centroid_pointer,
+                );
                 if centroid_page.centroids.is_empty() {
                     continue;
                 }

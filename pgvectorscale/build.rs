@@ -40,7 +40,9 @@ fn main() {
 
     let mut ar = cc::Build::new().get_archiver();
     ar.arg("crs").arg(&lib).arg(&obj);
-    let status = ar.status().expect("failed to spawn archiver for test_stubs");
+    let status = ar
+        .status()
+        .expect("failed to spawn archiver for test_stubs");
     assert!(status.success(), "failed to archive test_stubs.o");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());

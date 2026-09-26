@@ -12,8 +12,8 @@ use pgrx::pg_sys::BlockNumber;
 use pgrx::*;
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::access_method::quantization::rabitq::RabitqVector;
 use crate::access_method::ivf::segment::{IvfActiveBuffer, IvfSegment};
+use crate::access_method::quantization::rabitq::RabitqVector;
 use crate::util::page::{PageType, ReadablePage, WritablePage};
 use crate::util::ports::{PageGetItem, PageGetItemId, PageGetMaxOffsetNumber};
 use crate::util::*;
@@ -57,11 +57,7 @@ impl IvfEntry {
 /// or sqrt per entry.
 pub fn serialize_entries(entries: &[IvfEntry]) -> Vec<u8> {
     let (num_bits, dim, code_len) = match entries.first() {
-        Some(e) => (
-            e.code.num_bits,
-            e.code.dim as u16,
-            e.code.packed_code.len(),
-        ),
+        Some(e) => (e.code.num_bits, e.code.dim as u16, e.code.packed_code.len()),
         None => (1u8, 0u16, 0usize),
     };
     let n = entries.len();
@@ -85,7 +81,11 @@ pub fn serialize_entries(entries: &[IvfEntry]) -> Vec<u8> {
         // FastScan.  2-bit codes are split into their sign and ex bit-planes
         // (each a plain 1-bit-style code of `code_len/2` bytes per vector)
         // and both planes are transposed: plane0 then plane1.
-        let plane_len = if num_bits == 1 { code_len } else { code_len / 2 };
+        let plane_len = if num_bits == 1 {
+            code_len
+        } else {
+            code_len / 2
+        };
         if num_bits == 1 {
             let mut row_major = Vec::with_capacity(n * code_len);
             for e in entries {
@@ -115,12 +115,18 @@ pub fn serialize_entries(entries: &[IvfEntry]) -> Vec<u8> {
                     }
                 }
             }
-            buf.extend_from_slice(&crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
-                &sign_plane, n, plane_len,
-            ));
-            buf.extend_from_slice(&crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
-                &ex_plane, n, plane_len,
-            ));
+            buf.extend_from_slice(
+                &crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
+                    &sign_plane,
+                    n,
+                    plane_len,
+                ),
+            );
+            buf.extend_from_slice(
+                &crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
+                    &ex_plane, n, plane_len,
+                ),
+            );
         }
     } else {
         for e in entries {
@@ -291,7 +297,10 @@ impl<'a> IvfEntrySlice<'a> {
     /// goes through a u8 pointer into a fully initialized `&mut [f32]`.
     #[inline]
     fn copy_f32_region(src: &'a [u8], base: usize, out: &mut [f32]) {
-        assert!(base + out.len() <= src.len() / 4, "f32 region out of bounds");
+        assert!(
+            base + out.len() <= src.len() / 4,
+            "f32 region out of bounds"
+        );
         // SAFETY: `src[base*4 ..]` holds `out.len()*4` initialized bytes
         // (asserted above); writing them into `out` through a u8 pointer is
         // valid because all f32 bit patterns are valid values.
@@ -671,9 +680,7 @@ impl<'a> IvfEntryReader<'a> {
             while off < n {
                 let chunk = (n - off).min(max_burst);
                 let mut ptrs: Vec<*mut std::os::raw::c_void> = (0..chunk)
-                    .map(|i| {
-                        raw.as_mut_ptr().add((off + i) * blksz) as *mut std::os::raw::c_void
-                    })
+                    .map(|i| raw.as_mut_ptr().add((off + i) * blksz) as *mut std::os::raw::c_void)
                     .collect();
                 pg_sys::smgrreadv(
                     reln,
@@ -792,7 +799,9 @@ mod two_bit_soa_tests {
         let q = RabitqQuantizer::new(2, 5, dim);
         let mut entries = Vec::new();
         for i in 0..40usize {
-            let v: Vec<f32> = (0..dim).map(|d| ((i * 13 + d * 7) % 23) as f32 - 11.0).collect();
+            let v: Vec<f32> = (0..dim)
+                .map(|d| ((i * 13 + d * 7) % 23) as f32 - 11.0)
+                .collect();
             entries.push(IvfEntry {
                 heap_tid: ItemPointer::new(i as u32, 1),
                 code: q.quantize(&v),
@@ -843,7 +852,9 @@ mod two_bit_plane_slice_tests {
         let mut sign_planes = vec![0u8; n * (dim / 8)];
         let mut ex_planes = vec![0u8; n * (dim / 8)];
         for i in 0..n {
-            let v: Vec<f32> = (0..dim).map(|d| ((i * 13 + d * 7) % 23) as f32 - 11.0).collect();
+            let v: Vec<f32> = (0..dim)
+                .map(|d| ((i * 13 + d * 7) % 23) as f32 - 11.0)
+                .collect();
             let code = q.quantize(&v);
             let sp = &mut sign_planes[i * (dim / 8)..(i + 1) * (dim / 8)];
             let ep = &mut ex_planes[i * (dim / 8)..(i + 1) * (dim / 8)];
@@ -858,7 +869,10 @@ mod two_bit_plane_slice_tests {
                     }
                 }
             }
-            entries.push(IvfEntry { heap_tid: ItemPointer::new(i as u32, 1), code });
+            entries.push(IvfEntry {
+                heap_tid: ItemPointer::new(i as u32, 1),
+                code,
+            });
         }
         let bytes = serialize_entries(&entries);
         let view = IvfEntrySlice::parse(&bytes);
@@ -885,10 +899,14 @@ mod two_bit_plane_slice_tests {
         let row_major: Vec<u8> = {
             let plane_bytes = view.num_batches() * 32 * half;
             let p0 = crate::access_method::quantization::rabitq_fastscan::untranspose_1bit(
-                &view.codes()[..plane_bytes], n, half,
+                &view.codes()[..plane_bytes],
+                n,
+                half,
             );
             let p1 = crate::access_method::quantization::rabitq_fastscan::untranspose_1bit(
-                &view.codes()[plane_bytes..plane_bytes * 2], n, half,
+                &view.codes()[plane_bytes..plane_bytes * 2],
+                n,
+                half,
             );
             let mut packed = vec![0u8; n * view.code_len()];
             for i in 0..n {
@@ -929,8 +947,9 @@ mod f32_region_alignment_tests {
                 let q = RabitqQuantizer::new(num_bits, 5, dim);
                 let entries: Vec<IvfEntry> = (0..n)
                     .map(|i| {
-                        let v: Vec<f32> =
-                            (0..dim).map(|d| ((i * 13 + d * 7) % 23) as f32 - 11.0).collect();
+                        let v: Vec<f32> = (0..dim)
+                            .map(|d| ((i * 13 + d * 7) % 23) as f32 - 11.0)
+                            .collect();
                         IvfEntry {
                             heap_tid: ItemPointer::new(i as u32, 1),
                             code: q.quantize(&v),

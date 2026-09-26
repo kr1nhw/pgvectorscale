@@ -127,7 +127,10 @@ pub(super) unsafe fn consolidate_inner(index: &PgRelation) -> i64 {
         let nearest = find_nearest_centroids(vec, &centroids, distance_type, 1);
         let list_id = nearest[0];
         let code = quantizer.quantize_residual(&centroids[list_id], vec);
-        per_list[list_id].push(IvfEntry::new(ItemPointer::with_item_pointer_data(*tid), code));
+        per_list[list_id].push(IvfEntry::new(
+            ItemPointer::with_item_pointer_data(*tid),
+            code,
+        ));
     }
 
     let (ivf_base, list_directory_pointer) = build_ivf_segment(
@@ -279,4 +282,3 @@ fn reservoir_sample(rows: &[(pg_sys::ItemPointerData, Vec<f32>)], want: usize) -
     }
     sample
 }
-

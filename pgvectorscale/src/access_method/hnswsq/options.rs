@@ -135,7 +135,10 @@ impl Hnsw2Options {
             ops.ef_construction = DEFAULT_EF_CONSTRUCTION;
             ops.sample_size = DEFAULT_SAMPLE_SIZE_OPTION;
             unsafe {
-                set_varsize_4b(ops.as_ptr().cast(), std::mem::size_of::<Hnsw2Options>() as i32);
+                set_varsize_4b(
+                    ops.as_ptr().cast(),
+                    std::mem::size_of::<Hnsw2Options>() as i32,
+                );
             }
             ops.into_pg_boxed()
         } else {
@@ -179,11 +182,7 @@ impl Hnsw2Options {
         }
     }
 
-    fn get_str<F: FnOnce() -> String>(
-        &self,
-        offset: i32,
-        _default: F,
-    ) -> String {
+    fn get_str<F: FnOnce() -> String>(&self, offset: i32, _default: F) -> String {
         // storage layout string is written directly into the options by
         // PostgreSQL (the offset points into rd_options bytes)
         let p = (self as *const Hnsw2Options as *const u8).wrapping_add(offset as usize);
@@ -257,8 +256,7 @@ pub unsafe fn init() {
     pg_sys::add_string_reloption(
         RELOPT_KIND_HNSW2,
         "storage_layout".as_pg_cstr(),
-        "Node vector precision: plain, ieeefp16 (f16), ieeefp8, f8, sq8, or sq16"
-            .as_pg_cstr(),
+        "Node vector precision: plain, ieeefp16 (f16), ieeefp8, f8, sq8, or sq16".as_pg_cstr(),
         HNSW_DEFAULT_STORAGE_TYPE_STR.as_pg_cstr(),
         Some(validate_storage_layout),
         pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
@@ -267,8 +265,7 @@ pub unsafe fn init() {
     pg_sys::add_int_reloption(
         RELOPT_KIND_HNSW2,
         "m".as_pg_cstr(),
-        "Maximum number of neighbors per node per upper layer (layer 0 uses 2*m)"
-            .as_pg_cstr(),
+        "Maximum number of neighbors per node per upper layer (layer 0 uses 2*m)".as_pg_cstr(),
         DEFAULT_M,
         4,
         100,
@@ -288,8 +285,7 @@ pub unsafe fn init() {
     pg_sys::add_int_reloption(
         RELOPT_KIND_HNSW2,
         "sample_size".as_pg_cstr(),
-        "Vectors reservoir-sampled for SQ8 (f8) calibration (0 = auto, 30000)"
-            .as_pg_cstr(),
+        "Vectors reservoir-sampled for SQ8 (f8) calibration (0 = auto, 30000)".as_pg_cstr(),
         DEFAULT_SAMPLE_SIZE_OPTION,
         0,
         1_000_000,

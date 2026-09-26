@@ -202,12 +202,24 @@ pub mod tests {
 
     #[pg_test]
     fn test_hnswsq_recall_ieeefp16_l2() {
-        recall_case("vector_l2_ops", "<->", "storage_layout = ieeefp16", 0.9, false);
+        recall_case(
+            "vector_l2_ops",
+            "<->",
+            "storage_layout = ieeefp16",
+            0.9,
+            false,
+        );
     }
 
     #[pg_test]
     fn test_hnswsq_recall_ieeefp8_l2() {
-        recall_case("vector_l2_ops", "<->", "storage_layout = ieeefp8", 0.75, false);
+        recall_case(
+            "vector_l2_ops",
+            "<->",
+            "storage_layout = ieeefp8",
+            0.75,
+            false,
+        );
     }
 
     #[pg_test]
@@ -230,12 +242,24 @@ pub mod tests {
 
     #[pg_test]
     fn test_hnswsq_recall_plain_cosine() {
-        recall_case("vector_cosine_ops", "<=>", "storage_layout = plain", 0.9, false);
+        recall_case(
+            "vector_cosine_ops",
+            "<=>",
+            "storage_layout = plain",
+            0.9,
+            false,
+        );
     }
 
     #[pg_test]
     fn test_hnswsq_recall_ieeefp16_ip() {
-        recall_case("vector_ip_ops", "<#>", "storage_layout = ieeefp16", 0.85, false);
+        recall_case(
+            "vector_ip_ops",
+            "<#>",
+            "storage_layout = ieeefp16",
+            0.85,
+            false,
+        );
     }
 
     // ---------------- gate 2: incremental empty-start ----------------
@@ -323,7 +347,9 @@ pub mod tests {
         )
         .unwrap();
         insert_rows("hs_r", &rows).unwrap();
-        let before: i64 = Spi::get_one::<i64>("SELECT count(*) FROM hs_r").unwrap().unwrap();
+        let before: i64 = Spi::get_one::<i64>("SELECT count(*) FROM hs_r")
+            .unwrap()
+            .unwrap();
         assert_eq!(before, 100);
 
         // A subtransaction that inserts and aborts: the rows must be
@@ -343,7 +369,9 @@ pub mod tests {
         ))
         .unwrap();
 
-        let after: i64 = Spi::get_one::<i64>("SELECT count(*) FROM hs_r").unwrap().unwrap();
+        let after: i64 = Spi::get_one::<i64>("SELECT count(*) FROM hs_r")
+            .unwrap()
+            .unwrap();
         assert_eq!(after, before, "rolled-back inserts must not persist");
         let got: i64 = Spi::get_one::<i64>(&format!(
             "SELECT id FROM hs_r ORDER BY embedding <-> '{}' LIMIT 1",
@@ -363,10 +391,7 @@ pub mod tests {
         let (rows, queries) = gen_clustered(10, 100, 2, 0.1, 777);
         setup_case(2, &rows, &queries, "<->").unwrap();
         Spi::run("SET hnswsq.build_seed = 11;").unwrap();
-        Spi::run(
-            "CREATE INDEX hs_idx ON hs_t USING hnswsq (embedding vector_l2_ops)",
-        )
-        .unwrap();
+        Spi::run("CREATE INDEX hs_idx ON hs_t USING hnswsq (embedding vector_l2_ops)").unwrap();
         Spi::run("SET hnswsq.ef_search = 100; SET enable_seqscan = off;").unwrap();
         Spi::run(
             "CREATE TABLE hs_ann AS
@@ -425,10 +450,9 @@ pub mod tests {
                 && pgrx::itemptr::item_pointer_get_offset_number(tid) == target.offset
         }
 
-        let index_oid = Spi::get_one::<pg_sys::Oid>("SELECT 'hs_bd_idx'::regclass::oid")?
-            .expect("oid");
-        let index_rel =
-            unsafe { PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid)) };
+        let index_oid =
+            Spi::get_one::<pg_sys::Oid>("SELECT 'hs_bd_idx'::regclass::oid")?.expect("oid");
+        let index_rel = unsafe { PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid)) };
         let mut kill = KillOne { block, offset };
         let mut info = pg_sys::IndexVacuumInfo::default();
         info.index = index_rel.as_ptr();
@@ -450,7 +474,10 @@ pub mod tests {
         }
         let diag: String =
             Spi::get_one::<String>("SELECT hnswsq_diag('hs_bd_idx')")?.expect("diag");
-        assert!(diag.contains("deleted=1"), "diag reflects the tombstone: {diag}");
+        assert!(
+            diag.contains("deleted=1"),
+            "diag reflects the tombstone: {diag}"
+        );
         Ok(())
     }
 
@@ -806,9 +833,7 @@ pub mod tests {
         assert!(diag.contains("live=10000"), "all rows live: {}", diag);
 
         client
-            .batch_execute(
-                "SET enable_seqscan = off; SET hnswsq.ef_search = 100;",
-            )
+            .batch_execute("SET enable_seqscan = off; SET hnswsq.ef_search = 100;")
             .unwrap();
         // Exact-match probe: the first row's vector must be found.
         let got: i64 = client
@@ -908,7 +933,10 @@ pub mod tests {
         ))
         .unwrap()
         .unwrap_or(0);
-        assert_eq!(n3, 3, "ef_search GUC must be settable and scans keep working");
+        assert_eq!(
+            n3, 3,
+            "ef_search GUC must be settable and scans keep working"
+        );
     }
 
     #[pg_test]
@@ -916,8 +944,7 @@ pub mod tests {
         // 2000 dims (pgvector's hard cap) work for both plain (element +
         // neighbor tuples split across pages) and ieeefp8.  The vector is
         // built in SQL (a 15KB literal is not SPI-friendly).
-        Spi::run("CREATE TABLE hs_big(id serial primary key, embedding vector(2000));")
-            .unwrap();
+        Spi::run("CREATE TABLE hs_big(id serial primary key, embedding vector(2000));").unwrap();
         Spi::run(
             "INSERT INTO hs_big(embedding)
                SELECT ARRAY(SELECT (d % 100)::float8 * 0.01 FROM generate_series(1,2000) d)::vector;",
@@ -1062,11 +1089,10 @@ pub mod tests {
                  WITH (storage_layout = {layout});"
             ))
             .unwrap();
-            let sz: i64 = Spi::get_one::<i64>(&format!(
-                "SELECT pg_relation_size('hs_sz_idx{i}')::int8"
-            ))
-            .unwrap()
-            .unwrap_or(0);
+            let sz: i64 =
+                Spi::get_one::<i64>(&format!("SELECT pg_relation_size('hs_sz_idx{i}')::int8"))
+                    .unwrap()
+                    .unwrap_or(0);
             sizes.push(sz);
         }
         assert!(

@@ -494,11 +494,7 @@ impl Codec {
     pub fn distance_l2_sq8_pairwise(&self, qhat: &[i16], bytes: &[u8]) -> f32 {
         debug_assert_eq!(qhat.len(), self.dim);
         debug_assert_eq!(bytes.len(), self.dim);
-        crate::access_method::distance::distance_l2_sq8_pairwise(
-            qhat,
-            bytes,
-            &self.sq8_scales2,
-        )
+        crate::access_method::distance::distance_l2_sq8_pairwise(qhat, bytes, &self.sq8_scales2)
     }
 
     /// Fixed-range `sq8` pairwise: `SUM (qhat - code)^2` over the unsigned
@@ -524,8 +520,6 @@ impl Codec {
         debug_assert_eq!(bytes.len(), self.dim * 2);
         crate::access_method::distance::distance_l2_sq16_fixed_pairwise(qhat, bytes)
     }
-
-
 
     /// Compute `distance(query, bytes)` directly over the encoded byte
     /// representation, without the decode-into-scratch copy.  Matches the
@@ -681,9 +675,7 @@ impl Codec {
     /// the norm is `scale · √dim`.  Zero for the other layouts.
     pub fn quant_error_norm(&self) -> f32 {
         match self.precision {
-            HnswPrecision::Sq8 => {
-                self.sq8_scales.iter().map(|s| s * s).sum::<f32>().sqrt() / 2.0
-            }
+            HnswPrecision::Sq8 => self.sq8_scales.iter().map(|s| s * s).sum::<f32>().sqrt() / 2.0,
             HnswPrecision::Sq8Fixed => SQ8_FIXED_SCALE * (self.dim as f32).sqrt(),
             HnswPrecision::Sq16Fixed => SQ16_FIXED_SCALE * (self.dim as f32).sqrt(),
             _ => 0.0,
@@ -899,11 +891,17 @@ mod tests {
                         .map(|(a, b)| (a - b) * (a - b))
                         .sum::<f32>(),
                     DistanceType::Cosine => (1.0
-                        - decoded.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f32>())
+                        - decoded
+                            .iter()
+                            .zip(q.iter())
+                            .map(|(a, b)| a * b)
+                            .sum::<f32>())
                     .max(0.0),
-                    DistanceType::InnerProduct => {
-                        -decoded.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f32>()
-                    }
+                    DistanceType::InnerProduct => -decoded
+                        .iter()
+                        .zip(q.iter())
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>(),
                 };
                 let tol = 1e-5 * (1.0 + want.abs());
                 assert!(
@@ -1201,7 +1199,11 @@ mod tests {
         let mut rng = rand::rngs::SmallRng::seed_from_u64(99);
         for (p, scale, k2) in [
             (HnswPrecision::Sq8Fixed, SQ8_FIXED_SCALE, 1.0f32),
-            (HnswPrecision::Sq16Fixed, SQ16_FIXED_SCALE, 128.0f32 * 128.0f32),
+            (
+                HnswPrecision::Sq16Fixed,
+                SQ16_FIXED_SCALE,
+                128.0f32 * 128.0f32,
+            ),
         ] {
             let codec = Codec::new(p, dim);
             for _ in 0..30 {
@@ -1211,12 +1213,8 @@ mod tests {
                 let enc = codec.encode(&v);
                 let Sq8QueryState::Pairwise(qhat) = codec.sq8_query_state(&q, true);
                 let got = match p {
-                    HnswPrecision::Sq8Fixed => {
-                        codec.distance_l2_sq8_fixed_pairwise(&qhat, &enc)
-                    }
-                    HnswPrecision::Sq16Fixed => {
-                        codec.distance_l2_sq16_fixed_pairwise(&qhat, &enc)
-                    }
+                    HnswPrecision::Sq8Fixed => codec.distance_l2_sq8_fixed_pairwise(&qhat, &enc),
+                    HnswPrecision::Sq16Fixed => codec.distance_l2_sq16_fixed_pairwise(&qhat, &enc),
                     _ => unreachable!(),
                 };
                 // Reference: decoded-domain L2 of the QUANTIZED query —
@@ -1254,8 +1252,16 @@ mod tests {
                 );
                 // And both kernels (x86 SIMD + scalar fallback) agree.
                 let scalar = match p {
-                    HnswPrecision::Sq8Fixed => crate::access_method::distance::distance_l2_sq8_fixed_pairwise_scalar(&qhat, &enc),
-                    HnswPrecision::Sq16Fixed => crate::access_method::distance::distance_l2_sq16_fixed_pairwise_scalar(&qhat, &enc),
+                    HnswPrecision::Sq8Fixed => {
+                        crate::access_method::distance::distance_l2_sq8_fixed_pairwise_scalar(
+                            &qhat, &enc,
+                        )
+                    }
+                    HnswPrecision::Sq16Fixed => {
+                        crate::access_method::distance::distance_l2_sq16_fixed_pairwise_scalar(
+                            &qhat, &enc,
+                        )
+                    }
                     _ => unreachable!(),
                 };
                 assert!(
@@ -1392,7 +1398,10 @@ mod tests {
                 out.push(x.clamp(0.0f32, 255.0f32).round() as u8);
             }
         }
-        println!("round-based: {} ns/vec", t0.elapsed().as_nanos() / n as u128);
+        println!(
+            "round-based: {} ns/vec",
+            t0.elapsed().as_nanos() / n as u128
+        );
 
         // Truncation variant: clamp + native truncating cast, no round().
         for _ in 0..10_000 {
@@ -1410,6 +1419,9 @@ mod tests {
                 out.push(x.clamp(0.0f32, 255.0f32) as u8);
             }
         }
-        println!("trunc-based: {} ns/vec", t1.elapsed().as_nanos() / n as u128);
+        println!(
+            "trunc-based: {} ns/vec",
+            t1.elapsed().as_nanos() / n as u128
+        );
     }
 }

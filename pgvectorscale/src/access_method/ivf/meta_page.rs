@@ -214,7 +214,10 @@ impl IvfMetaPage {
         let bytes = self.serialize_to_vec();
         if first_time {
             assert_eq!(
-                pg_sys::RelationGetNumberOfBlocksInFork(index.as_ptr(), pg_sys::ForkNumber::MAIN_FORKNUM),
+                pg_sys::RelationGetNumberOfBlocksInFork(
+                    index.as_ptr(),
+                    pg_sys::ForkNumber::MAIN_FORKNUM
+                ),
                 base,
                 "ivf: meta base does not match the relation end"
             );
@@ -304,8 +307,12 @@ impl IvfMetaPage {
         let mut stats = crate::access_method::stats::WriteStats::default();
         let (ptr, blocks) = match meta.get_free_list_pointer() {
             Some(old_ptr) => {
-                let mut tape =
-                    ChainTapeWriter::reinit(index, PageType::IvfFreeList, &mut stats, old_ptr.block_number);
+                let mut tape = ChainTapeWriter::reinit(
+                    index,
+                    PageType::IvfFreeList,
+                    &mut stats,
+                    old_ptr.block_number,
+                );
                 tape.write_counted(&bytes)
             }
             None => {

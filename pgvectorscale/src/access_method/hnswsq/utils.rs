@@ -24,9 +24,9 @@ use pgrx::pg_sys;
 use pgrx::*;
 
 use crate::access_method::distance::{self as kernels, DistanceType};
-use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision, Sq8Calibration, Sq8QueryState};
 use crate::access_method::hnswsq::options::Hnsw2Options;
 use crate::access_method::hnswsq::ptr::HnswPtr;
+use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision, Sq8Calibration, Sq8QueryState};
 use crate::access_method::hnswsq::types::*;
 use crate::util::ports::{PageGetContents, PageGetItem, PageGetItemId, PageGetMaxOffsetNumber};
 
@@ -219,14 +219,21 @@ impl Allocator {
 
 /// `HnswInitNeighborArray`: allocate a neighbor array of `lm` slots.
 pub unsafe fn init_neighbor_array(lm: usize, allocator: &Allocator) -> *mut NeighborArray {
-    let a = allocator.alloc(neighbor_array_size(lm)).cast::<NeighborArray>();
+    let a = allocator
+        .alloc(neighbor_array_size(lm))
+        .cast::<NeighborArray>();
     (*a).length = 0;
     (*a).closer_set = false;
     a
 }
 
 /// `HnswInitNeighbors`: allocate the per-layer neighbor array pointers.
-pub unsafe fn init_neighbors(base: *mut u8, element: *mut Element, m: usize, allocator: &Allocator) {
+pub unsafe fn init_neighbors(
+    base: *mut u8,
+    element: *mut Element,
+    m: usize,
+    allocator: &Allocator,
+) {
     let level = (*element).level as usize;
     let neighbor_list = allocator
         .alloc((level + 1) * std::mem::size_of::<HnswPtr>())
@@ -278,7 +285,9 @@ pub unsafe fn init_element(
     level: usize,
     allocator: &Allocator,
 ) -> *mut Element {
-    let element = allocator.alloc(std::mem::size_of::<Element>()).cast::<Element>();
+    let element = allocator
+        .alloc(std::mem::size_of::<Element>())
+        .cast::<Element>();
     let element = &mut *element;
     crate::access_method::hnswsq::ptr::store(base, &mut element.next, std::ptr::null_mut::<u8>());
     element.heaptid_set = 0;
@@ -347,10 +356,7 @@ pub unsafe fn page_get_meta(page: pg_sys::Page) -> *mut MetaPageData {
 /// The metapage is authoritative for embedded regions (an AgentVec HOT
 /// segment's relation carries *agentvec* reloptions, not hnswsq ones); for
 /// the standalone AM these equal the reloptions the build stored.
-pub unsafe fn region_params(
-    index: pg_sys::Relation,
-    base: pg_sys::BlockNumber,
-) -> (usize, usize) {
+pub unsafe fn region_params(index: pg_sys::Relation, base: pg_sys::BlockNumber) -> (usize, usize) {
     let buf = pg_sys::ReadBuffer(index, metapage_block(base));
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
     let page = pg_sys::BufferGetPage(buf);
@@ -451,7 +457,6 @@ pub unsafe fn get_meta_page_info(
     pg_sys::UnlockReleaseBuffer(buf);
 }
 
-
 /// Read a TID's block without pgrx's validity assertion (we check invalid
 /// TIDs all the time — that IS the check).
 #[inline]
@@ -490,10 +495,8 @@ pub unsafe fn meta_page_layout(
     }
     let precision = HnswPrecision::from_u8((*metap).precision);
     let dimensions = (*metap).dimensions as usize;
-    let calibration = crate::util::ItemPointer::new(
-        (*metap).calibration_blkno,
-        (*metap).calibration_offno,
-    );
+    let calibration =
+        crate::util::ItemPointer::new((*metap).calibration_blkno, (*metap).calibration_offno);
     pg_sys::UnlockReleaseBuffer(buf);
     (precision, dimensions, calibration)
 }
@@ -605,10 +608,8 @@ pub unsafe fn create_meta_page(
 
     // pd_lower sits right past the metapage struct, as in pgvector.
     let header = page.cast::<pg_sys::PageHeaderData>();
-    (*header).pd_lower = (pg_sys::MAXALIGN(std::mem::offset_of!(
-        pg_sys::PageHeaderData,
-        pd_linp
-    )) + std::mem::size_of::<MetaPageData>()) as u16;
+    (*header).pd_lower = (pg_sys::MAXALIGN(std::mem::offset_of!(pg_sys::PageHeaderData, pd_linp))
+        + std::mem::size_of::<MetaPageData>()) as u16;
 
     pg_sys::MarkBufferDirty(buf);
     pg_sys::UnlockReleaseBuffer(buf);
@@ -730,7 +731,6 @@ pub unsafe fn set_neighbor_tuple(
 
     (*ntup).type_ = NEIGHBOR_TUPLE_TYPE;
 
-
     let tids = ntup
         .cast::<u8>()
         .add(NEIGHBOR_TUPLE_HEADER_SIZE)
@@ -776,14 +776,11 @@ pub unsafe fn load_element_from_tuple(
     (*element).version = (*etup).version;
     (*element).clamped = (*etup).clamped;
     (*element).neighbor_page = ip_block(&(*etup).neighbortid);
-    (*element).neighbor_offno =
-        ip_offset(&(*etup).neighbortid);
+    (*element).neighbor_offno = ip_offset(&(*etup).neighbortid);
     (*element).heaptid_set = 0;
 
     if load_heaptid {
-        if ip_block(&(*etup).heaptid)
-            != pg_sys::InvalidBlockNumber
-        {
+        if ip_block(&(*etup).heaptid) != pg_sys::InvalidBlockNumber {
             (*element).heaptid = (*etup).heaptid;
             (*element).heaptid_set = 1;
         }
@@ -1029,7 +1026,9 @@ pub unsafe fn init_search_candidate(
     element: *mut Element,
     distance: f32,
 ) -> SearchCandidate {
-    let mut hp = HnswPtr { ptr: std::ptr::null_mut() };
+    let mut hp = HnswPtr {
+        ptr: std::ptr::null_mut(),
+    };
     crate::access_method::hnswsq::ptr::store(base, &mut hp, element);
     SearchCandidate {
         element: hp,
@@ -1166,7 +1165,10 @@ pub unsafe fn load_unvisited_from_memory(
     let neighborhood = get_neighbors(base, element, lc);
 
     // Copy the neighborhood to local memory
-    pg_sys::LWLockAcquire(std::ptr::addr_of_mut!((*element).lock), pg_sys::LWLockMode::LW_SHARED);
+    pg_sys::LWLockAcquire(
+        std::ptr::addr_of_mut!((*element).lock),
+        pg_sys::LWLockMode::LW_SHARED,
+    );
     local.clear();
     for i in 0..(*neighborhood).length as usize {
         local.push(*neighbor_items(neighborhood).add(i));
@@ -1243,7 +1245,8 @@ pub unsafe fn load_unvisited_from_disk(
         if ip_block(indextid) == pg_sys::InvalidBlockNumber {
             break;
         }
-        let found = v.insert(pack_tid(*indextid));        if !found {
+        let found = v.insert(pack_tid(*indextid));
+        if !found {
             unvisited.push(Unvisited::Tid(*indextid));
         }
     }
@@ -1640,8 +1643,7 @@ unsafe fn check_element_closer(
     let e_element = crate::access_method::hnswsq::ptr::access::<Element>(base, (*e).element);
 
     for &ri in r {
-        let ri_element =
-            crate::access_method::hnswsq::ptr::access::<Element>(base, (*ri).element);
+        let ri_element = crate::access_method::hnswsq::ptr::access::<Element>(base, (*ri).element);
         let distance = pair_distance(base, support, e_element, ri_element, scratch);
         if distance <= (*e).distance {
             return false;
@@ -1777,7 +1779,9 @@ pub unsafe fn update_connection(
     support: &Support,
     scratch: &mut Vec<f32>,
 ) {
-    let mut new_hp = HnswPtr { ptr: std::ptr::null_mut() };
+    let mut new_hp = HnswPtr {
+        ptr: std::ptr::null_mut(),
+    };
     crate::access_method::hnswsq::ptr::store(base, &mut new_hp, new_element);
     let mut new_hc = Candidate {
         element: new_hp,
@@ -2068,11 +2072,7 @@ pub fn build_level(seed: i32, ml: f64, max_level: usize, tid: pg_sys::ItemPointe
     // Same fnv1a mixing as the old levels module, so levels match for the
     // same (seed, tid) when comparing builds.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in block
-        .to_le_bytes()
-        .into_iter()
-        .chain(offset.to_le_bytes())
-    {
+    for byte in block.to_le_bytes().into_iter().chain(offset.to_le_bytes()) {
         h ^= byte as u64;
         h = h.wrapping_mul(0x100_0000_01b3);
     }
@@ -2121,7 +2121,9 @@ mod tests {
         // Allocate the element and its value by hand (init_element needs an
         // Allocator + a backend; the unit tests build the same shape).
         let element = alloc.alloc::<Element>();
-        (*element).next = HnswPtr { ptr: std::ptr::null_mut() };
+        (*element).next = HnswPtr {
+            ptr: std::ptr::null_mut(),
+        };
         (*element).heaptid = tid;
         (*element).heaptid_set = 1;
         (*element).level = level as u8;
@@ -2207,7 +2209,9 @@ mod tests {
             // away from 0.1, which is not > 0.3, so it loses.
             let mk = |v: f32| -> (*mut Element, Candidate) {
                 let (e, _codec) = test_element(&alloc, 4, 0, vec![v]);
-                let mut hp = HnswPtr { ptr: std::ptr::null_mut() };
+                let mut hp = HnswPtr {
+                    ptr: std::ptr::null_mut(),
+                };
                 crate::access_method::hnswsq::ptr::store(std::ptr::null_mut(), &mut hp, e);
                 (
                     e,
@@ -2316,11 +2320,10 @@ mod tests {
             let mut vals: Vec<f32> = (0..2)
                 .map(|i| {
                     let hp = (*neighbor_items(na).add(i)).element;
-                    let e =
-                        crate::access_method::hnswsq::ptr::access::<Element>(
-                            std::ptr::null_mut(),
-                            hp,
-                        );
+                    let e = crate::access_method::hnswsq::ptr::access::<Element>(
+                        std::ptr::null_mut(),
+                        hp,
+                    );
                     let v = get_value(std::ptr::null_mut(), e, 4);
                     Codec::new(HnswPrecision::Plain, 1).decode(v)[0]
                 })
@@ -2383,9 +2386,13 @@ mod tests {
             (*n2).blkno = 11;
             (*n2).offno = 2;
             let na = get_neighbors(std::ptr::null_mut(), element, 0);
-            let mut hp1 = HnswPtr { ptr: std::ptr::null_mut() };
+            let mut hp1 = HnswPtr {
+                ptr: std::ptr::null_mut(),
+            };
             crate::access_method::hnswsq::ptr::store(std::ptr::null_mut(), &mut hp1, n1);
-            let mut hp2 = HnswPtr { ptr: std::ptr::null_mut() };
+            let mut hp2 = HnswPtr {
+                ptr: std::ptr::null_mut(),
+            };
             crate::access_method::hnswsq::ptr::store(std::ptr::null_mut(), &mut hp2, n2);
             *neighbor_items(na) = Candidate {
                 element: hp1,
@@ -2410,19 +2417,10 @@ mod tests {
                 .add(NEIGHBOR_TUPLE_HEADER_SIZE)
                 .cast::<pg_sys::ItemPointerData>();
             // Highest layer first: layer 2 at index 0.
-            assert_eq!(
-                ip_block(&*tids.add(2 * 4)),
-                10
-            );
-            assert_eq!(
-                ip_block(&*tids.add(2 * 4 + 1)),
-                11
-            );
+            assert_eq!(ip_block(&*tids.add(2 * 4)), 10);
+            assert_eq!(ip_block(&*tids.add(2 * 4 + 1)), 11);
             // Padding beyond the valid prefix is invalid.
-            assert_eq!(
-                ip_block(&*tids.add(2 * 4 + 2)),
-                pg_sys::InvalidBlockNumber
-            );
+            assert_eq!(ip_block(&*tids.add(2 * 4 + 2)), pg_sys::InvalidBlockNumber);
         }
     }
 }

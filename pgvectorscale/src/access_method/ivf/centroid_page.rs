@@ -64,8 +64,13 @@ impl IvfCentroidPage {
             for item in tape.read(pointer) {
                 buf.extend_from_slice(item.get_data_slice());
             }
-            rkyv::from_bytes::<IvfCentroidPage>(&buf)
-                .unwrap_or_else(|e| panic!("IVF: centroid-page parse failed ({} bytes): {:?}", buf.len(), e))
+            rkyv::from_bytes::<IvfCentroidPage>(&buf).unwrap_or_else(|e| {
+                panic!(
+                    "IVF: centroid-page parse failed ({} bytes): {:?}",
+                    buf.len(),
+                    e
+                )
+            })
         }
     }
 }

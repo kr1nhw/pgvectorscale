@@ -53,7 +53,9 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         // not nest inside the header lock, so the reservation happens here.
         let peek_rewrite = {
             let peek = IvfListHeader::load(&index_rel, header_ptr);
-            let segs = IvfSegmentList::load(&index_rel, peek.segment_list).segments.len();
+            let segs = IvfSegmentList::load(&index_rel, peek.segment_list)
+                .segments
+                .len();
             segs > 1 || peek.active.is_some()
         };
         let reserved_item: Option<pg_sys::BlockNumber> = if peek_rewrite {
@@ -89,9 +91,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                     }
                 };
                 for segment in &segment_list.segments {
-                    if segment.start_page == pg_sys::InvalidBlockNumber
-                        || segment.num_blocks == 0
-                    {
+                    if segment.start_page == pg_sys::InvalidBlockNumber || segment.num_blocks == 0 {
                         continue;
                     }
                     let entries = reader.read_entries(segment.start_page, segment.num_blocks);
@@ -112,11 +112,8 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
 
                 // Skip the rewrite when nothing died and there is nothing to
                 // merge (a single published segment and no active buffer).
-                let current_total: u64 =
-                    segment_list.segments.iter().map(|s| s.num_entries).sum();
-                if total_dead == dead_before
-                    && segment_list.segments.len() <= 1
-                    && !active_present
+                let current_total: u64 = segment_list.segments.iter().map(|s| s.num_entries).sum();
+                if total_dead == dead_before && segment_list.segments.len() <= 1 && !active_present
                 {
                     return (current_total, Vec::new(), false, reserved_item);
                 }
@@ -129,11 +126,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                 let seg_start = segment.start_page;
                 let seg_blocks = segment.num_blocks;
                 let seg_empty = segment.is_empty();
-                let segments = if seg_empty {
-                    Vec::new()
-                } else {
-                    vec![segment]
-                };
+                let segments = if seg_empty { Vec::new() } else { vec![segment] };
                 let segment_list_new = IvfSegmentList::new(segments);
                 let mut item_used = false;
                 let (new_ptr, new_blocks) = match reserved_item {

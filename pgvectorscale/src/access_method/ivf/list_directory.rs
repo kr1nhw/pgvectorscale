@@ -83,20 +83,12 @@ impl IvfListDirectory {
         let mut tape = if first_time {
             ChainTapeWriter::new(index, PageType::IvfListDirectory, &mut stats)
         } else {
-            ChainTapeWriter::reinit(
-                index,
-                PageType::IvfListDirectory,
-                &mut stats,
-                base + 1,
-            )
+            ChainTapeWriter::reinit(index, PageType::IvfListDirectory, &mut stats, base + 1)
         };
 
         let bytes = self.serialize_to_vec();
         let off = tape.write(&bytes);
-        assert_eq!(
-            off,
-            ItemPointer::new(base + 1, LIST_DIRECTORY_OFFSET)
-        );
+        assert_eq!(off, ItemPointer::new(base + 1, LIST_DIRECTORY_OFFSET));
     }
 
     /// Store the list directory anywhere (embedded segments), returning its
@@ -110,7 +102,10 @@ impl IvfListDirectory {
 
     /// Load the list directory from the AM's fixed slot (`base + 1`).
     pub fn load(index: &PgRelation, base: pg_sys::BlockNumber) -> IvfListDirectory {
-        Self::load_at(index, crate::util::ItemPointer::new(base + 1, LIST_DIRECTORY_OFFSET))
+        Self::load_at(
+            index,
+            crate::util::ItemPointer::new(base + 1, LIST_DIRECTORY_OFFSET),
+        )
     }
 
     /// Load a list directory from an arbitrary pointer (embedded segments).
@@ -123,8 +118,13 @@ impl IvfListDirectory {
             for item in tape.read(pointer) {
                 buf.extend_from_slice(item.get_data_slice());
             }
-            rkyv::from_bytes::<IvfListDirectory>(&buf)
-                .unwrap_or_else(|e| panic!("IVF: list-directory parse failed ({} bytes): {:?}", buf.len(), e))
+            rkyv::from_bytes::<IvfListDirectory>(&buf).unwrap_or_else(|e| {
+                panic!(
+                    "IVF: list-directory parse failed ({} bytes): {:?}",
+                    buf.len(),
+                    e
+                )
+            })
         }
     }
 }

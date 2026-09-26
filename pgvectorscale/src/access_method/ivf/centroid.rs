@@ -268,17 +268,23 @@ mod tests {
         let expected_c1 = vec![0.1, 0.033333334];
         let expected_c2 = vec![10.1, 10.033333];
 
-        let (actual_c1, actual_c2) = if near_origin(c0) {
-            (c0, c1)
-        } else {
-            (c1, c0)
-        };
+        let (actual_c1, actual_c2) = if near_origin(c0) { (c0, c1) } else { (c1, c0) };
 
         for (a, e) in actual_c1.iter().zip(expected_c1.iter()) {
-            assert!((a - e).abs() < 1e-4, "Expected ~{:?}, got {:?}", expected_c1, actual_c1);
+            assert!(
+                (a - e).abs() < 1e-4,
+                "Expected ~{:?}, got {:?}",
+                expected_c1,
+                actual_c1
+            );
         }
         for (a, e) in actual_c2.iter().zip(expected_c2.iter()) {
-            assert!((a - e).abs() < 1e-4, "Expected ~{:?}, got {:?}", expected_c2, actual_c2);
+            assert!(
+                (a - e).abs() < 1e-4,
+                "Expected ~{:?}, got {:?}",
+                expected_c2,
+                actual_c2
+            );
         }
     }
 

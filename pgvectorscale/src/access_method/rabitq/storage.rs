@@ -27,11 +27,11 @@ use crate::{
     },
 };
 
+use super::super::rabitq::code_cos_distance;
 use super::{
     node::{ArchivedRabitqNode, RabitqNode, RabitqNodeData},
     RabitqNodeDistanceMeasure, RabitqQuantizerMetadata, RabitqSearchDistanceMeasure,
 };
-use super::super::rabitq::code_cos_distance;
 
 pub struct RabitqSpeedupStorage<'a> {
     pub index: &'a PgRelation,
@@ -190,7 +190,11 @@ impl<'a> RabitqSpeedupStorage<'a> {
                         .sdm
                         .as_ref()
                         .expect("sdm is Some")
-                        .calculate_bq_distance(node_neighbor.get_rabitq_data(), gns, &mut lsr.stats);
+                        .calculate_bq_distance(
+                            node_neighbor.get_rabitq_data(),
+                            gns,
+                            &mut lsr.stats,
+                        );
 
                     let lsn = ListSearchNeighbor::new(
                         neighbor_index_pointer,
@@ -312,7 +316,8 @@ impl Storage for RabitqSpeedupStorage<'_> {
         // takes the page's exclusive lock so no concurrent reader/writer can
         // race the neighbor update, and `self.has_labels` matches the stored
         // variant (both derive from the meta page).
-        let mut node = unsafe { RabitqNode::modify(self.index, index_pointer, self.has_labels, stats) };
+        let mut node =
+            unsafe { RabitqNode::modify(self.index, index_pointer, self.has_labels, stats) };
         let mut archived = node.get_archived_node();
         archived.set_neighbors(neighbors, self.num_neighbors);
         node.commit();
@@ -378,11 +383,7 @@ impl Storage for RabitqSpeedupStorage<'_> {
                 let other = arch.get_rabitq_data();
                 stats.record_quantized_distance_comparison();
                 let dist = match self.quantizer_num_bits() {
-                    4 | 8 => code_cos_distance(
-                        &data.code,
-                        &other.code,
-                        self.quantizer_num_bits(),
-                    ),
+                    4 | 8 => code_cos_distance(&data.code, &other.code, self.quantizer_num_bits()),
                     _ => {
                         // code-to-code cosine estimate via the arcsin identity
                         let d = data.code.len() as f32 * 8.0;
@@ -419,7 +420,8 @@ impl Storage for RabitqSpeedupStorage<'_> {
         // SAFETY: `index_pointer` is the graph's entry/start node pointer
         // (written by the build path and live while the scan runs); the node is
         // sealed and immutable, and `self.has_labels` matches the stored variant.
-        let rn = unsafe { RabitqNode::read(self.index, index_pointer, self.has_labels, &mut lsr.stats) };
+        let rn =
+            unsafe { RabitqNode::read(self.index, index_pointer, self.has_labels, &mut lsr.stats) };
         let node = rn.get_archived_node();
         let distance = lsr.sdm.as_ref().unwrap().calculate_bq_distance(
             node.get_rabitq_data(),
@@ -480,7 +482,8 @@ impl Storage for RabitqSpeedupStorage<'_> {
         // takes the page's exclusive lock so no concurrent reader/writer can
         // race the neighbor update, and `self.has_labels` matches the stored
         // variant (both derive from the meta page).
-        let mut node = unsafe { RabitqNode::modify(self.index, index_pointer, self.has_labels, stats) };
+        let mut node =
+            unsafe { RabitqNode::modify(self.index, index_pointer, self.has_labels, stats) };
         let mut archived = node.get_archived_node();
         archived.set_neighbors(neighbors, self.num_neighbors);
         node.commit();

@@ -34,9 +34,8 @@ mod tests {
     /// The ids returned by an approximate-nearest-neighbour query, in order.
     fn search_ids(table: &str, column: &str, op: &str, query: &str, limit: usize) -> Vec<i32> {
         Spi::connect(|client| {
-            let sql = format!(
-                "SELECT id FROM {table} ORDER BY {column} {op} '{query}' LIMIT {limit}"
-            );
+            let sql =
+                format!("SELECT id FROM {table} ORDER BY {column} {op} '{query}' LIMIT {limit}");
             let table = client.select(&sql, None, &[])?;
             let mut ids = Vec::new();
             for row in table {
@@ -145,8 +144,8 @@ mod tests {
         );
 
         // Kill the heap row with id = 1 through the AM's own bulkdelete.
-        let ctid = Spi::get_one::<String>("SELECT ctid::text FROM t_av_tomb WHERE id = 1")?
-            .expect("ctid");
+        let ctid =
+            Spi::get_one::<String>("SELECT ctid::text FROM t_av_tomb WHERE id = 1")?.expect("ctid");
         let (block, offset) = parse_ctid(&ctid);
 
         struct KillOne {
@@ -353,8 +352,8 @@ mod tests {
         // Bulk loads build IVF segments directly; the HNSW HOT path belongs
         // to inserts, which seal at hot_segment_max_rows (two 10-row sealed
         // segments here).  Converting the oldest sealed segment...
-        let converted = Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_conv')")?
-            .expect("converted");
+        let converted =
+            Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_conv')")?.expect("converted");
         assert_eq!(converted, 10, "the oldest sealed segment holds 10 rows");
 
         let warm = Spi::get_one::<i64>(
@@ -373,7 +372,11 @@ mod tests {
         // rows: the retired HOT segment keeps its 10 entries until phase-10
         // reclamation, so the index holds 30 HOT + 10 WARM copies. Retired
         // segments are not searched, so no duplicate TIDs reach the scan.
-        assert_eq!((warm, retired, total), (1, 1, 40), "1 warm, 1 retired, no row lost");
+        assert_eq!(
+            (warm, retired, total),
+            (1, 1, 40),
+            "1 warm, 1 retired, no row lost"
+        );
 
         // The converted segment is immutable and searchable.
         assert_eq!(
@@ -414,7 +417,10 @@ mod tests {
             let exact = exact_topk(&rows, q, 10);
             let got = search_ids("t_av_recall", "v", "<->", &vec_literal(q), 10);
             total += 10;
-            hits += got.iter().filter(|id| exact.contains(&(**id as usize))).count();
+            hits += got
+                .iter()
+                .filter(|id| exact.contains(&(**id as usize)))
+                .count();
         }
         let recall = hits as f64 / total as f64;
         assert!(
@@ -446,7 +452,13 @@ mod tests {
             let directory = meta.load_directory(&index);
             let options = TSVAgentVecOptions::from_relation(&index);
             let decided = unsafe {
-                router::route(&index, &[0.0; 8], &directory, &options, meta.get_router_base())
+                router::route(
+                    &index,
+                    &[0.0; 8],
+                    &directory,
+                    &options,
+                    meta.get_router_base(),
+                )
             };
             assert!(decided.is_none(), "no region means no decision");
         }
@@ -468,17 +480,17 @@ mod tests {
             .segments
             .iter()
             .filter(|s| {
-                s.algorithm() == crate::access_method::agentvec::directory::SegmentAlgorithm::IvfRaBitQ
+                s.algorithm()
+                    == crate::access_method::agentvec::directory::SegmentAlgorithm::IvfRaBitQ
                     && s.ownership() == SegmentOwnership::Owned
             })
             .map(|s| s.segment_id)
             .collect();
         assert_eq!(warm.len(), 2, "two converted segments");
 
-        let decided = unsafe {
-            router::route(&index, &[0.0; 8], &directory, &options, router_base)
-        }
-        .expect("the router must decide once it has nodes");
+        let decided =
+            unsafe { router::route(&index, &[0.0; 8], &directory, &options, router_base) }
+                .expect("the router must decide once it has nodes");
         assert_eq!(decided.len(), 2, "top_m = 2 activates at most 2");
         assert!(
             decided.iter().all(|id| warm.contains(id)),
@@ -529,7 +541,10 @@ mod tests {
             let exact = exact_topk(&rows, q, 10);
             let got = search_ids("t_av_rr", "v", "<->", &vec_literal(q), 10);
             total += 10;
-            hits += got.iter().filter(|id| exact.contains(&(**id as usize))).count();
+            hits += got
+                .iter()
+                .filter(|id| exact.contains(&(**id as usize)))
+                .count();
         }
         let recall = hits as f64 / total as f64;
         assert!(
@@ -685,7 +700,10 @@ mod tests {
 
         let converted =
             Spi::get_one::<i64>("SELECT agentvec_consolidate('idx_av_heal')")?.expect("n");
-        assert_eq!(converted, 10, "the Retiring sealed segment is reclaimed and converted");
+        assert_eq!(
+            converted, 10,
+            "the Retiring sealed segment is reclaimed and converted"
+        );
         let warm: i64 = Spi::get_one::<i64>(
             "SELECT count(*) FROM agentvec_index_info('idx_av_heal') WHERE algorithm = 'ivf_rabitq'",
         )?
@@ -811,7 +829,11 @@ mod tests {
         force_index_scan();
 
         let ids = search_ids("t_av_bound", "v", "<->", "[0,0]", 10);
-        assert_eq!(ids.len(), 3, "a bounded scan returns at most `search_candidates` rows");
+        assert_eq!(
+            ids.len(),
+            3,
+            "a bounded scan returns at most `search_candidates` rows"
+        );
         assert!(ids.iter().all(|id| (1..=10).contains(id)));
         Ok(())
     }

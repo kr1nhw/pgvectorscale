@@ -14,7 +14,6 @@ use crate::access_method::ivf::entry::{
     append_active_entry_bytes, read_active_entries, seal_blocks_needed, seal_entries,
     seal_entries_at, serialize_active_entry, IvfEntry,
 };
-use crate::util::page::ReadablePage;
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::{IvfMetaPage, IVF_STANDALONE_BASE};
 use crate::access_method::ivf::options::IVF_SEAL_THRESHOLD;
@@ -22,6 +21,7 @@ use crate::access_method::ivf::segment::{IvfFreeRange, IvfListHeader, IvfSegment
 use crate::access_method::ivf::simd::find_nearest_centroids;
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::access_method::quantization::rabitq::{padded_dim, RabitqQuantizer};
+use crate::util::page::ReadablePage;
 use crate::util::ItemPointer;
 
 /// Insert a tuple into the IVF index.
@@ -186,13 +186,10 @@ pub unsafe extern "C-unwind" fn aminsert(
                             let used = seal_entries_at(&index_rel, entries, start);
                             reserved_used = true;
                             if used < need {
-                                unused_tail = Some((start + used as pg_sys::BlockNumber, need - used));
+                                unused_tail =
+                                    Some((start + used as pg_sys::BlockNumber, need - used));
                             }
-                            crate::access_method::ivf::segment::IvfSegment::new(
-                                start,
-                                used,
-                                count,
-                            )
+                            crate::access_method::ivf::segment::IvfSegment::new(start, used, count)
                         }
                         _ => seal_entries(&index_rel, entries),
                     };
@@ -264,11 +261,7 @@ pub unsafe extern "C-unwind" fn aminsert(
             reserved_page_used = page_used;
             header.active = Some(new_active);
 
-            let unused_item_block = if item_block_used {
-                None
-            } else {
-                reserved_item
-            };
+            let unused_item_block = if item_block_used { None } else { reserved_item };
             Outcome {
                 retired,
                 reserved_used,

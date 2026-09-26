@@ -10,13 +10,13 @@ use crate::access_method::distance::DistanceType;
 use crate::access_method::ivf::centroid::{kmeans_plus_plus_init, lloyds_algorithm};
 use crate::access_method::ivf::centroid_page::IvfCentroidPage;
 use crate::access_method::ivf::entry::{seal_entries, IvfEntry};
-use crate::access_method::storage::StorageType;
 use crate::access_method::ivf::list_directory::IvfListDirectory;
 use crate::access_method::ivf::meta_page::{IvfMetaPage, IVF_STANDALONE_BASE};
 use crate::access_method::ivf::options::TSVIvfOptions;
 use crate::access_method::ivf::segment::{IvfListHeader, IvfSegment, IvfSegmentList};
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::access_method::quantization::rabitq::{RabitqQuantizer, RabitqVector};
+use crate::access_method::storage::StorageType;
 use crate::util::ItemPointer;
 use rayon::prelude::*;
 
@@ -192,8 +192,7 @@ pub unsafe extern "C-unwind" fn ambuild(
             .sum();
         num_tuples += count;
 
-        let segment_list =
-            IvfSegmentList::new(std::mem::take(&mut assign_state.segments[list_id]));
+        let segment_list = IvfSegmentList::new(std::mem::take(&mut assign_state.segments[list_id]));
         let (segment_list_ptr, segment_list_blocks) = unsafe { segment_list.store(&index_rel) };
         let header = IvfListHeader::new(segment_list_ptr, segment_list_blocks);
         let header_ptr = unsafe { header.store_new(&index_rel) };
@@ -261,8 +260,15 @@ pub unsafe fn build_embedded_region(
     // ---- K-means on the sample. ----
     let mut rng = SmallRng::from_entropy();
     let rotation_seed: u64 = rng.gen();
-    let quantizer = RabitqQuantizer::new(num_bits, rotation_seed, index_rel
-        .tuple_desc().get(0).map(|a| a.atttypmod as usize).unwrap_or(0));
+    let quantizer = RabitqQuantizer::new(
+        num_bits,
+        rotation_seed,
+        index_rel
+            .tuple_desc()
+            .get(0)
+            .map(|a| a.atttypmod as usize)
+            .unwrap_or(0),
+    );
     let mut centroids = kmeans_plus_plus_init(&sample_state.sample, num_lists, distance_type);
     centroids = lloyds_algorithm(
         &sample_state.sample,
@@ -276,7 +282,11 @@ pub unsafe fn build_embedded_region(
     let mut meta_page = IvfMetaPage::create(
         &index_rel,
         base,
-        index_rel.tuple_desc().get(0).map(|a| a.atttypmod as usize).unwrap_or(0) as u32,
+        index_rel
+            .tuple_desc()
+            .get(0)
+            .map(|a| a.atttypmod as usize)
+            .unwrap_or(0) as u32,
         distance_type,
         num_lists as u16,
         StorageType::RabitqCompression,
@@ -339,7 +349,12 @@ pub unsafe fn build_embedded_region(
     // Bulk smgr scans need the built entry blocks on disk first.
     pg_sys::FlushRelationBuffers(index_rel.as_ptr());
 
-    (reltuples, num_tuples as f64, assign_state.centroids, list_directory_ptr)
+    (
+        reltuples,
+        num_tuples as f64,
+        assign_state.centroids,
+        list_directory_ptr,
+    )
 }
 
 /// Pass-1 callback: reservoir sampling (Algorithm R) with a row counter.
@@ -399,8 +414,11 @@ unsafe extern "C-unwind" fn assign_callback(
     let pg_vec_internal = detoasted_datum.cast_mut_ptr::<PgVectorInternal>();
     let vec_slice = unsafe { (*pg_vec_internal).to_slice() };
 
-    let list_id =
-        nearest_centroid(vec_slice, &assign_state.centroids, assign_state.distance_type) as usize;
+    let list_id = nearest_centroid(
+        vec_slice,
+        &assign_state.centroids,
+        assign_state.distance_type,
+    ) as usize;
     let code = assign_state
         .quantizer
         .quantize_residual(&assign_state.centroids[list_id], vec_slice);
@@ -540,11 +558,7 @@ pub fn assign_vectors_to_lists(
 
 /// Find the nearest centroid to a single vector (index into `centroids`).
 #[inline]
-pub fn nearest_centroid(
-    vec: &[f32],
-    centroids: &[Vec<f32>],
-    distance_type: DistanceType,
-) -> u16 {
+pub fn nearest_centroid(vec: &[f32], centroids: &[Vec<f32>], distance_type: DistanceType) -> u16 {
     let dist_fn = distance_type.get_distance_function();
     let mut best_list = 0u16;
     let mut best_dist = dist_fn(vec, &centroids[0]);
@@ -629,8 +643,8 @@ pub fn build_ivf_index_serial(
             distance_type,
             num_lists as u16,
             storage_type,
-            num_bits,       // bq_num_bits_per_dimension
-            rotation_seed,  // rotation seed
+            num_bits,      // bq_num_bits_per_dimension
+            rotation_seed, // rotation seed
         )
     };
 
@@ -668,8 +682,7 @@ pub fn build_ivf_index_serial(
             vec![segment]
         };
         let segment_list = IvfSegmentList::new(segments);
-        let (segment_list_ptr, segment_list_blocks) =
-            unsafe { segment_list.store(index) };
+        let (segment_list_ptr, segment_list_blocks) = unsafe { segment_list.store(index) };
         let header = IvfListHeader::new(segment_list_ptr, segment_list_blocks);
         let header_ptr = unsafe { header.store_new(index) };
 

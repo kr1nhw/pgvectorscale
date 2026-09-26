@@ -103,9 +103,7 @@ unsafe fn remove_heap_tids(vac: &mut VacuumState) {
                 continue;
             }
 
-            if ip_block(&(*etup).heaptid)
-                != pg_sys::InvalidBlockNumber
-            {
+            if ip_block(&(*etup).heaptid) != pg_sys::InvalidBlockNumber {
                 let dead = (vac.callback).expect("bulkdelete callback")(
                     &mut (*etup).heaptid,
                     vac.callback_state,
@@ -127,9 +125,7 @@ unsafe fn remove_heap_tids(vac: &mut VacuumState) {
                 }
             }
 
-            if ip_block(&(*etup).heaptid)
-                == pg_sys::InvalidBlockNumber
-            {
+            if ip_block(&(*etup).heaptid) == pg_sys::InvalidBlockNumber {
                 // Add to deletion list
                 let mut indextid = pg_sys::ItemPointerData::default();
                 pgrx::itemptr::item_pointer_set_all(&mut indextid, blkno, offno);
@@ -212,8 +208,7 @@ unsafe fn needs_updated(vac: &VacuumState, element: *mut Element) -> bool {
     // candidates being deleted during insert; there should always be more
     // than zero indextids, but check for safety)
     if !needs && (*ntup).count > 0 {
-        needs = ip_block(&*tids.add((*ntup).count as usize - 1))
-            == pg_sys::InvalidBlockNumber;
+        needs = ip_block(&*tids.add((*ntup).count as usize - 1)) == pg_sys::InvalidBlockNumber;
     }
 
     pg_sys::UnlockReleaseBuffer(buf);
@@ -329,7 +324,11 @@ unsafe fn repair_graph_entry_point(vac: &mut VacuumState) {
 
     if !highest.is_null() {
         // Get a shared lock
-        pg_sys::LockPage(vac.index, update_lock_page(vac.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
+        pg_sys::LockPage(
+            vac.index,
+            update_lock_page(vac.base),
+            pg_sys::ShareLock as pg_sys::LOCKMODE,
+        );
 
         // Get latest entry point
         let mut entry = get_entry_point(vac.index, vac.base);
@@ -348,7 +347,16 @@ unsafe fn repair_graph_entry_point(vac: &mut VacuumState) {
 
         if !highest.is_null() {
             // Load element
-            load_element(highest, None, None, vac.index, &vac.support, true, None, None);
+            load_element(
+                highest,
+                None,
+                None,
+                vac.index,
+                &vac.support,
+                true,
+                None,
+                None,
+            );
 
             // Repair if needed
             if needs_updated(vac, highest) {
@@ -358,11 +366,19 @@ unsafe fn repair_graph_entry_point(vac: &mut VacuumState) {
         }
 
         // Release lock
-        pg_sys::UnlockPage(vac.index, update_lock_page(vac.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
+        pg_sys::UnlockPage(
+            vac.index,
+            update_lock_page(vac.base),
+            pg_sys::ShareLock as pg_sys::LOCKMODE,
+        );
     }
 
     // Prevent concurrent inserts when possibly updating entry point
-    pg_sys::LockPage(vac.index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::LockPage(
+        vac.index,
+        update_lock_page(vac.base),
+        pg_sys::ExclusiveLock as pg_sys::LOCKMODE,
+    );
 
     // Get latest entry point
     let mut entry = get_entry_point(vac.index, vac.base);
@@ -380,7 +396,11 @@ unsafe fn repair_graph_entry_point(vac: &mut VacuumState) {
                 vac.index,
                 vac.base,
                 UPDATE_ENTRY_ALWAYS,
-                if highest.is_null() { None } else { Some(highest) },
+                if highest.is_null() {
+                    None
+                } else {
+                    Some(highest)
+                },
                 pg_sys::InvalidBlockNumber,
                 false,
             );
@@ -412,14 +432,22 @@ unsafe fn repair_graph_entry_point(vac: &mut VacuumState) {
                 repair_graph_element(
                     vac,
                     entry_ptr,
-                    if highest.is_null() { None } else { Some(highest) },
+                    if highest.is_null() {
+                        None
+                    } else {
+                        Some(highest)
+                    },
                 );
             }
         }
     }
 
     // Release lock
-    pg_sys::UnlockPage(vac.index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::UnlockPage(
+        vac.index,
+        update_lock_page(vac.base),
+        pg_sys::ExclusiveLock as pg_sys::LOCKMODE,
+    );
 }
 
 /// `RepairGraph` (hnswvacuum.c): pass 2.
@@ -428,8 +456,16 @@ unsafe fn repair_graph(vac: &mut VacuumState) {
 
     // Wait for inserts to complete. Inserts before this point may have
     // neighbors about to be deleted. Inserts after this point will not.
-    pg_sys::LockPage(index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
-    pg_sys::UnlockPage(index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::LockPage(
+        index,
+        update_lock_page(vac.base),
+        pg_sys::ExclusiveLock as pg_sys::LOCKMODE,
+    );
+    pg_sys::UnlockPage(
+        index,
+        update_lock_page(vac.base),
+        pg_sys::ExclusiveLock as pg_sys::LOCKMODE,
+    );
 
     // Repair entry point first
     repair_graph_entry_point(vac);
@@ -473,9 +509,7 @@ unsafe fn repair_graph(vac: &mut VacuumState) {
                     continue;
                 }
                 // Skip updating neighbors if being deleted
-                if ip_block(&(*etup).heaptid)
-                    == pg_sys::InvalidBlockNumber
-                {
+                if ip_block(&(*etup).heaptid) == pg_sys::InvalidBlockNumber {
                     offno += 1;
                     continue;
                 }
@@ -590,18 +624,14 @@ unsafe fn confirm_repaired(vac: &VacuumState) {
                 continue;
             }
             // Skip if being deleted
-            if ip_block(&(*etup).heaptid)
-                == pg_sys::InvalidBlockNumber
-            {
+            if ip_block(&(*etup).heaptid) == pg_sys::InvalidBlockNumber {
                 offno += 1;
                 continue;
             }
 
             // Get neighbor page
-            let neighbor_page =
-                ip_block(&(*etup).neighbortid);
-            let neighbor_offno =
-                ip_offset(&(*etup).neighbortid);
+            let neighbor_page = ip_block(&(*etup).neighbortid);
+            let neighbor_offno = ip_offset(&(*etup).neighbortid);
 
             let nbuf: pg_sys::Buffer;
             let npage: pg_sys::Page;
@@ -630,9 +660,7 @@ unsafe fn confirm_repaired(vac: &VacuumState) {
             // Check neighbors
             for i in 0..(*ntup).count as usize {
                 let indextid = &*tids.add(i);
-                if ip_block(indextid)
-                    == pg_sys::InvalidBlockNumber
-                {
+                if ip_block(indextid) == pg_sys::InvalidBlockNumber {
                     continue;
                 }
                 // Check if in deletion list
@@ -664,13 +692,29 @@ unsafe fn mark_deleted(vac: &mut VacuumState) {
     // Wait for inserts and index scans to complete. Inserts and scans before
     // this point may visit tuples about to be deleted. Inserts and scans
     // after this point will not, since the graph has been repaired.
-    pg_sys::LockPage(index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
-    pg_sys::UnlockPage(index, update_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::LockPage(
+        index,
+        update_lock_page(vac.base),
+        pg_sys::ExclusiveLock as pg_sys::LOCKMODE,
+    );
+    pg_sys::UnlockPage(
+        index,
+        update_lock_page(vac.base),
+        pg_sys::ExclusiveLock as pg_sys::LOCKMODE,
+    );
 
     confirm_repaired(vac);
 
-    pg_sys::LockPage(index, scan_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
-    pg_sys::UnlockPage(index, scan_lock_page(vac.base), pg_sys::ExclusiveLock as pg_sys::LOCKMODE);
+    pg_sys::LockPage(
+        index,
+        scan_lock_page(vac.base),
+        pg_sys::ExclusiveLock as pg_sys::LOCKMODE,
+    );
+    pg_sys::UnlockPage(
+        index,
+        scan_lock_page(vac.base),
+        pg_sys::ExclusiveLock as pg_sys::LOCKMODE,
+    );
 
     let mut blkno = meta_graph_head(index, vac.base);
     let vec_bytes = vac.support.codec.vector_bytes();
@@ -716,18 +760,14 @@ unsafe fn mark_deleted(vac: &mut VacuumState) {
             }
 
             // Skip live tuples
-            if ip_block(&(*etup).heaptid)
-                != pg_sys::InvalidBlockNumber
-            {
+            if ip_block(&(*etup).heaptid) != pg_sys::InvalidBlockNumber {
                 offno += 1;
                 continue;
             }
 
             // Get neighbor page
-            let neighbor_page =
-                ip_block(&(*etup).neighbortid);
-            let neighbor_offno =
-                ip_offset(&(*etup).neighbortid);
+            let neighbor_page = ip_block(&(*etup).neighbortid);
+            let neighbor_offno = ip_offset(&(*etup).neighbortid);
 
             let nbuf: pg_sys::Buffer;
             let npage: pg_sys::Page;
@@ -811,7 +851,10 @@ unsafe fn mark_deleted(vac: &mut VacuumState) {
 
 /// The graph's head block from the metapage (pgvector's `HNSW_HEAD_BLKNO`,
 /// recorded because the calibration chain may precede the graph pages).
-pub unsafe fn meta_graph_head(index: pg_sys::Relation, base: pg_sys::BlockNumber) -> pg_sys::BlockNumber {
+pub unsafe fn meta_graph_head(
+    index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
+) -> pg_sys::BlockNumber {
     let buf = pg_sys::ReadBuffer(index, metapage_block(base));
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
     let page = pg_sys::BufferGetPage(buf);
@@ -872,14 +915,8 @@ pub unsafe fn vacuum_region(
         deleting: Visited::new(256),
         bas: pg_sys::GetAccessStrategy(pg_sys::BufferAccessStrategyType::BAS_BULKREAD),
         ntup: vec![0u8; pg_sys::BLCKSZ as usize],
-        highest: init_element_from_block(
-            pg_sys::InvalidBlockNumber,
-            pg_sys::InvalidOffsetNumber,
-        ),
-        fallback: init_element_from_block(
-            pg_sys::InvalidBlockNumber,
-            pg_sys::InvalidOffsetNumber,
-        ),
+        highest: init_element_from_block(pg_sys::InvalidBlockNumber, pg_sys::InvalidOffsetNumber),
+        fallback: init_element_from_block(pg_sys::InvalidBlockNumber, pg_sys::InvalidOffsetNumber),
         tmp_ctx: PgMemoryContexts::new("hnswsq vacuum temporary context"),
         scratch: SearchScratch::new(m),
         decode: Vec::with_capacity(dim),
@@ -917,7 +954,8 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
         return std::ptr::null_mut();
     }
 
-    (*stats).num_pages = pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+    (*stats).num_pages =
+        pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
 
     stats
 }

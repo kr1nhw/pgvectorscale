@@ -19,14 +19,14 @@ use pgrx::pg_sys;
 use pgrx::*;
 
 use crate::access_method::distance::{preprocess_cosine, DistanceType};
-use crate::access_method::hnswsq::quantize::{self, HnswPrecision};
 use crate::access_method::hnswsq::options::HNSW_EF_SEARCH;
 use crate::access_method::hnswsq::options::{
-    HNSW_ITERATIVE_SCAN, HNSW_MAX_SCAN_TUPLES, HNSW_SCAN_MEM_MULTIPLIER,
-    ITERATIVE_SCAN_OFF, ITERATIVE_SCAN_STRICT,
+    HNSW_ITERATIVE_SCAN, HNSW_MAX_SCAN_TUPLES, HNSW_SCAN_MEM_MULTIPLIER, ITERATIVE_SCAN_OFF,
+    ITERATIVE_SCAN_STRICT,
 };
-use crate::access_method::hnswsq::types::*;
 use crate::access_method::hnswsq::quantize::Sq8QueryState;
+use crate::access_method::hnswsq::quantize::{self, HnswPrecision};
+use crate::access_method::hnswsq::types::*;
 use crate::access_method::hnswsq::utils::*;
 use crate::access_method::pg_vector::PgVectorInternal;
 
@@ -199,7 +199,10 @@ pub unsafe fn region_candidates(
 
 /// `ResumeScanItems` (hnswscan.c): continue the layer-0 search from the
 /// discarded candidates.
-unsafe fn resume_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> Vec<SearchCandidate> {
+unsafe fn resume_scan_items(
+    state: &mut ScanState,
+    index: pg_sys::Relation,
+) -> Vec<SearchCandidate> {
     let load_vec = scan_load_vec(state.support.precision);
     let batch_size = (HNSW_EF_SEARCH.get() as usize).max(1);
 
@@ -219,7 +222,10 @@ unsafe fn resume_scan_items(state: &mut ScanState, index: pg_sys::Relation) -> V
     } else {
         Some(state.q.as_slice())
     };
-    let discarded = state.discarded.as_mut().expect("iterative scan owns its heap");
+    let discarded = state
+        .discarded
+        .as_mut()
+        .expect("iterative scan owns its heap");
     search_layer(
         std::ptr::null_mut(),
         Some(index),
@@ -369,8 +375,8 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     }
 
     // max memory: work_mem * multiplier, +256 bytes to fill the last block
-    let max_memory = ((pg_sys::work_mem as f64) * HNSW_SCAN_MEM_MULTIPLIER * 1024.0 + 256.0)
-        as usize;
+    let max_memory =
+        ((pg_sys::work_mem as f64) * HNSW_SCAN_MEM_MULTIPLIER * 1024.0 + 256.0) as usize;
 
     let state = Box::new(ScanState {
         recheck_orderby: support.precision != HnswPrecision::Plain,
@@ -460,9 +466,17 @@ pub unsafe extern "C-unwind" fn amgettuple(
 
         // A shared lock lets vacuum ensure no in-flight scans before marking
         // tuples deleted.
-        pg_sys::LockPage(index, scan_lock_page(state.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
+        pg_sys::LockPage(
+            index,
+            scan_lock_page(state.base),
+            pg_sys::ShareLock as pg_sys::LOCKMODE,
+        );
         state.w = get_scan_items(state, index);
-        pg_sys::UnlockPage(index, scan_lock_page(state.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
+        pg_sys::UnlockPage(
+            index,
+            scan_lock_page(state.base),
+            pg_sys::ShareLock as pg_sys::LOCKMODE,
+        );
 
         // The iterative scan owns its discarded heap from the start.
         if HNSW_ITERATIVE_SCAN.get().as_i32() != ITERATIVE_SCAN_OFF {
@@ -492,8 +506,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
 
             // Reached max number of tuples or memory limit
             let mem = scan_memory(state);
-            if state.tuples >= HNSW_MAX_SCAN_TUPLES.get() as i64
-                && HNSW_MAX_SCAN_TUPLES.get() >= 0
+            if state.tuples >= HNSW_MAX_SCAN_TUPLES.get() as i64 && HNSW_MAX_SCAN_TUPLES.get() >= 0
                 || mem > state.max_memory
             {
                 let empty = state
@@ -511,9 +524,17 @@ pub unsafe extern "C-unwind" fn amgettuple(
                 // Locking ensures when neighbors are read, the elements they
                 // reference will not be deleted (and replaced) during the
                 // iteration.
-                pg_sys::LockPage(index, scan_lock_page(state.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
+                pg_sys::LockPage(
+                    index,
+                    scan_lock_page(state.base),
+                    pg_sys::ShareLock as pg_sys::LOCKMODE,
+                );
                 state.w = resume_scan_items(state, index);
-                pg_sys::UnlockPage(index, scan_lock_page(state.base), pg_sys::ShareLock as pg_sys::LOCKMODE);
+                pg_sys::UnlockPage(
+                    index,
+                    scan_lock_page(state.base),
+                    pg_sys::ShareLock as pg_sys::LOCKMODE,
+                );
             }
 
             if state.w.is_empty() {

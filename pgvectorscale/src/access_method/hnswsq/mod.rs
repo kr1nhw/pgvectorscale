@@ -14,11 +14,11 @@ pub mod quantize;
 pub mod scan;
 #[cfg(test)]
 mod smoke;
+#[cfg(any(test, feature = "pg_test"))]
+mod tests;
 pub mod types;
 pub mod utils;
 pub mod vacuum;
-#[cfg(any(test, feature = "pg_test"))]
-mod tests;
 
 use pgrx::*;
 
@@ -223,9 +223,8 @@ fn hnswsq_diag(index: PgRelation) -> String {
                     total += 1;
                     if (*tup).deleted != 0 {
                         deleted += 1;
-                    } else if pgrx::itemptr::item_pointer_get_block_number_no_check(
-                        (*tup).heaptid,
-                    ) != pg_sys::InvalidBlockNumber
+                    } else if pgrx::itemptr::item_pointer_get_block_number_no_check((*tup).heaptid)
+                        != pg_sys::InvalidBlockNumber
                     {
                         live += 1;
                     } else {
@@ -271,19 +270,10 @@ fn hnswsq_diag(index: PgRelation) -> String {
                     continue;
                 }
                 reach += 1;
-                let mut tids = vec![pg_sys::ItemPointerData::default(); get_layer_m(
-                    get_m(index_rel),
-                    0,
-                )];
+                let mut tids =
+                    vec![pg_sys::ItemPointerData::default(); get_layer_m(get_m(index_rel), 0,)];
                 let m = get_m(index_rel);
-                if load_neighbor_tids(
-                    &mut *elem,
-                    &mut tids,
-                    index_rel,
-                    m,
-                    get_layer_m(m, 0),
-                    0,
-                ) {
+                if load_neighbor_tids(&mut *elem, &mut tids, index_rel, m, get_layer_m(m, 0), 0) {
                     nlists += 1;
                     let mut len = 0u64;
                     for t in &tids {
@@ -293,8 +283,7 @@ fn hnswsq_diag(index: PgRelation) -> String {
                             break;
                         }
                         len += 1;
-                        let np =
-                            crate::util::ItemPointer::new(ip_block(t), ip_offset(t));
+                        let np = crate::util::ItemPointer::new(ip_block(t), ip_offset(t));
                         if seen.insert(np) {
                             queue.push_back(np);
                         }
@@ -378,14 +367,10 @@ fn hnswsq_dump(index: PgRelation) -> String {
                         let nbuf = pg_sys::ReadBuffer(index_rel, (*vt).neighbor_page);
                         pg_sys::LockBuffer(nbuf, pg_sys::BUFFER_LOCK_SHARE as i32);
                         let npage = pg_sys::BufferGetPage(nbuf);
-                        let nitem = PageGetItem(
-                            npage,
-                            PageGetItemId(npage, (*vt).neighbor_offno),
-                        )
-                        .cast::<NeighborTupleData>();
+                        let nitem = PageGetItem(npage, PageGetItemId(npage, (*vt).neighbor_offno))
+                            .cast::<NeighborTupleData>();
                         if (*nitem).version != (*vt).version
-                            || (*nitem).count as usize
-                                != ((*vt).level as usize + 2) * m
+                            || (*nitem).count as usize != ((*vt).level as usize + 2) * m
                         {
                             out.push_str(&format!(
                                 "  VERSION/COUNT MISMATCH: elem_v={} ntup_v={} ntup_count={} expect={}\n",
@@ -399,17 +384,17 @@ fn hnswsq_dump(index: PgRelation) -> String {
                     }
                     // Read the neighbor tuple's layer-0 section.
                     let mut elem = init_element_from_block(blkno, off);
-                    load_element_from_tuple(&mut *elem, tup, true, true, support.codec.vector_bytes());
+                    load_element_from_tuple(
+                        &mut *elem,
+                        tup,
+                        true,
+                        true,
+                        support.codec.vector_bytes(),
+                    );
                     let mut tids = vec![pg_sys::ItemPointerData::default(); get_layer_m(m, 0)];
                     let mut nids = String::from("-");
-                    if load_neighbor_tids(
-                        &mut *elem,
-                        &mut tids,
-                        index_rel,
-                        m,
-                        get_layer_m(m, 0),
-                        0,
-                    ) {
+                    if load_neighbor_tids(&mut *elem, &mut tids, index_rel, m, get_layer_m(m, 0), 0)
+                    {
                         let parts: Vec<String> = tids
                             .iter()
                             .take_while(|t| ip_block(t) != pg_sys::InvalidBlockNumber)
@@ -432,7 +417,13 @@ fn hnswsq_dump(index: PgRelation) -> String {
                     // (debugging aid): header + first few tids as hex.
                     if (*tup).level == 0 {
                         let mut nt = init_element_from_block(blkno, off);
-                        load_element_from_tuple(&mut *nt, tup, false, false, support.codec.vector_bytes());
+                        load_element_from_tuple(
+                            &mut *nt,
+                            tup,
+                            false,
+                            false,
+                            support.codec.vector_bytes(),
+                        );
                         let nbuf = pg_sys::ReadBuffer(index_rel, (*nt).neighbor_page);
                         pg_sys::LockBuffer(nbuf, pg_sys::BUFFER_LOCK_SHARE as i32);
                         let npage = pg_sys::BufferGetPage(nbuf);

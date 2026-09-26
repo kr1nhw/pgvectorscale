@@ -92,9 +92,11 @@ impl TSVScanState {
             StorageType::RabitqCompression => {
                 let mut stats = QuantizerStats::default();
                 let quantizer = unsafe {
-                    let qip = meta_page.get_quantizer_metadata_pointer().unwrap_or_else(|| {
-                        pgrx::error!("No RaBitQ metadata pointer found in meta page")
-                    });
+                    let qip = meta_page
+                        .get_quantizer_metadata_pointer()
+                        .unwrap_or_else(|| {
+                            pgrx::error!("No RaBitQ metadata pointer found in meta page")
+                        });
                     RabitqQuantizerMetadata::load(index, qip, &mut stats)
                 };
                 let bq = RabitqSpeedupStorage::load_for_search(index, heap, &quantizer, &meta_page);

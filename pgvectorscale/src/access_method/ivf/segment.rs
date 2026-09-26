@@ -129,8 +129,13 @@ impl IvfSegmentList {
             for item in tape.read(pointer) {
                 buf.extend_from_slice(item.get_data_slice());
             }
-            rkyv::from_bytes::<IvfSegmentList>(&buf)
-                .unwrap_or_else(|e| panic!("IVF: segment-list parse failed ({} bytes): {:?}", buf.len(), e))
+            rkyv::from_bytes::<IvfSegmentList>(&buf).unwrap_or_else(|e| {
+                panic!(
+                    "IVF: segment-list parse failed ({} bytes): {:?}",
+                    buf.len(),
+                    e
+                )
+            })
         }
     }
 }
@@ -178,8 +183,9 @@ impl IvfFreeList {
             for item in tape.read(pointer) {
                 buf.extend_from_slice(item.get_data_slice());
             }
-            rkyv::from_bytes::<IvfFreeList>(&buf)
-                .unwrap_or_else(|e| panic!("IVF: free-list parse failed ({} bytes): {:?}", buf.len(), e))
+            rkyv::from_bytes::<IvfFreeList>(&buf).unwrap_or_else(|e| {
+                panic!("IVF: free-list parse failed ({} bytes): {:?}", buf.len(), e)
+            })
         }
     }
 }
@@ -243,7 +249,12 @@ impl IvfListHeader {
         let item = PageGetItem(page, item_id);
         let len = (*item_id).lp_len() as usize;
         rkyv::from_bytes::<IvfListHeader>(std::slice::from_raw_parts(item as *const u8, len))
-            .unwrap_or_else(|e| panic!("IVF: list-header buffer parse failed ({} bytes): {:?}", len, e))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "IVF: list-header buffer parse failed ({} bytes): {:?}",
+                    len, e
+                )
+            })
     }
 
     /// Read-modify-write the header page of list `block` atomically.

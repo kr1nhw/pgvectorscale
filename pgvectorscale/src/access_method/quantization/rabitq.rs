@@ -374,7 +374,10 @@ mod ex_dot_neon {
 
     #[inline]
     unsafe fn reduce_add_neon(acc: [float32x4_t; 4]) -> f32 {
-        vaddvq_f32(vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3])))
+        vaddvq_f32(vaddq_f32(
+            vaddq_f32(acc[0], acc[1]),
+            vaddq_f32(acc[2], acc[3]),
+        ))
     }
 
     #[target_feature(enable = "neon")]
@@ -552,68 +555,68 @@ impl RabitqQuantizer {
         (rotated, sum)
     }
 
-const EX_QUANTIZATION_EPSILON: f32 = 1.0e-5;
-const EX_TIGHT_START: [f32; 9] = [0.0, 0.15, 0.20, 0.52, 0.59, 0.71, 0.75, 0.77, 0.81];
+    const EX_QUANTIZATION_EPSILON: f32 = 1.0e-5;
+    const EX_TIGHT_START: [f32; 9] = [0.0, 0.15, 0.20, 0.52, 0.59, 0.71, 0.75, 0.77, 0.81];
 
-/// Lance's `best_ex_rescale_factor`: the scale t for the ex-code magnitude
-/// quantization that maximizes ⟨|r̂|, code⟩/‖code‖ (tight quantization of the
-/// unit-direction magnitude shape).
-fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u32) -> f32 {
-    let max_value = abs_normalized.iter().copied().fold(0.0f32, f32::max);
-    if max_value <= 0.0 {
-        return 0.0;
-    }
-    let max_code = (1usize << ex_bits) - 1;
-    let t_end = ((max_code + 10) as f32) / max_value;
-    let t_start = t_end * Self::EX_TIGHT_START[ex_bits as usize];
-
-    let mut current_codes = Vec::with_capacity(abs_normalized.len());
-    let mut squared_denominator = abs_normalized.len() as f32 * 0.25;
-    let mut numerator = 0.0f32;
-    let mut thresholds = Vec::with_capacity(abs_normalized.len() * max_code);
-
-    for (idx, &value) in abs_normalized.iter().enumerate() {
-        if value <= 0.0 || !value.is_finite() {
-            current_codes.push(0usize);
-            continue;
+    /// Lance's `best_ex_rescale_factor`: the scale t for the ex-code magnitude
+    /// quantization that maximizes ⟨|r̂|, code⟩/‖code‖ (tight quantization of the
+    /// unit-direction magnitude shape).
+    fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u32) -> f32 {
+        let max_value = abs_normalized.iter().copied().fold(0.0f32, f32::max);
+        if max_value <= 0.0 {
+            return 0.0;
         }
-        let current = ((t_start * value) + Self::EX_QUANTIZATION_EPSILON)
-            .floor()
-            .clamp(0.0, max_code as f32) as usize;
-        current_codes.push(current);
-        squared_denominator += (current * current + current) as f32;
-        numerator += (current as f32 + 0.5) * value;
+        let max_code = (1usize << ex_bits) - 1;
+        let t_end = ((max_code + 10) as f32) / max_value;
+        let t_start = t_end * Self::EX_TIGHT_START[ex_bits as usize];
 
-        let mut next = current + 1;
-        while next <= max_code {
-            let threshold = next as f32 / value;
-            if threshold < t_end {
-                thresholds.push((threshold, idx));
+        let mut current_codes = Vec::with_capacity(abs_normalized.len());
+        let mut squared_denominator = abs_normalized.len() as f32 * 0.25;
+        let mut numerator = 0.0f32;
+        let mut thresholds = Vec::with_capacity(abs_normalized.len() * max_code);
+
+        for (idx, &value) in abs_normalized.iter().enumerate() {
+            if value <= 0.0 || !value.is_finite() {
+                current_codes.push(0usize);
+                continue;
             }
-            next += 1;
+            let current = ((t_start * value) + Self::EX_QUANTIZATION_EPSILON)
+                .floor()
+                .clamp(0.0, max_code as f32) as usize;
+            current_codes.push(current);
+            squared_denominator += (current * current + current) as f32;
+            numerator += (current as f32 + 0.5) * value;
+
+            let mut next = current + 1;
+            while next <= max_code {
+                let threshold = next as f32 / value;
+                if threshold < t_end {
+                    thresholds.push((threshold, idx));
+                }
+                next += 1;
+            }
         }
+
+        thresholds.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
+
+        let mut best_inner_product = numerator / squared_denominator.sqrt();
+        let mut best_t = t_start;
+        for (threshold, idx) in thresholds {
+            current_codes[idx] += 1;
+            let updated = current_codes[idx];
+            squared_denominator += (2 * updated) as f32;
+            numerator += abs_normalized[idx];
+
+            let current_inner_product = numerator / squared_denominator.sqrt();
+            if current_inner_product > best_inner_product {
+                best_inner_product = current_inner_product;
+                best_t = threshold;
+            }
+        }
+        best_t
     }
 
-    thresholds.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
-
-    let mut best_inner_product = numerator / squared_denominator.sqrt();
-    let mut best_t = t_start;
-    for (threshold, idx) in thresholds {
-        current_codes[idx] += 1;
-        let updated = current_codes[idx];
-        squared_denominator += (2 * updated) as f32;
-        numerator += abs_normalized[idx];
-
-        let current_inner_product = numerator / squared_denominator.sqrt();
-        if current_inner_product > best_inner_product {
-            best_inner_product = current_inner_product;
-            best_t = threshold;
-        }
-    }
-    best_t
-}
-
-pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
+    pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
         self.quantize_residual(&self.center.clone(), full_vector)
     }
 
@@ -650,8 +653,7 @@ pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
                 let code_scale = 2.0f32;
                 let code_bias = -1.5f32;
                 let norm = sum_of_x2.sqrt().max(1e-9);
-                let abs_normalized: Vec<f32> =
-                    rotated.iter().map(|v| v.abs() / norm).collect();
+                let abs_normalized: Vec<f32> = rotated.iter().map(|v| v.abs() / norm).collect();
                 let t = Self::best_ex_rescale_factor(&abs_normalized, ex_bits);
                 let mut code = vec![0u8; self.dim.div_ceil(4)];
                 let mut res_dot = 0.0f32; // ⟨rot, code⟩
@@ -694,8 +696,7 @@ pub fn quantize(&self, full_vector: &[f32]) -> RabitqVector {
                 let code_scale = (1u32 << ex_bits) as f32;
                 let code_bias = -(code_scale - 0.5);
                 let norm = sum_of_x2.sqrt().max(1e-9);
-                let abs_normalized: Vec<f32> =
-                    rotated.iter().map(|v| v.abs() / norm).collect();
+                let abs_normalized: Vec<f32> = rotated.iter().map(|v| v.abs() / norm).collect();
                 let t = Self::best_ex_rescale_factor(&abs_normalized, ex_bits);
                 let mut code = vec![0u8; self.dim.div_ceil(2 / (self.num_bits / 4) as usize)];
                 let mut res_dot = 0.0f32; // ⟨rot, code⟩
@@ -870,9 +871,8 @@ impl<'a> RabitqFastScan<'a> {
     pub fn new(rq: &'a RabitqQuery, num_bits: u8, dim: usize) -> Self {
         let (table_u8, qmin, range_scale, num_chunks) = if num_bits == 1 || num_bits == 2 {
             let f32_table = Self::build_table(&rq.rotated);
-            let (q, qmin, rs) = crate::access_method::quantization::rabitq_fastscan::quantize_table(
-                &f32_table,
-            );
+            let (q, qmin, rs) =
+                crate::access_method::quantization::rabitq_fastscan::quantize_table(&f32_table);
             (q, qmin, rs, f32_table.len() / 16)
         } else {
             (Vec::new(), 0.0, 0.0, 0)
@@ -1077,8 +1077,9 @@ mod tests {
     #[test]
     fn code_packing_roundtrip() {
         let q = RabitqQuantizer::new(1, 1, 16);
-        let input =
-            vec![1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0];
+        let input = vec![
+            1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0,
+        ];
         let v = q.quantize(&input);
         // code bits must equal sign of the rotated vector
         let mut rot = vec![0f32; padded_dim(16)];
@@ -1133,12 +1134,8 @@ mod tests {
         let scale = -2.0 * qv.sum_of_x2 / qv.l1_of_rotated.max(1e-9);
         let margin_factor = 2.0 * qv.sum_of_x2.max(0.0).sqrt() / (q.dim() as f32).sqrt().max(1.0);
         let expected = q.estimate_l2(&qv, &rq);
-        let actual = fastscan.estimate_from_full_dot(
-            actual_dot,
-            qv.sum_of_x2,
-            scale,
-            margin_factor,
-        );
+        let actual =
+            fastscan.estimate_from_full_dot(actual_dot, qv.sum_of_x2, scale, margin_factor);
         assert!(
             (actual - expected).abs() <= 1.0,
             "estimate {} vs {}",
@@ -1336,18 +1333,10 @@ mod tests {
             let rq = q.rotate_query(&b);
             let m = qa.dot_with_rotated(&rq.rotated);
             let cos = m / qa.l1_of_rotated;
-            let true_cos: f32 = a
-                .iter()
-                .zip(b.iter())
-                .map(|(x, y)| x * y)
-                .sum::<f32>()
+            let true_cos: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>()
                 / (qa.sum_of_x2 * rq.sum_of_x2).sqrt();
-            let est = RabitqVector::distance_from_cos(
-                cos,
-                qa.sum_of_x2,
-                rq.sum_of_x2,
-                DistanceType::L2,
-            );
+            let est =
+                RabitqVector::distance_from_cos(cos, qa.sum_of_x2, rq.sum_of_x2, DistanceType::L2);
             eprintln!(
                 "pair{}: exact_l2={:.0} est_l2={:.0} est_cos={:.3} true_cos={:.3} sx2b={:.0}",
                 k, exact, est, cos, true_cos, rq.sum_of_x2
@@ -1479,7 +1468,11 @@ mod four_bit_tests {
             mean_err += ((est - exact) / exact.max(1.0)).abs();
         }
         let mean_err = mean_err / 20.0;
-        assert!(mean_err < 0.22, "4-bit mean L2 rel err {} too high", mean_err);
+        assert!(
+            mean_err < 0.22,
+            "4-bit mean L2 rel err {} too high",
+            mean_err
+        );
     }
 
     #[test]
@@ -1605,20 +1598,31 @@ mod two_bit_tests {
             }
         }
         let p0 = crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
-            &sign_plane, 1, dim / 8,
+            &sign_plane,
+            1,
+            dim / 8,
         );
         let p1 = crate::access_method::quantization::rabitq_fastscan::transpose_1bit(
-            &ex_plane, 1, dim / 8,
+            &ex_plane,
+            1,
+            dim / 8,
         );
         let mut s0 = [0u16; 32];
         let mut s1 = [0u16; 32];
         fastscan.sum_batch(&p0, &mut s0);
         fastscan.sum_batch(&p1, &mut s1);
         let scale = -2.0 * qv.sum_of_x2 / qv.l1_of_rotated.max(1e-9);
-        let margin_factor =
-            2.0 * qv.sum_of_x2.max(0.0).sqrt() / (q.dim() as f32).sqrt().max(1.0);
+        let margin_factor = 2.0 * qv.sum_of_x2.max(0.0).sqrt() / (q.dim() as f32).sqrt().max(1.0);
         let mut out = [0f32; 32];
-        fastscan.estimate_batch_2bit(&s0, &s1, &[scale], &[qv.sum_of_x2], &[margin_factor], &mut out, 1);
+        fastscan.estimate_batch_2bit(
+            &s0,
+            &s1,
+            &[scale],
+            &[qv.sum_of_x2],
+            &[margin_factor],
+            &mut out,
+            1,
+        );
 
         let expected = q.estimate_l2(&qv, &rq);
         assert!(
@@ -1657,8 +1661,14 @@ mod two_bit_debug_tests {
                 mean_err += rel;
                 worst = worst.max(rel);
             }
-            eprintln!("{}: mean_rel_err={:.3} worst={:.3} sx2={:.0} res_dot={:.1}",
-                label, mean_err / n as f32, worst, qa.sum_of_x2, qa.l1_of_rotated);
+            eprintln!(
+                "{}: mean_rel_err={:.3} worst={:.3} sx2={:.0} res_dot={:.1}",
+                label,
+                mean_err / n as f32,
+                worst,
+                qa.sum_of_x2,
+                qa.l1_of_rotated
+            );
         }
     }
 }

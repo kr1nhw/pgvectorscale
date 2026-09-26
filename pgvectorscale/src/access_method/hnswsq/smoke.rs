@@ -16,8 +16,8 @@
 //! Precision: recall@10 vs the exact f32 top-10 and mean rank displacement.
 #![cfg(test)]
 
-use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision, Sq8Calibration};
 use crate::access_method::distance::DistanceType;
+use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision, Sq8Calibration};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::time::Instant;
@@ -195,7 +195,14 @@ fn sq8_distance_smoke_gun() {
             sweep(&|k| {
                 let qi = k / CORPUS;
                 let ci = k % CORPUS;
-                l2_dot(&queries[qi], qnorm2s[qi], &codes[ci], vnorm2[ci], &mins, &scales)
+                l2_dot(
+                    &queries[qi],
+                    qnorm2s[qi],
+                    &codes[ci],
+                    vnorm2[ci],
+                    &mins,
+                    &scales,
+                )
             })
         })
         .fold(f64::INFINITY, f64::min);
@@ -232,7 +239,16 @@ fn sq8_distance_smoke_gun() {
             .map(|ci| l2_integer(&qhats[qi], &codes[ci]) as f32)
             .collect();
         let d_dot: Vec<f32> = (0..CORPUS)
-            .map(|ci| l2_dot(&queries[qi], qnorm2s[qi], &codes[ci], vnorm2[ci], &mins, &scales))
+            .map(|ci| {
+                l2_dot(
+                    &queries[qi],
+                    qnorm2s[qi],
+                    &codes[ci],
+                    vnorm2[ci],
+                    &mins,
+                    &scales,
+                )
+            })
             .collect();
         let d_dot_int: Vec<f32> = (0..CORPUS)
             .map(|ci| l2_dot_integer(qnorm2s[qi], &qweights[qi], &codes[ci], vnorm2[ci]))
@@ -256,9 +272,22 @@ fn sq8_distance_smoke_gun() {
     // per element until the first difference.  Measure how early the first
     // differing byte appears (how many full elements need comparing) and the
     // cost of the byte-compare loop vs the float path.
-    let encode_e4m3 = |x: f32| crate::access_method::hnswsq::quantize::f32_to_e4m3(x.clamp(-448.0, 448.0));
-    let a: Vec<Vec<u8>> = (0..10_000).map(|_| (0..DIM).map(|_| encode_e4m3(rng.gen_range(0.0..255.0))).collect()).collect();
-    let b: Vec<Vec<u8>> = (0..10_000).map(|_| (0..DIM).map(|_| encode_e4m3(rng.gen_range(0.0..255.0))).collect()).collect();
+    let encode_e4m3 =
+        |x: f32| crate::access_method::hnswsq::quantize::f32_to_e4m3(x.clamp(-448.0, 448.0));
+    let a: Vec<Vec<u8>> = (0..10_000)
+        .map(|_| {
+            (0..DIM)
+                .map(|_| encode_e4m3(rng.gen_range(0.0..255.0)))
+                .collect()
+        })
+        .collect();
+    let b: Vec<Vec<u8>> = (0..10_000)
+        .map(|_| {
+            (0..DIM)
+                .map(|_| encode_e4m3(rng.gen_range(0.0..255.0)))
+                .collect()
+        })
+        .collect();
     let mut first_diff = vec![0usize; DIM + 1];
     for (x, y) in a.iter().zip(b.iter()) {
         let mut d = DIM;
@@ -273,9 +302,7 @@ fn sq8_distance_smoke_gun() {
     println!(
         "e4m3 first-differing element: median~{} (histogram head: {:?})",
         (0..=DIM)
-            .find(|&i| {
-                first_diff[..=i].iter().sum::<usize>() >= 5000
-            })
+            .find(|&i| { first_diff[..=i].iter().sum::<usize>() >= 5000 })
             .unwrap(),
         &first_diff[..6],
     );

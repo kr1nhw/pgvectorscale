@@ -23,8 +23,8 @@ use std::collections::BinaryHeap;
 use pgrx::pg_sys;
 
 use crate::access_method::distance::DistanceType;
-use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision};
 use crate::access_method::hnswsq::ptr::HnswPtr;
+use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision};
 
 // ---------------------------------------------------------------------------
 // Constants (pgvector hnsw.h, renamed for the port)
@@ -226,7 +226,9 @@ pub fn neighbor_array_size(lm: usize) -> usize {
 /// bytes for the `lm` the caller then indexes.
 #[inline]
 pub unsafe fn neighbor_items(na: *mut NeighborArray) -> *mut Candidate {
-    (na as *mut u8).add(std::mem::size_of::<NeighborArray>()).cast()
+    (na as *mut u8)
+        .add(std::mem::size_of::<NeighborArray>())
+        .cast()
 }
 
 /// pgvector's `HnswElementData`, adapted to one heap TID.  The same struct
@@ -546,8 +548,12 @@ mod tests {
         // Neighbor tuple header: 4 bytes.
         assert_eq!(NEIGHBOR_TUPLE_HEADER_SIZE, 4);
         // Sizes match the pgvector MAXALIGN formulas.
-        assert_eq!(element_tuple_size(512), unsafe { pg_sys::MAXALIGN(24 + 512) });
-        assert_eq!(neighbor_tuple_size(2, 16), unsafe { pg_sys::MAXALIGN(4 + 4 * 16 * 6) });
+        assert_eq!(element_tuple_size(512), unsafe {
+            pg_sys::MAXALIGN(24 + 512)
+        });
+        assert_eq!(neighbor_tuple_size(2, 16), unsafe {
+            pg_sys::MAXALIGN(4 + 4 * 16 * 6)
+        });
         assert_eq!(neighbor_tuple_size(2, 16), 392);
     }
 
@@ -559,7 +565,10 @@ mod tests {
         let nbase = std::mem::offset_of!(ElementTupleData, neighbortid);
         assert_eq!(base % 2, 0);
         assert_eq!(nbase % 2, 0);
-        assert_eq!(ELEMENT_TUPLE_VECTOR_OFFSET, std::mem::size_of::<ElementTupleData>());
+        assert_eq!(
+            ELEMENT_TUPLE_VECTOR_OFFSET,
+            std::mem::size_of::<ElementTupleData>()
+        );
     }
 
     #[test]
@@ -603,9 +612,7 @@ mod tests {
     fn test_heap_orders() {
         use pgrx::pg_sys::BlockNumber;
         let sc = |d: f32, k: u64| SearchCandidate {
-            element: HnswPtr {
-                ptr: k as *mut u8,
-            },
+            element: HnswPtr { ptr: k as *mut u8 },
             distance: d,
             key: k,
         };
@@ -637,7 +644,13 @@ mod tests {
 
     #[test]
     fn test_neighbor_array_sizes() {
-        assert_eq!(neighbor_array_size(16), std::mem::size_of::<NeighborArray>() + 16 * std::mem::size_of::<Candidate>());
-        assert_eq!(neighbor_array_size(32) - neighbor_array_size(16), 16 * std::mem::size_of::<Candidate>());
+        assert_eq!(
+            neighbor_array_size(16),
+            std::mem::size_of::<NeighborArray>() + 16 * std::mem::size_of::<Candidate>()
+        );
+        assert_eq!(
+            neighbor_array_size(32) - neighbor_array_size(16),
+            16 * std::mem::size_of::<Candidate>()
+        );
     }
 }

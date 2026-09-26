@@ -21,7 +21,10 @@ use crate::access_method::pg_vector::PgVectorInternal;
 use crate::util::ports::{PageGetItem, PageGetItemId, PageGetMaxOffsetNumber};
 
 /// `GetInsertPage` (hnswinsert.c): the append hint from the metapage.
-pub unsafe fn get_insert_page(index: pg_sys::Relation, base: pg_sys::BlockNumber) -> pg_sys::BlockNumber {
+pub unsafe fn get_insert_page(
+    index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
+) -> pg_sys::BlockNumber {
     let buf = pg_sys::ReadBuffer(index, metapage_block(base));
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
     let page = pg_sys::BufferGetPage(buf);
@@ -71,8 +74,7 @@ unsafe fn free_offset(
         if (*etup).deleted != 0 {
             let element_page = pg_sys::BufferGetBlockNumber(buf);
             let neighbor_page = ip_block(&(*etup).neighbortid);
-            let neighbor_offno =
-                ip_offset(&(*etup).neighbortid);
+            let neighbor_offno = ip_offset(&(*etup).neighbortid);
 
             if *new_insert_page == pg_sys::InvalidBlockNumber {
                 *new_insert_page = element_page;
@@ -144,7 +146,8 @@ unsafe fn insert_append_page(
     if building {
         *npage = pg_sys::BufferGetPage(*nbuf);
     } else {
-        *npage = pg_sys::GenericXLogRegisterBuffer(state, *nbuf, pg_sys::GENERIC_XLOG_FULL_IMAGE as i32);
+        *npage =
+            pg_sys::GenericXLogRegisterBuffer(state, *nbuf, pg_sys::GENERIC_XLOG_FULL_IMAGE as i32);
     }
 
     init_page(*nbuf, *npage);
@@ -233,8 +236,7 @@ pub unsafe fn add_element_on_disk(
         }
 
         // Next, try space from a deleted element
-        if let Some(f) = free_offset(index, buf, page, etup_size, ntup_size, &mut new_insert_page)
-        {
+        if let Some(f) = free_offset(index, buf, page, etup_size, ntup_size, &mut new_insert_page) {
             if f.nbuf != buf {
                 if building {
                     npage = pg_sys::BufferGetPage(f.nbuf);
@@ -341,12 +343,7 @@ pub unsafe fn add_element_on_disk(
 
     // Add element and neighbors
     if free_offno != pg_sys::InvalidOffsetNumber {
-        if !pg_sys::PageIndexTupleOverwrite(
-            page,
-            (*e).offno,
-            etup.as_mut_ptr().cast(),
-            etup_size,
-        ) {
+        if !pg_sys::PageIndexTupleOverwrite(page, (*e).offno, etup.as_mut_ptr().cast(), etup_size) {
             error!("hnswsq: failed to add index item");
         }
 
@@ -533,16 +530,7 @@ unsafe fn get_update_index(
     // Get latest neighbors since they may have changed. Do not lock yet since
     // selecting neighbors can take time. Could use optimistic locking to
     // retry if another update occurs before getting exclusive lock.
-    let len = load_neighbors_into(
-        element,
-        index,
-        m,
-        lm,
-        lc,
-        na_array,
-        na_tids,
-        na_elements,
-    );
+    let len = load_neighbors_into(element, index, m, lm, lc, na_array, na_tids, na_elements);
     let na = na_array.as_mut_ptr().cast::<NeighborArray>();
 
     if len < 0 || (*na).length < lm as u32 {
@@ -590,9 +578,7 @@ unsafe fn connection_exists(
         if ip_block(indextid) == pg_sys::InvalidBlockNumber {
             break;
         }
-        if ip_block(indextid) == (*e).blkno
-            && ip_offset(indextid) == (*e).offno
-        {
+        if ip_block(indextid) == (*e).blkno && ip_offset(indextid) == (*e).offno {
             return true;
         }
     }
@@ -643,9 +629,7 @@ unsafe fn update_neighbor_on_disk(
             .add(NEIGHBOR_TUPLE_HEADER_SIZE)
             .cast::<pg_sys::ItemPointerData>();
         for j in 0..lm {
-            if ip_block(&*tids.add(start_idx + j))
-                == pg_sys::InvalidBlockNumber
-            {
+            if ip_block(&*tids.add(start_idx + j)) == pg_sys::InvalidBlockNumber {
                 idx = (start_idx + j) as i32;
                 break;
             }
@@ -700,8 +684,10 @@ pub unsafe fn update_neighbors_on_disk(
 
         for i in 0..(*neighbors).length as usize {
             let hc = &*neighbor_items(neighbors).add(i);
-            let neighbor =
-                crate::access_method::hnswsq::ptr::access::<Element>(std::ptr::null_mut(), hc.element);
+            let neighbor = crate::access_method::hnswsq::ptr::access::<Element>(
+                std::ptr::null_mut(),
+                hc.element,
+            );
             let idx = get_update_index(
                 neighbor,
                 e,
@@ -759,14 +745,7 @@ unsafe fn update_graph_on_disk(
 
     // Update insert page if needed
     if new_insert_page != pg_sys::InvalidBlockNumber {
-        update_meta_page(
-            index,
-            base,
-            0,
-            None,
-            new_insert_page,
-            building,
-        );
+        update_meta_page(index, base, 0, None, new_insert_page, building);
     }
 
     // Update neighbors
@@ -826,12 +805,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn with_insert_scratch(
-    dim: usize,
-    m: usize,
-    ef: usize,
-    f: impl FnOnce(&mut InsertScratch),
-) {
+fn with_insert_scratch(dim: usize, m: usize, ef: usize, f: impl FnOnce(&mut InsertScratch)) {
     INSERT_SCRATCH.with(|cell| {
         let mut opt = cell.borrow_mut();
         let needs_init = match opt.as_ref() {
@@ -909,7 +883,11 @@ pub unsafe fn insert_tuple_on_disk(
     (*element).clamped = clamped as u8;
     let value_ptr = pg_sys::palloc(value.len()).cast::<u8>();
     std::ptr::copy_nonoverlapping(value.as_ptr(), value_ptr, value.len());
-    crate::access_method::hnswsq::ptr::store(std::ptr::null_mut(), &mut (*element).value, value_ptr);
+    crate::access_method::hnswsq::ptr::store(
+        std::ptr::null_mut(),
+        &mut (*element).value,
+        value_ptr,
+    );
 
     // Prevent concurrent inserts when likely updating entry point
     let mut entry_locked = false;
@@ -932,9 +910,7 @@ pub unsafe fn insert_tuple_on_disk(
     // buffers was the dominant insert cost).
     let (_m_metapage, ef_construction) =
         crate::access_method::hnswsq::utils::region_params(index, base);
-    let entry_ptr = entry
-        .as_deref_mut()
-        .map(|e| e as *mut Element);
+    let entry_ptr = entry.as_deref_mut().map(|e| e as *mut Element);
     with_insert_scratch(support.codec.dim(), m, ef_construction, |s| {
         let sq8_mode = crate::access_method::hnswsq::options::HNSW_SQ8_DISTANCE.get();
         find_element_neighbors(
@@ -1013,7 +989,15 @@ pub unsafe extern "C-unwind" fn aminsert(
         let mut encoded = Vec::with_capacity(support.codec.vector_bytes());
         let clamped = support.codec.encode_into(&vec, &mut encoded);
 
-        insert_tuple_on_disk(index, HNSW_STANDALONE_BASE, &support, &encoded, &*heap_tid, false, clamped);
+        insert_tuple_on_disk(
+            index,
+            HNSW_STANDALONE_BASE,
+            &support,
+            &encoded,
+            &*heap_tid,
+            false,
+            clamped,
+        );
     });
     drop(insert_ctx);
 

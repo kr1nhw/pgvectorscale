@@ -32,9 +32,9 @@ use super::sbq::storage::SbqSpeedupStorage;
 use super::meta_page::MetaPage;
 
 use super::plain::storage::PlainStorage;
-use super::rabitq::RabitqQuantizerMetadata;
-use super::rabitq::storage::RabitqSpeedupStorage;
 use super::quantization::rabitq::RabitqQuantizer;
+use super::rabitq::storage::RabitqSpeedupStorage;
+use super::rabitq::RabitqQuantizerMetadata;
 use super::sbq::SbqMeans;
 use super::storage::{Storage, StorageType};
 
@@ -681,13 +681,11 @@ fn maybe_train_quantizer(
                     }
                 }
                 quantizer = quantizer.with_center(center);
-                notice!(
-                    "RaBitQ center trained from {} vectors",
-                    state.count
-                );
+                notice!("RaBitQ center trained from {} vectors", state.count);
             }
-            let index_pointer =
-                unsafe { RabitqQuantizerMetadata::store(index_relation, &quantizer, &mut write_stats) };
+            let index_pointer = unsafe {
+                RabitqQuantizerMetadata::store(index_relation, &quantizer, &mut write_stats)
+            };
             meta_page.set_quantizer_metadata_pointer(index_pointer);
         }
     }

@@ -297,7 +297,8 @@ pub unsafe fn init() {
     pg_sys::add_string_reloption(
         RELOPT_KIND_AGENTVEC,
         "hot_storage_layout".as_pg_cstr(),
-        "Storage layout of a HOT HNSW segment: plain, ieeefp16, ieeefp8, f8, sq8, sq16".as_pg_cstr(),
+        "Storage layout of a HOT HNSW segment: plain, ieeefp16, ieeefp8, f8, sq8, sq16"
+            .as_pg_cstr(),
         DEFAULT_HOT_STORAGE_LAYOUT_STR.as_pg_cstr(),
         Some(validate_hot_storage_layout),
         pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
@@ -584,10 +585,9 @@ mod tests {
                 USING agentvec(encoding);",
         )?;
 
-        let index_oid = Spi::get_one::<pg_sys::Oid>(
-            "SELECT 'idxtest_options_defaults'::regclass::oid",
-        )?
-        .expect("oid was null");
+        let index_oid =
+            Spi::get_one::<pg_sys::Oid>("SELECT 'idxtest_options_defaults'::regclass::oid")?
+                .expect("oid was null");
         let indexrel = PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid));
         let options = TSVAgentVecOptions::from_relation(&indexrel);
 

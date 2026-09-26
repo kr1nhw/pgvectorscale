@@ -14,9 +14,7 @@ use crate::access_method::{
     storage::NodeDistanceMeasure,
 };
 use crate::util::{
-    page::PageType,
-    tape::Tape,
-    IndexPointer, ItemPointer, ReadableBuffer, WritableBuffer,
+    page::PageType, tape::Tape, IndexPointer, ItemPointer, ReadableBuffer, WritableBuffer,
 };
 use pgvectorscale_derive::{Readable, Writeable};
 
@@ -65,8 +63,12 @@ impl RabitqQuantizerMetadata {
     ) -> RabitqQuantizer {
         let node = RabitqQuantizerMetadata::read(index, qip, stats);
         let archived = node.get_archived_node();
-        RabitqQuantizer::new(archived.num_bits, archived.rotation_seed, archived.dim as usize)
-            .with_center(archived.center.to_vec())
+        RabitqQuantizer::new(
+            archived.num_bits,
+            archived.rotation_seed,
+            archived.dim as usize,
+        )
+        .with_center(archived.center.to_vec())
     }
 }
 

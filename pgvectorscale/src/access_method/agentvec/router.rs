@@ -62,10 +62,8 @@ pub unsafe fn ensure_router_region(index: &PgRelation, dim: u32) -> pg_sys::Bloc
 /// page at `base + 1` (the empty-graph convention the HOT regions use).
 unsafe fn create_region(index: &PgRelation, dim: u32) -> pg_sys::BlockNumber {
     let _ext_lock = crate::util::buffer::LockRelationForExtension::new(index);
-    let base = pg_sys::RelationGetNumberOfBlocksInFork(
-        index.as_ptr(),
-        pg_sys::ForkNumber::MAIN_FORKNUM,
-    );
+    let base =
+        pg_sys::RelationGetNumberOfBlocksInFork(index.as_ptr(), pg_sys::ForkNumber::MAIN_FORKNUM);
     utils::init_region(
         index.as_ptr(),
         base,

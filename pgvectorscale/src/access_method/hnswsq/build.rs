@@ -28,8 +28,8 @@ use pgrx::*;
 use rand::SeedableRng;
 
 use crate::access_method::distance::{preprocess_cosine, DistanceType};
-use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision, Sq8Calibration};
 use crate::access_method::hnswsq::options::{Hnsw2Options, HNSW_BUILD_SEED};
+use crate::access_method::hnswsq::quantize::{Codec, HnswPrecision, Sq8Calibration};
 use crate::access_method::hnswsq::types::*;
 use crate::access_method::hnswsq::utils::*;
 use crate::access_method::pg_vector::PgVectorInternal;
@@ -197,7 +197,10 @@ unsafe fn update_neighbors_in_memory(
         let lm = get_layer_m(m, lc);
 
         // Copy neighbors to local memory
-        pg_sys::LWLockAcquire(std::ptr::addr_of_mut!((*e).lock), pg_sys::LWLockMode::LW_SHARED);
+        pg_sys::LWLockAcquire(
+            std::ptr::addr_of_mut!((*e).lock),
+            pg_sys::LWLockMode::LW_SHARED,
+        );
         let neighbors = get_neighbors(base, e, lc);
         local.clear();
         for i in 0..(*neighbors).length as usize {
@@ -207,7 +210,10 @@ unsafe fn update_neighbors_in_memory(
 
         for hc in local.iter() {
             let neighbor = crate::access_method::hnswsq::ptr::access::<Element>(base, hc.element);
-            pg_sys::LWLockAcquire(std::ptr::addr_of_mut!((*neighbor).lock), pg_sys::LWLockMode::LW_EXCLUSIVE);
+            pg_sys::LWLockAcquire(
+                std::ptr::addr_of_mut!((*neighbor).lock),
+                pg_sys::LWLockMode::LW_EXCLUSIVE,
+            );
             update_connection(
                 base,
                 get_neighbors(base, neighbor, lc),
@@ -258,16 +264,24 @@ unsafe fn insert_tuple_in_memory(build: &mut BuildState, element: *mut Element) 
     let ef_construction = build.ef_construction;
 
     // Wait if another process needs exclusive lock on entry lock
-    pg_sys::LWLockAcquire(std::ptr::addr_of_mut!((*graph).entry_wait_lock), pg_sys::LWLockMode::LW_EXCLUSIVE);
+    pg_sys::LWLockAcquire(
+        std::ptr::addr_of_mut!((*graph).entry_wait_lock),
+        pg_sys::LWLockMode::LW_EXCLUSIVE,
+    );
     pg_sys::LWLockRelease(std::ptr::addr_of_mut!((*graph).entry_wait_lock));
 
     // Get entry point
-    pg_sys::LWLockAcquire(std::ptr::addr_of_mut!((*graph).entry_lock), pg_sys::LWLockMode::LW_SHARED);
+    pg_sys::LWLockAcquire(
+        std::ptr::addr_of_mut!((*graph).entry_lock),
+        pg_sys::LWLockMode::LW_SHARED,
+    );
     let mut entry_hp = (*graph).entry_point;
     let mut entry_point = if crate::access_method::hnswsq::ptr::is_null(base, entry_hp) {
         None
     } else {
-        Some(crate::access_method::hnswsq::ptr::access::<Element>(base, entry_hp))
+        Some(crate::access_method::hnswsq::ptr::access::<Element>(
+            base, entry_hp,
+        ))
     };
 
     // Prevent concurrent inserts when likely updating entry point
@@ -276,8 +290,14 @@ unsafe fn insert_tuple_in_memory(build: &mut BuildState, element: *mut Element) 
         pg_sys::LWLockRelease(std::ptr::addr_of_mut!((*graph).entry_lock));
 
         // Tell other processes to wait and get exclusive lock
-        pg_sys::LWLockAcquire(std::ptr::addr_of_mut!((*graph).entry_wait_lock), pg_sys::LWLockMode::LW_EXCLUSIVE);
-        pg_sys::LWLockAcquire(std::ptr::addr_of_mut!((*graph).entry_lock), pg_sys::LWLockMode::LW_EXCLUSIVE);
+        pg_sys::LWLockAcquire(
+            std::ptr::addr_of_mut!((*graph).entry_wait_lock),
+            pg_sys::LWLockMode::LW_EXCLUSIVE,
+        );
+        pg_sys::LWLockAcquire(
+            std::ptr::addr_of_mut!((*graph).entry_lock),
+            pg_sys::LWLockMode::LW_EXCLUSIVE,
+        );
         pg_sys::LWLockRelease(std::ptr::addr_of_mut!((*graph).entry_wait_lock));
 
         // Get latest entry point after lock is acquired
@@ -285,7 +305,9 @@ unsafe fn insert_tuple_in_memory(build: &mut BuildState, element: *mut Element) 
         entry_point = if crate::access_method::hnswsq::ptr::is_null(base, entry_hp) {
             None
         } else {
-            Some(crate::access_method::hnswsq::ptr::access::<Element>(base, entry_hp))
+            Some(crate::access_method::hnswsq::ptr::access::<Element>(
+                base, entry_hp,
+            ))
         };
     }
 
@@ -309,7 +331,10 @@ unsafe fn insert_tuple_in_memory(build: &mut BuildState, element: *mut Element) 
     );
 
     #[cfg(any(test, feature = "pg_test"))]
-    build.timers.search_ns.set(build.timers.search_ns.get() + t0.elapsed().as_nanos());
+    build
+        .timers
+        .search_ns
+        .set(build.timers.search_ns.get() + t0.elapsed().as_nanos());
 
     // Update graph in memory
     #[cfg(any(test, feature = "pg_test"))]
@@ -325,7 +350,10 @@ unsafe fn insert_tuple_in_memory(build: &mut BuildState, element: *mut Element) 
         &mut build.pair_scratch,
     );
     #[cfg(any(test, feature = "pg_test"))]
-    build.timers.backlink_ns.set(build.timers.backlink_ns.get() + t1.elapsed().as_nanos());
+    build
+        .timers
+        .backlink_ns
+        .set(build.timers.backlink_ns.get() + t1.elapsed().as_nanos());
 
     // Release entry lock
     pg_sys::LWLockRelease(std::ptr::addr_of_mut!((*graph).entry_lock));
@@ -357,7 +385,10 @@ unsafe fn insert_tuple(
         preprocess_cosine(&mut build.vector);
     }
     build.encoded.clear();
-    let clamped = build.support.codec.encode_into(&build.vector, &mut build.encoded);
+    let clamped = build
+        .support
+        .codec
+        .encode_into(&build.vector, &mut build.encoded);
 
     let value_size = build.encoded.len();
     let graph = build.graph_ptr;
@@ -367,7 +398,10 @@ unsafe fn insert_tuple(
     let memory_margin = if base.is_null() { 0 } else { MEMORY_MARGIN };
 
     // Ensure graph not flushed when inserting
-    pg_sys::LWLockAcquire(std::ptr::addr_of_mut!((*graph).flush_lock), pg_sys::LWLockMode::LW_SHARED);
+    pg_sys::LWLockAcquire(
+        std::ptr::addr_of_mut!((*graph).flush_lock),
+        pg_sys::LWLockMode::LW_SHARED,
+    );
 
     // Are we in the on-disk phase?
     if (*graph).flushed {
@@ -383,7 +417,10 @@ unsafe fn insert_tuple(
         );
     }
 
-    pg_sys::LWLockAcquire(std::ptr::addr_of_mut!((*graph).allocator_lock), pg_sys::LWLockMode::LW_EXCLUSIVE);
+    pg_sys::LWLockAcquire(
+        std::ptr::addr_of_mut!((*graph).allocator_lock),
+        pg_sys::LWLockMode::LW_EXCLUSIVE,
+    );
 
     // Check that we have enough memory available for the new element now that
     // we have the allocator lock, and flush pages if needed.
@@ -391,7 +428,10 @@ unsafe fn insert_tuple(
         pg_sys::LWLockRelease(std::ptr::addr_of_mut!((*graph).allocator_lock));
 
         pg_sys::LWLockRelease(std::ptr::addr_of_mut!((*graph).flush_lock));
-        pg_sys::LWLockAcquire(std::ptr::addr_of_mut!((*graph).flush_lock), pg_sys::LWLockMode::LW_EXCLUSIVE);
+        pg_sys::LWLockAcquire(
+            std::ptr::addr_of_mut!((*graph).flush_lock),
+            pg_sys::LWLockMode::LW_EXCLUSIVE,
+        );
 
         if !(*graph).flushed {
             let indtuples = (*graph).indtuples;
@@ -557,8 +597,7 @@ unsafe fn create_graph_pages(build: &mut BuildState) {
 
         // Calculate offsets
         (*element).blkno = pg_sys::BufferGetBlockNumber(buf);
-        (*element).offno =
-            (PageGetMaxOffsetNumber(page) + 1) as pg_sys::OffsetNumber;
+        (*element).offno = (PageGetMaxOffsetNumber(page) + 1) as pg_sys::OffsetNumber;
         if combined_size <= max_size {
             (*element).neighbor_page = (*element).blkno;
             (*element).neighbor_offno = (*element).offno + 1;
@@ -619,7 +658,14 @@ unsafe fn create_graph_pages(build: &mut BuildState) {
     } else {
         Some(entry_point)
     };
-    update_meta_page(index, build.region_base, UPDATE_ENTRY_ALWAYS, entry_point_opt, insert_page, true);
+    update_meta_page(
+        index,
+        build.region_base,
+        UPDATE_ENTRY_ALWAYS,
+        entry_point_opt,
+        insert_page,
+        true,
+    );
 
     // Record where the graph chain starts (see the module docs).
     let buf = pg_sys::ReadBuffer(index, metapage_block(build.region_base));
@@ -657,7 +703,12 @@ unsafe fn write_neighbor_tuples(build: &BuildState) {
         let page = pg_sys::BufferGetPage(buf);
 
         ntup.fill(0);
-        set_neighbor_tuple(base, ntup.as_mut_ptr().cast::<NeighborTupleData>(), element, m);
+        set_neighbor_tuple(
+            base,
+            ntup.as_mut_ptr().cast::<NeighborTupleData>(),
+            element,
+            m,
+        );
 
         if !pg_sys::PageIndexTupleOverwrite(
             page,
@@ -765,7 +816,7 @@ unsafe fn parallel_scan_and_insert(
         heap,
         index,
         index_info,
-        true,   // allow_sync
+        true, // allow_sync
         progress,
         progress,
         0,
@@ -961,8 +1012,16 @@ unsafe fn begin_parallel(build: &mut BuildState, isconcurrent: bool, request: i3
     let area = pg_sys::shm_toc_allocate((*pcxt).toc, estarea).cast::<u8>();
     init_graph(&mut (*shared).graph, area, estarea, build.tranche);
 
-    pg_sys::shm_toc_insert((*pcxt).toc, PARALLEL_KEY_SHARED, shared.cast::<std::os::raw::c_void>());
-    pg_sys::shm_toc_insert((*pcxt).toc, PARALLEL_KEY_AREA, area.cast::<std::os::raw::c_void>());
+    pg_sys::shm_toc_insert(
+        (*pcxt).toc,
+        PARALLEL_KEY_SHARED,
+        shared.cast::<std::os::raw::c_void>(),
+    );
+    pg_sys::shm_toc_insert(
+        (*pcxt).toc,
+        PARALLEL_KEY_AREA,
+        area.cast::<std::os::raw::c_void>(),
+    );
 
     // Workers are separate processes and do not see the leader's session
     // GUCs: publish the SQ8 distance mode BEFORE launching them (they read
@@ -1233,7 +1292,6 @@ unsafe extern "C-unwind" fn sample_callback(
 // ---------------------------------------------------------------------------
 // ambuild / ambuildempty (hnswbuild.c: BuildIndex / hnswbuild / hnswbuildempty)
 // ---------------------------------------------------------------------------
-
 
 /// pgvector's `RelationNeedsWAL`: permanent relations need WAL.
 unsafe fn relation_needs_wal(index: pg_sys::Relation) -> bool {

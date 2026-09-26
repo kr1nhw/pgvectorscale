@@ -26,11 +26,11 @@ use crate::access_method::agentvec::directory::{
     AgentVecDirectory, AgentVecSegmentHeader, AgentVecSegmentMeta, SegmentAlgorithm, SegmentLevel,
     SegmentOwnership, SegmentState,
 };
-use crate::access_method::hnswsq::quantize::{HnswPrecision, Sq8Calibration};
 use crate::access_method::agentvec::flat;
 use crate::access_method::agentvec::meta_page::AgentVecMetaPage;
 use crate::access_method::agentvec::options::TSVAgentVecOptions;
 use crate::access_method::distance::{preprocess_cosine, DistanceType};
+use crate::access_method::hnswsq::quantize::{HnswPrecision, Sq8Calibration};
 use crate::access_method::pg_vector::PgVectorInternal;
 use crate::util::ItemPointer;
 
@@ -248,18 +248,15 @@ pub unsafe fn seal_hot_and_open_new(index: &PgRelation, expected_hot_id: u64) ->
             let header_pointer = segment.header;
             // Freeze the active chain.  This takes the header lock while
             // holding the meta lock, which is the documented order.
-            let (vector_count, live_count, dead_count) = AgentVecSegmentHeader::update(
-                index,
-                header_pointer.block_number,
-                |header| {
+            let (vector_count, live_count, dead_count) =
+                AgentVecSegmentHeader::update(index, header_pointer.block_number, |header| {
                     header.seal_active();
                     (
                         header.num_entries,
                         header.live_entries(),
                         header.dead_entries,
                     )
-                },
-            );
+                });
 
             let epoch = meta.bump_epoch();
             let segment = directory
@@ -414,10 +411,8 @@ pub unsafe fn fetch_heap_vector(
         // the vector's position in the heap tuple.
         let rd_index = (*index.as_ptr()).rd_index;
         let attnum = *(*rd_index).indkey.values.as_ptr() as i32;
-        let slot = pg_sys::MakeSingleTupleTableSlot(
-            (*heap_rel).rd_att,
-            &pg_sys::TTSOpsBufferHeapTuple,
-        );
+        let slot =
+            pg_sys::MakeSingleTupleTableSlot((*heap_rel).rd_att, &pg_sys::TTSOpsBufferHeapTuple);
         let mut htup: pg_sys::HeapTupleData = std::mem::zeroed();
         // PG18's heap_fetch reads the TID from the tuple's t_self.
         htup.t_self = tid;
@@ -458,4 +453,3 @@ pub unsafe fn fetch_heap_vector(
     pg_sys::table_close(heap_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
     result
 }
-

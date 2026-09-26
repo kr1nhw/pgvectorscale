@@ -207,8 +207,7 @@ pub unsafe fn init() {
         unsafe { std::ffi::CStr::from_ptr("ivf.seal_threshold".as_pg_cstr()) },
         unsafe {
             std::ffi::CStr::from_ptr(
-                "Entries accumulated in a list's active buffer before it is sealed"
-                    .as_pg_cstr(),
+                "Entries accumulated in a list's active buffer before it is sealed".as_pg_cstr(),
             )
         },
         unsafe {
@@ -289,7 +288,6 @@ pub unsafe extern "C-unwind" fn amoptions(
     reloptions: pg_sys::Datum,
     validate: bool,
 ) -> *mut pg_sys::bytea {
-
     fn make_relopt_parse_elt(
         optname: &str,
         opttype: pg_sys::relopt_type::Type,

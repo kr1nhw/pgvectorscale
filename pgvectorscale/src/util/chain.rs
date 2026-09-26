@@ -73,7 +73,8 @@ impl<'a, S: StatsNodeWrite> ChainTapeWriter<'a, S> {
     }
 
     /// Write chained data to the tape, returning an `ItemPointer` to the start of the data.
-    pub fn write(&mut self, mut data: &[u8]) -> super::ItemPointer {        let mut current_page = WritablePage::modify(self.index, self.current);
+    pub fn write(&mut self, mut data: &[u8]) -> super::ItemPointer {
+        let mut current_page = WritablePage::modify(self.index, self.current);
 
         // If there isn't enough space for the header plus some data, start a new page.
         if current_page.get_aligned_free_space() < CHAIN_ITEM_HEADER_SIZE + 1 {

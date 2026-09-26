@@ -98,7 +98,11 @@ pub fn launch_worker_for_current_database() {
     let result = BackgroundWorkerBuilder::new("agentvec maintenance worker")
         .set_type(WORKER_TYPE)
         .set_function("agentvec_maintenance_worker_main")
-        .set_library(concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION")))
+        .set_library(concat!(
+            env!("CARGO_PKG_NAME"),
+            "-",
+            env!("CARGO_PKG_VERSION")
+        ))
         .set_extra(&dbname)
         .enable_spi_access()
         .set_start_time(BgWorkerStartTime::ConsistentState)
@@ -169,8 +173,7 @@ fn pass_interval_ms() -> u64 {
 #[pg_extern]
 fn agentvec_run_maintenance(index: PgRelation, budget_rows: default!(i64, "-1")) -> i64 {
     let budget = if budget_rows < 0 {
-        super::options::TSVAgentVecOptions::from_relation(&index)
-            .get_migration_batch_rows() as i64
+        super::options::TSVAgentVecOptions::from_relation(&index).get_migration_batch_rows() as i64
     } else {
         budget_rows
     };

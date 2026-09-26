@@ -84,11 +84,11 @@ pub unsafe extern "C-unwind" fn ambuild(
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
+    use crate::access_method::agentvec::consolidate::SEGMENT_FORMAT_IVF_V1;
     use crate::access_method::agentvec::directory::{
         AgentVecSegmentHeader, AgentVecSegmentMeta, SegmentAlgorithm, SegmentLevel,
         SegmentOwnership, SegmentState,
     };
-    use crate::access_method::agentvec::consolidate::SEGMENT_FORMAT_IVF_V1;
     use crate::access_method::agentvec::insert::SEGMENT_FORMAT_HNSW_V1;
 
     let heap_rel = PgRelation::from_pg(heap);
@@ -145,16 +145,20 @@ pub unsafe extern "C-unwind" fn ambuild(
             meta.set_hot_segment_id(segment_id);
             segment_id
         });
-        AgentVecSegmentHeader::update(&index_rel, {
-            AgentVecMetaPage::fetch(&index_rel)
-                .load_directory(&index_rel)
-                .get(segment_id)
-                .expect("segment just created")
-                .header
-                .block_number
-        }, |header| {
-            header.num_entries = indtuples as u64;
-        });
+        AgentVecSegmentHeader::update(
+            &index_rel,
+            {
+                AgentVecMetaPage::fetch(&index_rel)
+                    .load_directory(&index_rel)
+                    .get(segment_id)
+                    .expect("segment just created")
+                    .header
+                    .block_number
+            },
+            |header| {
+                header.num_entries = indtuples as u64;
+            },
+        );
         return return_finish(&index_rel, reltuples, indtuples);
     }
     let (reltuples, indtuples, centroids, directory_ptr) =
@@ -198,16 +202,20 @@ pub unsafe extern "C-unwind" fn ambuild(
             meta.set_directory(ptr, blocks);
             segment_id
         });
-        AgentVecSegmentHeader::update(&index_rel, {
-            AgentVecMetaPage::fetch(&index_rel)
-                .load_directory(&index_rel)
-                .get(segment_id)
-                .expect("segment just created")
-                .header
-                .block_number
-        }, |header| {
-            header.num_entries = indtuples as u64;
-        });
+        AgentVecSegmentHeader::update(
+            &index_rel,
+            {
+                AgentVecMetaPage::fetch(&index_rel)
+                    .load_directory(&index_rel)
+                    .get(segment_id)
+                    .expect("segment just created")
+                    .header
+                    .block_number
+            },
+            |header| {
+                header.num_entries = indtuples as u64;
+            },
+        );
 
         // Register the segment's centroids in the router Vamana graph.
         if !centroids.is_empty() {

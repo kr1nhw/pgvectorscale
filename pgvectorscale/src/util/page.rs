@@ -299,11 +299,7 @@ impl Drop for WritablePage<'_> {
 /// touches buffers the caller holds content locks on, so it is safe inside a
 /// header/meta update closure (where `FlushRelationBuffers` would try to flush
 /// the locked page and self-deadlock on its content lock).
-pub unsafe fn flush_block_range(
-    index: &PgRelation,
-    start: pg_sys::BlockNumber,
-    count: u32,
-) {
+pub unsafe fn flush_block_range(index: &PgRelation, start: pg_sys::BlockNumber, count: u32) {
     for i in 0..count {
         let block = start + i as pg_sys::BlockNumber;
         let buf = pg_sys::ReadBufferExtended(
