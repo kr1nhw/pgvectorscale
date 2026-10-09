@@ -1301,8 +1301,15 @@ impl ElementArena {
         self.len
     }
 
+    /// Release every chunk this arena owns (the bump restarts from a fresh
+    /// chunk on the next `alloc`).  The chunks hold raw pointers, so they must
+    /// be deallocated explicitly — `Vec::clear` alone leaks all of them.  Use
+    /// `reset` instead when the memory is about to be reused.
     pub fn clear(&mut self) {
-        self.chunks.clear();
+        let layout = std::alloc::Layout::array::<Element>(ELEMENT_ARENA_CHUNK).unwrap();
+        for chunk in self.chunks.drain(..) {
+            unsafe { std::alloc::dealloc(chunk.cast::<u8>(), layout) };
+        }
         self.next = ELEMENT_ARENA_CHUNK;
         self.len = 0;
     }

@@ -89,12 +89,19 @@ pub unsafe fn add_segment_centroids(
         "agentvec: segment id {segment_id} does not fit the router TID encoding"
     );
     let support = utils::init_support(index.as_ptr(), router_base);
+    // Cosine centroids are normalized in place before encoding, so they need an
+    // owned copy; for every other distance type the borrowed centroid is
+    // encoded directly and the buffer is never touched.
+    let mut normalized: Vec<f32> = Vec::new();
     for (list_id, centroid) in centroids.iter().enumerate() {
-        let mut stored = centroid.clone();
-        if support.dist_type == DistanceType::Cosine {
-            preprocess_cosine(&mut stored);
-        }
-        let encoded = support.codec.encode(&stored);
+        let encoded = if support.dist_type == DistanceType::Cosine {
+            normalized.clear();
+            normalized.extend_from_slice(centroid);
+            preprocess_cosine(&mut normalized);
+            support.codec.encode(&normalized)
+        } else {
+            support.codec.encode(centroid)
+        };
         let mut tid = pg_sys::ItemPointerData::default();
         pgrx::itemptr::item_pointer_set_all(
             &mut tid,

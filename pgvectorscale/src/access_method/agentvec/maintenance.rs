@@ -116,22 +116,91 @@ pub fn launch_worker_for_current_database() {
 }
 
 /// One maintenance pass: every agentvec index of this database gets
-/// `agentvec_maybe_maintain` (the per-index schedule gate; each index's work
-/// commits in its own transaction).  Returns the number of rows converted.
-fn maintenance_pass() -> i64 {
+/// `agentvec_maybe_maintain` (the per-index schedule gate).  Each index runs in
+/// its own subtransaction, so a failure is rolled back for that index only and
+/// the pass carries on.  Returns the number of rows converted.
+pub(super) fn maintenance_pass() -> i64 {
     let indexes = list_indexes();
     let mut converted_total: i64 = 0;
     for oid in indexes {
-        let done = Spi::get_one::<i64>(&format!("SELECT agentvec_maybe_maintain({oid}::regclass)"));
-        match done {
-            Ok(Some(n)) if n > 0 => converted_total += n,
-            Ok(_) => {}
-            Err(err) => {
-                pgrx::log!("agentvec maintenance: index {oid} failed: {err}");
-            }
-        }
+        converted_total += maintain_one_index(oid).unwrap_or(0);
     }
     converted_total
+}
+
+/// The worker's per-index step, isolated in a subtransaction.
+///
+/// A failing step (`agentvec_maybe_maintain` raises) must not take anything
+/// else down with it.  `Spi::get_one` reports only SPI-level failures as `Err`;
+/// a failing SQL statement raises a Postgres ERROR, which aborts the enclosing
+/// transaction — every later statement in the pass would then fail with
+/// "current transaction is aborted" — and, with no outer error handler in a
+/// background worker, would turn into a FATAL that terminates the worker
+/// process (which is registered without a restart).  Catching the error and
+/// rolling the subtransaction back keeps the pass and the worker alive; the
+/// failure is logged for this index only.  The index's maintenance schedule is
+/// not advanced, so the next pass retries it.
+///
+/// Returns `None` when the index's step failed.
+pub(super) fn maintain_one_index(oid: pg_sys::Oid) -> Option<i64> {
+    unsafe {
+        let saved_ctx = pg_sys::CurrentMemoryContext;
+        let saved_owner = pg_sys::CurrentResourceOwner;
+        pg_sys::BeginInternalSubTransaction(std::ptr::null());
+        // Stay in the caller's memory context: the subtransaction's own context
+        // is destroyed with it (the PL/pgSQL exception-block pattern).
+        pg_sys::CurrentMemoryContext = saved_ctx;
+
+        // `Ok(Ok(n))` is a successful step, `Ok(Err(spi))` an SPI-level failure
+        // (the transaction stays usable), `Err(())` the caught Postgres error
+        // the handler above has already logged and rolled back.
+        let outcome: Result<Result<Option<i64>, spi::Error>, ()> = PgTryBuilder::new(|| {
+            Ok(Spi::get_one::<i64>(&format!(
+                "SELECT agentvec_maybe_maintain({oid}::regclass)"
+            )))
+        })
+        .catch_others(|caught| {
+            // The error left the subtransaction aborted, and may have left the
+            // current memory context inside it: switch out before rolling back.
+            pg_sys::CurrentMemoryContext = saved_ctx;
+            pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            pg_sys::CurrentMemoryContext = saved_ctx;
+            pg_sys::CurrentResourceOwner = saved_owner;
+            pgrx::log!(
+                "agentvec maintenance: index {oid} failed: {}",
+                caught_message(&caught)
+            );
+            Err(())
+        })
+        .execute();
+
+        let converted = match outcome {
+            Ok(Ok(n)) => n.unwrap_or(0),
+            Ok(Err(err)) => {
+                // SPI-level failure: the transaction is still usable, so the
+                // rest of the pass can proceed.
+                pgrx::log!("agentvec maintenance: index {oid} failed: {err}");
+                0
+            }
+            // Already logged and rolled back by the handler.
+            Err(()) => return None,
+        };
+
+        pg_sys::ReleaseCurrentSubTransaction();
+        pg_sys::CurrentMemoryContext = saved_ctx;
+        pg_sys::CurrentResourceOwner = saved_owner;
+        Some(converted)
+    }
+}
+
+/// The message of a caught error.  pgrx copies the error data into Rust memory
+/// when it catches, so reading it after the rollback is safe.
+fn caught_message(caught: &pg_sys::panic::CaughtError) -> String {
+    match caught {
+        pg_sys::panic::CaughtError::PostgresError(report)
+        | pg_sys::panic::CaughtError::ErrorReport(report) => report.message().to_string(),
+        pg_sys::panic::CaughtError::RustPanic { ereport, .. } => ereport.message().to_string(),
+    }
 }
 
 /// The oids of every agentvec index of this database.

@@ -646,6 +646,54 @@ mod tests {
         Ok(())
     }
 
+    /// A failing index must not take the maintenance pass (or the worker
+    /// process) down with it.  `maintain_one_index` runs the index's step in
+    /// its own subtransaction: the error is caught, logged and rolled back, the
+    /// enclosing transaction stays usable, and the pass goes on to the next
+    /// index.  (Before this was isolated, the raw `Spi::get_one` raised: the
+    /// whole pass — and, in the worker, the backend — was lost.)
+    #[pg_test]
+    fn test_agentvec_maintenance_isolates_failing_index() -> spi::Result<()> {
+        use crate::access_method::agentvec::maintenance;
+
+        Spi::run(
+            "CREATE TABLE t_av_iso(id int, v vector(8));
+             CREATE INDEX idx_av_iso ON t_av_iso USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_max_rows = 30, maintenance_interval = 0);
+             INSERT INTO t_av_iso
+                SELECT g, ('[' || g || ',0,0,0,0,0,0,0]')::vector FROM generate_series(1, 60) AS g;",
+        )?;
+
+        // A relation that does not exist: the step fails inside its
+        // subtransaction (the `regclass` cast inside the SPI call raises).
+        force_index_scan();
+        let missing = Spi::get_one::<pg_sys::Oid>("SELECT 987654321::oid")?.expect("oid");
+        assert_eq!(
+            maintenance::maintain_one_index(missing),
+            None,
+            "a failing index must be reported as failed, not raised"
+        );
+
+        // ... and the pass survived it: the next index runs on the same
+        // transaction and converts the segment the insert above sealed.
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'idx_av_iso'::regclass::oid")?.expect("oid");
+        assert_eq!(
+            maintenance::maintain_one_index(oid),
+            Some(30),
+            "the pass continues after a failing index"
+        );
+
+        // The transaction is still usable (a raised error would have left it
+        // aborted, failing everything from here on).
+        assert_eq!(Spi::get_one::<i32>("SELECT 1")?, Some(1));
+        assert_eq!(
+            search_ids("t_av_iso", "v", "<->", "[0,0,0,0,0,0,0,0]", 3),
+            vec![1, 2, 3],
+            "the index converted after the failure is searchable"
+        );
+        Ok(())
+    }
+
     /// With nothing sealed, the conversion is a no-op.
     #[pg_test]
     fn test_agentvec_consolidate_noop() -> spi::Result<()> {

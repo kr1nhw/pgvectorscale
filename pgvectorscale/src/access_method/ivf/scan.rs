@@ -99,12 +99,6 @@ fn extract_query_vector(datum: pg_sys::Datum, distance_type: DistanceType) -> Ve
 /// unsealed active buffers, handing each (estimate, heap tid) to `push`.
 /// `push` owns the bound (the AM's top-k heap; AgentVec's merged scan heap).
 #[allow(clippy::too_many_arguments)]
-/// Visit every estimated candidate of one IVF payload — the standalone AM's
-/// whole index, or an embedded AgentVec WARM/COLD segment at `meta`'s base:
-/// the zero-copy FastScan over the probed lists' published segments plus the
-/// unsealed active buffers, handing each (estimate, heap tid) to `push`.
-/// `push` owns the bound (the AM's top-k heap; AgentVec's merged scan heap).
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn for_each_candidate(
     index: &PgRelation,
     meta: &IvfMetaPage,

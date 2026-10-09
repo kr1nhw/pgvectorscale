@@ -422,7 +422,10 @@ pub unsafe extern "C-unwind" fn amrescan(
     state.discarded = None;
     state.tuples = 0;
     state.previous_distance = f64::NEG_INFINITY;
-    state.scratch.elements.clear();
+    // Rewind, not release: a rescan (nested-loop joins rescan once per outer
+    // row) reuses the arena's first chunk instead of reallocating it.  Every
+    // pointer handed out by the previous run died with `w`/`visited` above.
+    state.scratch.elements.reset();
     pg_sys::MemoryContextReset(state.tmp_ctx.value());
 
     // Extract the query vector (NULL/absent → empty → no results).

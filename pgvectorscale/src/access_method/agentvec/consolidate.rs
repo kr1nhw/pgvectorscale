@@ -267,18 +267,71 @@ unsafe fn build_ivf_segment(
 }
 
 /// Reservoir sample (bounded memory; keeps every row when `rows` is smaller).
+/// Only indices are held while scanning: an evicted row never has its vector
+/// copied, so the deep copies are bounded by `want` (the surviving sample)
+/// instead of by the number of replacements (≈ `want · ln(n/want)`).
 fn reservoir_sample(rows: &[(pg_sys::ItemPointerData, Vec<f32>)], want: usize) -> Vec<Vec<f32>> {
-    let mut sample: Vec<Vec<f32>> = Vec::with_capacity(want);
+    let mut sample: Vec<usize> = Vec::with_capacity(want);
     let mut rng = SmallRng::from_entropy();
-    for (i, (_tid, vec)) in rows.iter().enumerate() {
+    for i in 0..rows.len() {
         if sample.len() < want {
-            sample.push(vec.clone());
+            sample.push(i);
         } else {
             let j = rng.gen_range(0..=i);
             if j < want {
-                sample[j] = vec.clone();
+                sample[j] = i;
             }
         }
     }
-    sample
+    sample.into_iter().map(|i| rows[i].1.clone()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(n: usize) -> Vec<(pg_sys::ItemPointerData, Vec<f32>)> {
+        (0..n)
+            .map(|i| {
+                (
+                    pg_sys::ItemPointerData::default(),
+                    vec![i as f32, -(i as f32)],
+                )
+            })
+            .collect()
+    }
+
+    /// The sample is exactly the reservoir size, is drawn from the input
+    /// verbatim, and keeps everything when the input is smaller than `want`.
+    #[test]
+    fn test_reservoir_sample_is_bounded_and_faithful() {
+        let all = rows(1_000);
+        let sample = reservoir_sample(&all, 8);
+        assert_eq!(sample.len(), 8);
+        for vec in &sample {
+            let i = vec[0] as usize;
+            assert!(i < all.len(), "sample row {i} is not from the input");
+            assert_eq!(all[i].1, *vec, "sampled vector was altered");
+        }
+
+        let small = reservoir_sample(&all[..3], 8);
+        assert_eq!(small.len(), 3, "a short input is kept entirely");
+    }
+
+    /// Algorithm R must reach rows beyond the reservoir's initial fill: with
+    /// 1000 rows and `want = 4`, every sample drawn from only the first 64 rows
+    /// is a ≈ 1e-5 event, so 64 draws without a single later row would mean the
+    /// replacement step is dead.
+    #[test]
+    fn test_reservoir_sample_replaces() {
+        let all = rows(1_000);
+        let mut saw_late_row = false;
+        for _ in 0..64 {
+            if reservoir_sample(&all, 4).iter().any(|v| v[0] >= 64.0) {
+                saw_late_row = true;
+                break;
+            }
+        }
+        assert!(saw_late_row, "reservoir never replaced an early row");
+    }
 }

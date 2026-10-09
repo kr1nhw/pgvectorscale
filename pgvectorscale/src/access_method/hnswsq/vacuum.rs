@@ -43,6 +43,12 @@ pub struct VacuumState {
     pub decode: Vec<f32>,
     pub pair_scratch: Vec<f32>,
     pub visited: Visited,
+    /// Scratch of `repair_graph_element`, reused across every element the graph
+    /// repair walks (a graph-wide repair would otherwise allocate two `dim`
+    /// vectors and a 64 KiB arena per element).
+    pub na_array: Vec<u8>,
+    pub na_tids: Vec<pg_sys::ItemPointerData>,
+    pub na_elements: ElementArena,
 }
 
 /// `DeletingElement` (hnswvacuum.c).
@@ -224,7 +230,22 @@ unsafe fn repair_graph_element(
     let index = vac.index;
     let m = vac.m;
     let ef_construction = vac.ef_construction;
-    let support = &vac.support;
+    let base = vac.base;
+    let bas = vac.bas;
+    // Split the borrow: the search below and the neighbor rewrite at the end
+    // share the vacuum's scratch, and every buffer lives in its own field.
+    let VacuumState {
+        support,
+        ntup,
+        scratch,
+        decode,
+        pair_scratch,
+        visited,
+        na_array,
+        na_tids,
+        na_elements,
+        ..
+    } = vac;
 
     // Skip if element is entry point
     if let Some(ep) = entry_point {
@@ -238,6 +259,12 @@ unsafe fn repair_graph_element(
     init_neighbors(std::ptr::null_mut(), element, m, &allocator);
     (*element).heaptid_set = 0;
 
+    // Rewind the search arena first: the candidates of the previously repaired
+    // element are dead (its neighbors were copied onto its tuple before this
+    // call returned), and without the rewind a graph-wide repair would only
+    // ever grow the arena.
+    scratch.elements.reset();
+
     // Find neighbors for element, skipping itself
     find_element_neighbors(
         std::ptr::null_mut(),
@@ -248,19 +275,19 @@ unsafe fn repair_graph_element(
         m,
         ef_construction,
         true,
-        &mut vac.scratch,
-        &mut vac.decode,
-        &mut vac.pair_scratch,
-        &mut vac.visited,
+        scratch,
+        decode,
+        pair_scratch,
+        visited,
         crate::access_method::hnswsq::options::HNSW_SQ8_DISTANCE.get(),
     );
 
     // Update neighbor tuple (before getting the page, to minimize locking)
     let ntup_size = neighbor_tuple_size((*element).level as usize, m);
-    vac.ntup.fill(0);
+    ntup.fill(0);
     set_neighbor_tuple(
         std::ptr::null_mut(),
-        vac.ntup.as_mut_ptr().cast::<NeighborTupleData>(),
+        ntup.as_mut_ptr().cast::<NeighborTupleData>(),
         element,
         m,
     );
@@ -271,7 +298,7 @@ unsafe fn repair_graph_element(
         pg_sys::ForkNumber::MAIN_FORKNUM,
         (*element).neighbor_page,
         pg_sys::ReadBufferMode::RBM_NORMAL,
-        vac.bas,
+        bas,
     );
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
     let state = pg_sys::GenericXLogStart(index);
@@ -291,25 +318,26 @@ unsafe fn repair_graph_element(
     pg_sys::GenericXLogFinish(state);
     pg_sys::UnlockReleaseBuffer(buf);
 
-    // Update neighbors (vacuum-local scratch: this is per repaired element,
-    // not the per-row insert hot path)
-    let mut pair_scratch = vec![0.0f32; support.codec.dim()];
-    let mut decode = vec![0.0f32; support.codec.dim()];
-    let mut na_array: Vec<u8> = Vec::new();
-    let mut na_tids: Vec<pg_sys::ItemPointerData> = Vec::new();
-    let mut na_elements = ElementArena::new();
+    // Update neighbors: reuse the vacuum's buffers (this runs once per repaired
+    // element and a mass delete leaves most of the graph stale, so a fresh
+    // 64 KiB arena plus two `dim` vectors per element is pure churn).  The
+    // neighbor list loaded below is dead as soon as the connections have been
+    // written back, so the arena is rewound here rather than reallocated.
+    na_array.clear();
+    na_tids.clear();
+    na_elements.reset();
     update_neighbors_on_disk(
         index,
-        vac.base,
+        base,
         support,
         element,
         m,
         false,
-        &mut pair_scratch,
-        &mut decode,
-        &mut na_array,
-        &mut na_tids,
-        &mut na_elements,
+        pair_scratch,
+        decode,
+        na_array,
+        na_tids,
+        na_elements,
     );
 }
 
@@ -922,6 +950,9 @@ pub unsafe fn vacuum_region(
         decode: Vec::with_capacity(dim),
         pair_scratch: Vec::with_capacity(dim),
         visited: Visited::new(ef * m * 2),
+        na_array: Vec::new(),
+        na_tids: Vec::new(),
+        na_elements: ElementArena::new(),
     };
 
     // Pass 1: Remove heap TIDs
