@@ -393,6 +393,33 @@ pub unsafe fn insert_entry(
 /// calibrated HOT layouts, whose inline bytes clamp.  Returns `None` when the
 /// row is not visible to the active snapshot (deleted or updated away while
 /// the conversion ran).
+/// Prefetch the heap pages that a rerank pass is about to read.
+///
+/// The candidates are scattered heap tids, so their reads are independent:
+/// issuing the prefetches up front lets the storage layer work on them in
+/// parallel instead of the scan stalling on one page at a time.  Prefetching
+/// is advisory — a page that arrives late (or is already cached) only costs
+/// the call.
+///
+/// The relation must be the *heap*: the index only stores tids, and
+/// `PrefetchBuffer` raises when a block lies beyond the end of the relation
+/// it is given.  Blocks past the current end (a tid whose row was removed by a
+/// rewrite) are skipped for the same reason.
+pub unsafe fn prefetch_heap_tids(index: &PgRelation, tids: impl Iterator<Item = ItemPointer>) {
+    let heap_rel = pg_sys::table_open(
+        (*(*index.as_ptr()).rd_index).indrelid,
+        pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+    );
+    let nblocks =
+        pg_sys::RelationGetNumberOfBlocksInFork(heap_rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+    for tid in tids {
+        if tid.is_valid() && tid.block_number < nblocks {
+            pg_sys::PrefetchBuffer(heap_rel, pg_sys::ForkNumber::MAIN_FORKNUM, tid.block_number);
+        }
+    }
+    pg_sys::table_close(heap_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+}
+
 pub unsafe fn fetch_heap_vector(
     index: &PgRelation,
     tid: pg_sys::ItemPointerData,

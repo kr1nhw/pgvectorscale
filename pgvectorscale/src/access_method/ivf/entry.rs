@@ -286,6 +286,25 @@ impl<'a> IvfEntrySlice<'a> {
         f32::from_le_bytes(self.sums[i * 4..(i + 1) * 4].try_into().unwrap())
     }
 
+    /// Unaligned pointer to entry `base`'s `sum_of_x2` value in the SoA stream
+    /// (for the in-place SIMD estimate; see `estimate_batch_raw`).
+    #[inline]
+    pub fn sums_ptr(&self, base: usize) -> *const u8 {
+        unsafe { self.sums.as_ptr().add(base * 4) }
+    }
+
+    /// Unaligned pointer to entry `base`'s `scale` value (see [`Self::sums_ptr`]).
+    #[inline]
+    pub fn scales_ptr(&self, base: usize) -> *const u8 {
+        unsafe { self.scales.as_ptr().add(base * 4) }
+    }
+
+    /// Unaligned pointer to entry `base`'s `margin_factor` (see [`Self::sums_ptr`]).
+    #[inline]
+    pub fn margin_factors_ptr(&self, base: usize) -> *const u8 {
+        unsafe { self.margin_factors.as_ptr().add(base * 4) }
+    }
+
     /// Copy the packed little-endian f32 region starting at entry `base` for
     /// `out.len()` entries into the caller-provided (properly aligned) `out`.
     ///
@@ -295,6 +314,9 @@ impl<'a> IvfEntrySlice<'a> {
     /// f32's 4-byte alignment.  Copying the raw bytes into the aligned
     /// destination is sound: every bit pattern is a valid f32, and the write
     /// goes through a u8 pointer into a fully initialized `&mut [f32]`.
+    ///
+    /// For the SIMD estimate path, [`Self::scales_ptr`] and friends hand the
+    /// unaligned region to a kernel that loads it directly instead.
     #[inline]
     fn copy_f32_region(src: &'a [u8], base: usize, out: &mut [f32]) {
         assert!(
@@ -614,25 +636,38 @@ pub fn read_active_entries(index: &PgRelation, active: &IvfActiveBuffer) -> Vec<
 }
 
 /// Reader for IVF entry pages.
+///
+/// Owns the burst buffer: a scan reads thousands of segments, so the buffer is
+/// allocated once per reader and reused instead of once per segment.
 pub struct IvfEntryReader<'a> {
     index: &'a PgRelation,
+    scratch: Vec<u8>,
 }
 
 impl<'a> IvfEntryReader<'a> {
     /// Create a new entry reader.
     pub fn new(index: &'a PgRelation) -> Self {
-        Self { index }
+        Self {
+            index,
+            scratch: Vec::new(),
+        }
     }
 
-    /// Bulk-read a list's contiguous entry blocks via `smgrreadv` and return the
-    /// reassembled SoA byte stream.
+    /// Bulk-read a list's contiguous entry blocks via `smgrreadv` into
+    /// `self.scratch`, compact the per-page payloads towards the front, and
+    /// return the compacted SoA byte-stream length.
     ///
     /// This bypasses the buffer manager (no per-block pin/LWLock); it reads the
     /// on-disk image directly, so the writer must flush the relation (see
     /// `FlushRelationBuffers` in build/insert/vacuum) before a scan runs.
-    fn read_bytes(&self, start_page: BlockNumber, num_blocks: u32) -> Vec<u8> {
+    ///
+    /// Compaction is a forward move inside the burst buffer: page `i`'s payload
+    /// goes to `dst`, which never exceeds its source offset (every page holds
+    /// one item plus its header), so no second buffer is needed.
+    fn read_burst(&mut self, start_page: BlockNumber, num_blocks: u32) -> usize {
         if num_blocks == 0 {
-            return Vec::new();
+            self.scratch.clear();
+            return 0;
         }
         unsafe {
             let rel = self.index.as_ptr();
@@ -661,10 +696,19 @@ impl<'a> IvfEntryReader<'a> {
 
             let n = num_blocks as usize;
             let blksz = pg_sys::BLCKSZ as usize;
-            // One contiguous raw buffer, *uninitialized*: `smgrreadv` overwrites
-            // every byte, so zero-filling it would be pure wasted memset.
-            let mut raw: Vec<u8> = Vec::with_capacity(n * blksz);
-            raw.set_len(n * blksz);
+            // Grow to the largest burst seen so far; after the first segment the
+            // buffer is reused as-is.  `smgrreadv` overwrites every block it is
+            // handed, so only newly grown bytes are ever zero-filled.
+            let need = n * blksz;
+            if self.scratch.len() < need {
+                self.scratch.resize(need, 0);
+            }
+            // One raw base pointer for both the burst and the in-place
+            // compaction: going through `Vec::as_mut_ptr`/`as_ptr` while
+            // payload pointers derived from the same buffer are live would be
+            // aliasing UB (the reads below would be reordered against the
+            // moves).
+            let base = self.scratch.as_mut_ptr();
 
             // The smgr vtable caps one vectored read.  Vanilla md allows
             // PG_IOV_MAX (=IOV_MAX, 1024 on Linux), but Neon's fork defines
@@ -680,7 +724,7 @@ impl<'a> IvfEntryReader<'a> {
             while off < n {
                 let chunk = (n - off).min(max_burst);
                 let mut ptrs: Vec<*mut std::os::raw::c_void> = (0..chunk)
-                    .map(|i| raw.as_mut_ptr().add((off + i) * blksz) as *mut std::os::raw::c_void)
+                    .map(|i| base.add((off + i) * blksz) as *mut std::os::raw::c_void)
                     .collect();
                 pg_sys::smgrreadv(
                     reln,
@@ -692,26 +736,32 @@ impl<'a> IvfEntryReader<'a> {
                 off += chunk;
             }
 
-            let mut buf: Vec<u8> = Vec::with_capacity(n * blksz);
+            // Compact in place: payload of page `i` moves to `dst`, which is at
+            // or before the source, so a forward copy can never clobber a page
+            // that has not been read yet.
+            let mut dst = 0usize;
             for i in 0..n {
-                let block = &raw[i * blksz..(i + 1) * blksz];
-                let page = block.as_ptr() as pg_sys::Page;
-                let item_id = PageGetItemId(page, 1);
-                let item = PageGetItem(page, item_id);
+                let src_page = base.add(i * blksz) as pg_sys::Page;
+                let item_id = PageGetItemId(src_page, 1);
+                let item = PageGetItem(src_page, item_id);
                 let len = (*item_id).lp_len() as usize;
-                buf.extend_from_slice(std::slice::from_raw_parts(item as *const u8, len));
+                // Always move: even the first payload sits behind its page
+                // header.  `copy` is a memmove, and `dst` never passes the
+                // source of a page that has not been read yet.
+                std::ptr::copy(item as *const u8, base.add(dst), len);
+                dst += len;
             }
-            buf
+            dst
         }
     }
 
     /// Read all entries for a given list.
-    pub fn read_entries(&self, start_page: BlockNumber, num_blocks: u32) -> Vec<IvfEntry> {
-        let buf = self.read_bytes(start_page, num_blocks);
-        if buf.is_empty() {
+    pub fn read_entries(&mut self, start_page: BlockNumber, num_blocks: u32) -> Vec<IvfEntry> {
+        let len = self.read_burst(start_page, num_blocks);
+        if len == 0 {
             return Vec::new();
         }
-        let view = IvfEntrySlice::parse(&buf);
+        let view = IvfEntrySlice::parse(&self.scratch[..len]);
         // Transposed codes are recovered to row-major for the in-memory
         // IvfEntry (the rewrite path re-transposes on serialize): 1-bit is a
         // single plane; 2-bit re-interleaves its two planes into the packed
@@ -774,16 +824,16 @@ impl<'a> IvfEntryReader<'a> {
     /// slice borrows from it, so no owned `IvfEntry` (or per-entry `Vec<u8>`
     /// code) is allocated.
     pub fn for_each_slice<F: FnMut(&IvfEntrySlice)>(
-        &self,
+        &mut self,
         start_page: BlockNumber,
         num_blocks: u32,
         mut f: F,
     ) {
-        let buf = self.read_bytes(start_page, num_blocks);
-        if buf.is_empty() {
+        let len = self.read_burst(start_page, num_blocks);
+        if len == 0 {
             return;
         }
-        let view = IvfEntrySlice::parse(&buf);
+        let view = IvfEntrySlice::parse(&self.scratch[..len]);
         f(&view);
     }
 }

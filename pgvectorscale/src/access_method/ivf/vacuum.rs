@@ -36,7 +36,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     };
     let mut list_directory = IvfListDirectory::load(&index_rel, IVF_STANDALONE_BASE);
 
-    let reader = IvfEntryReader::new(&index_rel);
+    let mut reader = IvfEntryReader::new(&index_rel);
     let mut total_live = 0u64;
     let mut total_dead = 0u64;
 

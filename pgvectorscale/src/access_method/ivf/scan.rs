@@ -106,13 +106,18 @@ pub unsafe fn for_each_candidate(
     list_directory: &IvfListDirectory,
     query: &[f32],
     nearest: &[usize],
-    mut push: impl FnMut(f32, ItemPointer),
+    mut push: impl FnMut(f32, ItemPointer) -> bool,
 ) {
     let num_bits = meta.get_bq_num_bits_per_dimension();
     let rotation_seed = meta.get_rotation_seed();
     let quantizer =
         RabitqQuantizer::new(num_bits, rotation_seed, meta.get_num_dimensions() as usize);
-    let reader = IvfEntryReader::new(index);
+    let mut reader = IvfEntryReader::new(index);
+    // Upper bound on the distance the sink still accepts: `INFINITY` until the
+    // sink rejects something (a candidate at `d` proves every `d' >= d` is
+    // rejected too, and the bound only tightens).  Batches whose best entry is
+    // at or above it are skipped without touching a single entry.
+    let mut worst = f32::INFINITY;
     for &list_id in nearest {
         if let Some(list_meta) = list_directory.get_list(list_id as u16) {
             if !list_meta.header.is_valid() {
@@ -142,25 +147,30 @@ pub unsafe fn for_each_candidate(
                             fastscan.sum_batch(view.code_batch(batch), &mut sums);
                             let base = batch * 32;
                             let count = (view.len() - base).min(32);
-                            // The packed f32 regions are not guaranteed
-                            // 4-byte aligned, so copy them into aligned
-                            // stack buffers (byte-exact, no reordering).
-                            let mut scales = [0f32; 32];
-                            let mut sx2s = [0f32; 32];
-                            let mut mfs = [0f32; 32];
-                            view.copy_scales(base, &mut scales[..count]);
-                            view.copy_sums(base, &mut sx2s[..count]);
-                            view.copy_margin_factors(base, &mut mfs[..count]);
-                            fastscan.estimate_batch(
-                                &sums[..count],
-                                &scales[..count],
-                                &sx2s[..count],
-                                &mfs[..count],
-                                &mut dists[..count],
-                                count,
-                            );
+                            // The per-entry f32 metadata is read in place
+                            // from the SoA stream: the packed regions are not
+                            // 4-byte aligned, so the kernel uses unaligned
+                            // loads instead of staging stack copies.  It also
+                            // returns the batch minimum, which skips the whole
+                            // batch when even its best entry cannot enter the
+                            // bound.
+                            let min = unsafe {
+                                fastscan.estimate_batch_raw(
+                                    &sums[..count],
+                                    view.scales_ptr(base),
+                                    view.sums_ptr(base),
+                                    view.margin_factors_ptr(base),
+                                    &mut dists[..count],
+                                    count,
+                                )
+                            };
+                            if min >= worst {
+                                continue;
+                            }
                             for r in 0..count {
-                                push(dists[r], view.tid(base + r));
+                                if !push(dists[r], view.tid(base + r)) {
+                                    worst = worst.min(dists[r]);
+                                }
                             }
                         }
                     } else if num_bits == 2 {
@@ -192,8 +202,16 @@ pub unsafe fn for_each_candidate(
                                 &mut dists[..count],
                                 count,
                             );
+                            // Same batch skip as the 1-bit path; the minimum
+                            // comes from the (already SIMD) distance batch.
+                            let min = dists[..count].iter().copied().fold(f32::INFINITY, f32::min);
+                            if min >= worst {
+                                continue;
+                            }
                             for r in 0..count {
-                                push(dists[r], view.tid(base + r));
+                                if !push(dists[r], view.tid(base + r)) {
+                                    worst = worst.min(dists[r]);
+                                }
                             }
                         }
                     } else {
@@ -206,7 +224,9 @@ pub unsafe fn for_each_candidate(
                                 view.scale(i),
                                 view.margin_factor(i),
                             );
-                            push(d, view.tid(i));
+                            if !push(d, view.tid(i)) {
+                                worst = worst.min(d);
+                            }
                         }
                     }
                 });
@@ -227,7 +247,9 @@ pub unsafe fn for_each_candidate(
                         e.code.l1_of_rotated,
                         &rq,
                     );
-                    push(d, e.heap_tid);
+                    if !push(d, e.heap_tid) {
+                        worst = worst.min(d);
+                    }
                 }
             }
         }
@@ -336,10 +358,16 @@ pub unsafe extern "C-unwind" fn amgettuple(
                 let candidate = DistTid { dist, tid };
                 if heap.len() < top_k {
                     heap.push(candidate);
+                    true
                 } else if let Some(mut worst) = heap.peek_mut() {
                     if candidate.dist < worst.dist {
                         *worst = candidate;
+                        true
+                    } else {
+                        false
                     }
+                } else {
+                    false
                 }
             },
         );

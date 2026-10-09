@@ -321,6 +321,7 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
                             }
                         }
                     }
+                    super::insert::prefetch_heap_tids(&index_rel, est_heap.iter().map(|c| c.tid));
                     for cand in est_heap {
                         let mut tid_data = pg_sys::ItemPointerData::default();
                         cand.tid.to_item_pointer_data(&mut tid_data);
@@ -437,13 +438,20 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
                             };
                             if est_heap.len() < k {
                                 est_heap.push(cand);
+                                true
                             } else if let Some(mut worst) = est_heap.peek_mut() {
                                 if cand.dist < worst.dist {
                                     *worst = cand;
+                                    true
+                                } else {
+                                    false
                                 }
+                            } else {
+                                false
                             }
                         },
                     );
+                    super::insert::prefetch_heap_tids(&index_rel, est_heap.iter().map(|c| c.tid));
                     for cand in est_heap {
                         let mut tid_data = pg_sys::ItemPointerData::default();
                         cand.tid.to_item_pointer_data(&mut tid_data);
@@ -483,6 +491,7 @@ unsafe fn compute_results(scan: pg_sys::IndexScanDesc, state: &mut AgentVecScanS
                                     exact: false,
                                 },
                             );
+                            true
                         },
                     );
                 }

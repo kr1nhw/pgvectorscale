@@ -965,6 +965,37 @@ impl<'a> RabitqFastScan<'a> {
         );
     }
 
+    /// Fused estimate for a batch of 1-bit rows whose SoA metadata is read in
+    /// place from the entry stream (see `estimate_batch_raw` in
+    /// `rabitq_fastscan`), returning the batch minimum.
+    ///
+    /// # Safety
+    /// The three pointers must address `n` initialized little-endian `f32`
+    /// values each.
+    #[inline]
+    pub unsafe fn estimate_batch_raw(
+        &self,
+        sums: &[u16],
+        scales: *const u8,
+        sx2: *const u8,
+        mf: *const u8,
+        out: &mut [f32],
+        n: usize,
+    ) -> f32 {
+        crate::access_method::quantization::rabitq_fastscan::estimate_batch_raw(
+            sums,
+            scales,
+            sx2,
+            mf,
+            self.a_full,
+            self.b_full,
+            self.rq_sum_of_x2,
+            self.rq_margin,
+            out,
+            n,
+        )
+    }
+
     /// Fused estimate for a batch of 2-bit rows from the two plane sums
     /// (dequantize + combine + L2), SIMD over 4/8 rows.
     #[inline]

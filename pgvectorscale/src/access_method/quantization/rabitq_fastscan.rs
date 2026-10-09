@@ -160,6 +160,206 @@ fn estimate_batch_scalar(
     }
 }
 
+/// Fused estimate for a batch whose per-entry f32 metadata (`scales`, `sx2`,
+/// `mf`) is read in place from the tightly packed SoA byte stream — no
+/// per-batch staging copies — returning the batch's minimum estimate.
+///
+/// The SoA regions carry no alignment padding, so the three pointers are
+/// unaligned (every bit pattern is a valid `f32`; the loads are `loadu` /
+/// `read_unaligned`).  The minimum lets the caller skip a whole batch when
+/// even its best entry cannot enter the result bound.
+///
+/// # Safety
+/// Each metadata pointer must address `n` initialized little-endian `f32`
+/// values; `sums` and `out` must hold at least `n` elements.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn estimate_batch_raw(
+    sums: &[u16],
+    scales: *const u8,
+    sx2: *const u8,
+    mf: *const u8,
+    a_full: f32,
+    b_full: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: only selected when AVX2 was detected.
+            return estimate_batch_raw_avx2(
+                sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n,
+            );
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64.
+        return estimate_batch_raw_neon(
+            sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n,
+        );
+    }
+    #[allow(unreachable_code)]
+    estimate_batch_raw_scalar(
+        sums, scales, sx2, mf, a_full, b_full, rq_sum, rq_margin, out, n,
+    )
+}
+
+#[inline]
+unsafe fn f32_at(ptr: *const u8, i: usize) -> f32 {
+    f32::from_le_bytes(std::ptr::read_unaligned(ptr.add(i * 4) as *const [u8; 4]))
+}
+
+/// Scalar reference for [`estimate_batch_raw`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn estimate_batch_raw_scalar(
+    sums: &[u16],
+    scales: *const u8,
+    sx2: *const u8,
+    mf: *const u8,
+    a_full: f32,
+    b_full: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) -> f32 {
+    let mut min = f32::INFINITY;
+    for i in 0..n {
+        let scale = f32_at(scales, i);
+        let d = (a_full * scale * sums[i] as f32 + b_full * scale + rq_sum + f32_at(sx2, i)
+            - f32_at(mf, i) * rq_margin)
+            .max(0.0);
+        out[i] = d;
+        if d < min {
+            min = d;
+        }
+    }
+    min
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn estimate_batch_raw_avx2(
+    sums: &[u16],
+    scales: *const u8,
+    sx2: *const u8,
+    mf: *const u8,
+    a_full: f32,
+    b_full: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) -> f32 {
+    use std::arch::x86_64::*;
+    let rq_sum_v = _mm256_set1_ps(rq_sum);
+    let rq_margin_v = _mm256_set1_ps(rq_margin);
+    let a_v = _mm256_set1_ps(a_full);
+    let b_v = _mm256_set1_ps(b_full);
+    let zero = _mm256_setzero_ps();
+    let mut min_v = _mm256_set1_ps(f32::INFINITY);
+    let mut i = 0;
+    while i + 8 <= n {
+        let sums_v = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_loadu_si128(
+            sums.as_ptr().add(i) as *const __m128i,
+        )));
+        let scale_v = _mm256_loadu_ps(scales.add(i * 4) as *const f32);
+        let sx2_v = _mm256_loadu_ps(sx2.add(i * 4) as *const f32);
+        let mf_v = _mm256_loadu_ps(mf.add(i * 4) as *const f32);
+        let mut acc = _mm256_fmadd_ps(scale_v, b_v, rq_sum_v);
+        acc = _mm256_add_ps(acc, sx2_v);
+        acc = _mm256_fnmadd_ps(mf_v, rq_margin_v, acc);
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(sums_v, scale_v), a_v, acc);
+        let d = _mm256_max_ps(acc, zero);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), d);
+        min_v = _mm256_min_ps(min_v, d);
+        i += 8;
+    }
+    let mut lanes = [0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), min_v);
+    let mut min = lanes.iter().copied().fold(f32::INFINITY, f32::min);
+    if i < n {
+        let tail = estimate_batch_raw_scalar(
+            &sums[i..],
+            scales.add(i * 4),
+            sx2.add(i * 4),
+            mf.add(i * 4),
+            a_full,
+            b_full,
+            rq_sum,
+            rq_margin,
+            &mut out[i..],
+            n - i,
+        );
+        if tail < min {
+            min = tail;
+        }
+    }
+    min
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn estimate_batch_raw_neon(
+    sums: &[u16],
+    scales: *const u8,
+    sx2: *const u8,
+    mf: *const u8,
+    a_full: f32,
+    b_full: f32,
+    rq_sum: f32,
+    rq_margin: f32,
+    out: &mut [f32],
+    n: usize,
+) -> f32 {
+    use std::arch::aarch64::*;
+    let rq_sum_v = vdupq_n_f32(rq_sum);
+    let rq_margin_v = vdupq_n_f32(rq_margin);
+    let a_v = vdupq_n_f32(a_full);
+    let b_v = vdupq_n_f32(b_full);
+    let zero = vdupq_n_f32(0.0);
+    let mut min_v = vdupq_n_f32(f32::INFINITY);
+    let mut i = 0;
+    while i + 4 <= n {
+        let sums_v = vcvtq_f32_u32(vmovl_u16(vld1_u16(sums.as_ptr().add(i))));
+        // NEON loads tolerate unaligned addresses, which is what the packed
+        // SoA regions provide.
+        let scale_v = vld1q_f32(scales.add(i * 4) as *const f32);
+        let sx2_v = vld1q_f32(sx2.add(i * 4) as *const f32);
+        let mf_v = vld1q_f32(mf.add(i * 4) as *const f32);
+        let mut acc = vmlaq_n_f32(rq_sum_v, scale_v, b_full);
+        acc = vaddq_f32(acc, sx2_v);
+        acc = vmlsq_n_f32(acc, mf_v, rq_margin);
+        acc = vmlaq_f32(acc, vmulq_f32(sums_v, scale_v), a_v);
+        let d = vmaxq_f32(acc, zero);
+        vst1q_f32(out.as_mut_ptr().add(i), d);
+        min_v = vminq_f32(min_v, d);
+        i += 4;
+    }
+    let mut min = vminvq_f32(min_v);
+    if i < n {
+        let tail = estimate_batch_raw_scalar(
+            &sums[i..],
+            scales.add(i * 4),
+            sx2.add(i * 4),
+            mf.add(i * 4),
+            a_full,
+            b_full,
+            rq_sum,
+            rq_margin,
+            &mut out[i..],
+            n - i,
+        );
+        if tail < min {
+            min = tail;
+        }
+    }
+    min
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn estimate_batch_neon(
@@ -587,6 +787,85 @@ unsafe fn sum_batch_avx2(codes: &[u8], code_len: usize, table: &[u8], out: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The in-place metadata kernel must be bit-identical to the staging-copy
+    /// kernel for every layout, including the unaligned offsets the SoA stream
+    /// produces (an odd entry count misaligns all three f32 regions).
+    #[test]
+    fn test_estimate_batch_raw_matches_staged() {
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = SmallRng::seed_from_u64(7);
+        for n in [1usize, 7, 8, 31, 32, 40] {
+            for offset in [0usize, 1, 2, 3] {
+                let sums: Vec<u16> = (0..n).map(|_| rng.gen_range(0..4096u16)).collect();
+                let scales: Vec<f32> = (0..n).map(|_| rng.gen_range(-2.0f32..2.0)).collect();
+                let sx2: Vec<f32> = (0..n).map(|_| rng.gen_range(0.0f32..4.0)).collect();
+                let mf: Vec<f32> = (0..n).map(|_| rng.gen_range(0.0f32..2.0)).collect();
+                // Emulate the packed stream: shift each region by `offset`
+                // bytes so its f32s are unaligned.
+                let pad = |v: &[f32]| -> Vec<u8> {
+                    let mut b = vec![0u8; offset];
+                    for x in v {
+                        b.extend_from_slice(&x.to_le_bytes());
+                    }
+                    b
+                };
+                let (ps, px, pm) = (pad(&scales), pad(&sx2), pad(&mf));
+                let a_full = 1.234f32;
+                let b_full = -0.5f32;
+                let rq_sum = 0.75f32;
+                let rq_margin = 0.25f32;
+
+                let mut staged = vec![0f32; n];
+                estimate_batch(
+                    &sums,
+                    &scales,
+                    &sx2,
+                    &mf,
+                    a_full,
+                    b_full,
+                    rq_sum,
+                    rq_margin,
+                    &mut staged,
+                    n,
+                );
+                let mut raw = vec![0f32; n];
+                let min = unsafe {
+                    estimate_batch_raw(
+                        &sums,
+                        ps.as_ptr().add(offset),
+                        px.as_ptr().add(offset),
+                        pm.as_ptr().add(offset),
+                        a_full,
+                        b_full,
+                        rq_sum,
+                        rq_margin,
+                        &mut raw,
+                        n,
+                    )
+                };
+                for i in 0..n {
+                    // FMA (NEON/AVX2) and mul+add (scalar tail) round
+                    // differently, so the two kernels agree to a few ULPs
+                    // rather than bit-for-bit across instruction sets.
+                    let a = raw[i];
+                    let b = staged[i];
+                    let tol = 1e-4 * b.abs().max(1.0);
+                    assert!(
+                        (a - b).abs() <= tol,
+                        "n={n} offset={offset} i={i}: raw={a} staged={b}"
+                    );
+                }
+                let expect_min = staged[..n].iter().copied().fold(f32::INFINITY, f32::min);
+                assert_eq!(
+                    min.to_bits(),
+                    expect_min.to_bits(),
+                    "min n={n} offset={offset}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn transpose_roundtrip_matches_row_major_sum() {

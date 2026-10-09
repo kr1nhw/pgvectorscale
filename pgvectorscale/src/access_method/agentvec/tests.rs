@@ -694,6 +694,33 @@ mod tests {
         Ok(())
     }
 
+    /// A sealed segment that spans several entry blocks: the burst reader
+    /// compacts one payload per page into the SoA stream, so a search must see
+    /// exactly the entries that were written (a single-block segment cannot
+    /// catch a compaction that only handles the first page).
+    #[pg_test]
+    fn test_agentvec_multiblock_segment_search() -> spi::Result<()> {
+        Spi::run(
+            "CREATE TABLE t_av_mb(id int, v vector(8));
+             INSERT INTO t_av_mb
+                SELECT g, ('[' || (g % 7) || ',' || (g % 5) || ',' || (g % 3) || ',0,0,0,0,0]')::vector
+                  FROM generate_series(1, 4000) AS g;
+             CREATE INDEX idx_av_mb ON t_av_mb USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_max_rows = 4000);",
+        )?;
+        force_index_scan();
+        // Reference order without the index.
+        Spi::run("SET enable_seqscan = on")?;
+        let exact = search_ids("t_av_mb", "v", "<->", "[1,1,1,0,0,0,0,0]", 5);
+        force_index_scan();
+        let approx = search_ids("t_av_mb", "v", "<->", "[1,1,1,0,0,0,0,0]", 5);
+        assert_eq!(approx.len(), exact.len());
+        for id in &approx {
+            assert!(exact.contains(id), "id {id} not in the exact top-5");
+        }
+        Ok(())
+    }
+
     /// With nothing sealed, the conversion is a no-op.
     #[pg_test]
     fn test_agentvec_consolidate_noop() -> spi::Result<()> {
