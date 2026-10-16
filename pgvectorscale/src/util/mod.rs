@@ -11,8 +11,29 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use self::{
     page::{ReadablePage, WritablePage},
-    ports::{PageGetItem, PageGetItemId},
+    ports::PageGetItemChecked,
 };
+
+/// Report an on-disk metadata parse failure as data corruption.
+///
+/// The bytes read back from the index do not match the layout this build
+/// expects: a damaged page, a torn write, or an index written by an
+/// incompatible version.  Reported through `ereport!` rather than a bare
+/// `panic!` so the failure carries `ERRCODE_DATA_CORRUPTED` instead of
+/// `INTERNAL_ERROR` — which is what lets a client or a monitoring system tell
+/// corruption from an internal bug — while still unwinding the Rust frames on
+/// the way out, so every RAII buffer lock is released before the transaction
+/// aborts.
+pub fn corrupt_data(message: String) -> ! {
+    // `ereport!` expands to a statement, so the diverging return needs its own
+    // terminator (the macro's own `unreachable!()` runs first).
+    pgrx::ereport!(
+        ERROR,
+        pgrx::pg_sys::errcodes::PgSqlErrorCode::ERRCODE_DATA_CORRUPTED,
+        message
+    );
+    unreachable!("ereport raised")
+}
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
 #[archive(check_bytes)]
@@ -153,13 +174,13 @@ impl ItemPointer {
 
     pub unsafe fn modify_bytes(self, index: &PgRelation) -> WritableBuffer<'_> {
         let page = WritablePage::modify(index, self.block_number);
-        let item_id = PageGetItemId(*page, self.offset);
-        let item = PageGetItem(*page, item_id) as *mut u8;
-        let len = (*item_id).lp_len();
+        // The item's start and length both come off the page, so bound them
+        // before handing the payload to a writer (`PageGetItem` alone does not).
+        let (ptr, len) = PageGetItemChecked(*page, self.offset);
         WritableBuffer {
             _page: page,
-            ptr: item,
-            len: len as _,
+            ptr,
+            len,
         }
     }
 

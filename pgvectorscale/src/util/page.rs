@@ -390,15 +390,36 @@ impl<'a> ReadablePage<'a> {
         self,
         offset: pgrx::pg_sys::OffsetNumber,
     ) -> ReadableBuffer<'a> {
-        let item_id = PageGetItemId(self.page, offset);
-        let item = PageGetItem(self.page, item_id) as *mut u8;
-        let len = (*item_id).lp_len();
+        // The item's start and length both come off the page, so bound them
+        // before handing the payload to a parser (`PageGetItem` alone does not).
+        let (ptr, len) = super::ports::PageGetItemChecked(self.page, offset);
         ReadableBuffer {
             _page: self,
-            ptr: item,
-            len: len as _,
+            ptr,
+            len,
         }
     }
+}
+
+/// Type of a raw page, for callers that hold a buffer rather than a
+/// [`ReadablePage`] (the read-modify-write parsers).
+///
+/// The opaque area's magic is checked first: the parsers use this to reject a
+/// pointer that does not name a page of the type they expect, and a page that
+/// is not a vectorscale page at all has no meaningful type byte to compare.
+///
+/// # Safety
+///
+/// `page` must point to a valid page.
+pub unsafe fn page_type_of(page: pg_sys::Page) -> PageType {
+    let opaque_data = TsvPageOpaqueData::with_page(page);
+    if (*opaque_data).page_id != TSV_PAGE_ID {
+        crate::util::corrupt_data(format!(
+            "page's special area is not a vectorscale opaque area (page_id = {:#06x})",
+            (*opaque_data).page_id
+        ));
+    }
+    PageType::from_u8((*opaque_data).page_type)
 }
 
 impl Deref for ReadablePage<'_> {

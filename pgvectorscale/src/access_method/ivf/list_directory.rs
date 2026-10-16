@@ -119,11 +119,11 @@ impl IvfListDirectory {
                 buf.extend_from_slice(item.get_data_slice());
             }
             rkyv::from_bytes::<IvfListDirectory>(&buf).unwrap_or_else(|e| {
-                panic!(
+                crate::util::corrupt_data(format!(
                     "IVF: list-directory parse failed ({} bytes): {:?}",
                     buf.len(),
                     e
-                )
+                ))
             })
         }
     }

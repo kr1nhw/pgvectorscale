@@ -241,8 +241,10 @@ impl IvfMetaPage {
             let page = ReadablePage::read(index, base);
             assert!(page.get_type() == PageType::IvfMeta);
             let item = page.get_item_unchecked(META_OFFSET);
-            let result = rkyv::from_bytes::<IvfMetaPage>(item.get_data_slice())
-                .unwrap_or_else(|e| panic!("IVF: meta fetch parse failed: {:?}", e));
+            let result =
+                rkyv::from_bytes::<IvfMetaPage>(item.get_data_slice()).unwrap_or_else(|e| {
+                    crate::util::corrupt_data(format!("IVF: meta fetch parse failed: {:?}", e))
+                });
 
             // Verify magic number and version
             assert_eq!(result.magic_number, IVF_MAGIC_NUMBER);
@@ -263,12 +265,11 @@ impl IvfMetaPage {
     ) -> R {
         let buffer = LockedBufferExclusive::read(index, base);
         let page = pg_sys::BufferGetPage(**&buffer);
-        let item_id = crate::util::ports::PageGetItemId(page, META_OFFSET);
-        let item = crate::util::ports::PageGetItem(page, item_id);
-        let len = (*item_id).lp_len() as usize;
-        let mut meta =
-            rkyv::from_bytes::<IvfMetaPage>(std::slice::from_raw_parts(item as *const u8, len))
-                .unwrap_or_else(|e| panic!("IVF: meta update parse failed: {:?}", e));
+        // The item's length is page metadata: bound it to the page first.
+        let item = crate::util::ports::PageGetItemSlice(page, META_OFFSET);
+        let mut meta = rkyv::from_bytes::<IvfMetaPage>(item).unwrap_or_else(|e| {
+            crate::util::corrupt_data(format!("IVF: meta update parse failed: {:?}", e))
+        });
         assert_eq!(meta.magic_number, IVF_MAGIC_NUMBER);
         assert_eq!(meta.version, IVF_VERSION);
 

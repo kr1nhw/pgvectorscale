@@ -136,7 +136,9 @@ impl AgentVecMetaPage {
             );
             let item = page.get_item_unchecked(META_OFFSET);
             let result = rkyv::from_bytes::<AgentVecMetaPage>(item.get_data_slice())
-                .unwrap_or_else(|e| panic!("agentvec: meta parse failed: {:?}", e));
+                .unwrap_or_else(|e| {
+                    crate::util::corrupt_data(format!("agentvec: meta parse failed: {:?}", e))
+                });
             assert_eq!(result.magic_number, AGENTVEC_MAGIC_NUMBER);
             assert_eq!(result.version, AGENTVEC_FORMAT_VERSION);
             result
@@ -152,14 +154,11 @@ impl AgentVecMetaPage {
     pub unsafe fn update<R, F: FnOnce(&mut AgentVecMetaPage) -> R>(index: &PgRelation, f: F) -> R {
         let buffer = LockedBufferExclusive::read(index, META_BLOCK_NUMBER);
         let page = pg_sys::BufferGetPage(*buffer);
-        let item_id = crate::util::ports::PageGetItemId(page, META_OFFSET);
-        let item = crate::util::ports::PageGetItem(page, item_id);
-        let len = (*item_id).lp_len() as usize;
-        let mut meta = rkyv::from_bytes::<AgentVecMetaPage>(std::slice::from_raw_parts(
-            item as *const u8,
-            len,
-        ))
-        .unwrap_or_else(|e| panic!("agentvec: meta update parse failed: {:?}", e));
+        // The item's length is page metadata: bound it to the page first.
+        let item = crate::util::ports::PageGetItemSlice(page, META_OFFSET);
+        let mut meta = rkyv::from_bytes::<AgentVecMetaPage>(item).unwrap_or_else(|e| {
+            crate::util::corrupt_data(format!("agentvec: meta update parse failed: {:?}", e))
+        });
         assert_eq!(meta.magic_number, AGENTVEC_MAGIC_NUMBER);
         assert_eq!(meta.version, AGENTVEC_FORMAT_VERSION);
 

@@ -100,7 +100,6 @@ pub unsafe extern "C-unwind" fn aminsert(
     false
 }
 
-
 /// Payload format version of a phase-1 `FLAT` segment.
 pub const SEGMENT_FORMAT_FLAT_V1: u32 = 1;
 /// Payload format version of an embedded hnswsq region (HOT).
@@ -266,8 +265,7 @@ unsafe fn resolve_hot_pool(
             // Read each member's header for the authoritative count; this
             // happens once per publication (K page reads), not per insert.
             for seg in segments.iter_mut() {
-                seg.num_entries =
-                    AgentVecSegmentHeader::load(index, seg.header).num_entries;
+                seg.num_entries = AgentVecSegmentHeader::load(index, seg.header).num_entries;
             }
             let backlog = directory
                 .segments
@@ -362,7 +360,6 @@ impl Drop for RegionUpdateBarrierGuard {
         }
     }
 }
-
 
 /// Create a fresh HOT segment and publish it in the directory.
 ///
@@ -495,7 +492,11 @@ pub unsafe fn ensure_hot_pool(index: &PgRelation) -> usize {
     let mut created = 0usize;
     let members = AgentVecMetaPage::update(index, |meta| {
         let mut directory = meta.load_directory(index);
-        let mut have = directory.segments.iter().filter(|s| is_appendable_hot(s)).count();
+        let mut have = directory
+            .segments
+            .iter()
+            .filter(|s| is_appendable_hot(s))
+            .count();
         if have == 0 {
             open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot, &options);
             have = 1;
@@ -559,7 +560,8 @@ pub unsafe fn seal_hot_and_open_new(index: &PgRelation, expected_hot_id: u64) ->
             .get(expected_hot_id)
             .map(|s| s.code_root.block_number)
     };
-    let _barrier = region_base.and_then(|base| RegionUpdateBarrierGuard::acquire_region(index, base));
+    let _barrier =
+        region_base.and_then(|base| RegionUpdateBarrierGuard::acquire_region(index, base));
 
     let sealed = AgentVecMetaPage::update(index, |meta| {
         let mut directory = meta.load_directory(index);
@@ -613,7 +615,6 @@ pub unsafe fn seal_hot_and_open_new(index: &PgRelation, expected_hot_id: u64) ->
     invalidate_hot_pool_cache();
     sealed
 }
-
 
 /// Extract and validate a vector datum.
 pub unsafe fn extract_vector(datum: pg_sys::Datum, expected_dim: usize) -> Vec<f32> {
@@ -703,9 +704,8 @@ pub unsafe fn insert_entry(
         }
 
         if hot.algorithm == SegmentAlgorithm::Flat {
-            let entry_bytes = flat_entry.get_or_insert_with(|| {
-                flat::encode_entry(heap_tid, &stored, flat::STATE_LIVE)
-            });
+            let entry_bytes = flat_entry
+                .get_or_insert_with(|| flat::encode_entry(heap_tid, &stored, flat::STATE_LIVE));
             AgentVecSegmentHeader::update(index, hot.header.block_number, |header| {
                 let active = header.active.take();
                 header.active = Some(flat::append_entry(index, active, entry_bytes));
@@ -722,12 +722,10 @@ pub unsafe fn insert_entry(
         // loads (the hnswsq insert path frees them with its per-insert
         // context), and without the reset they accumulate ~100 KB/row in bulk
         // builds.
-        let mut insert_ctx =
-            pgrx::PgMemoryContexts::new("agentvec hnsw insert temporary context");
+        let mut insert_ctx = pgrx::PgMemoryContexts::new("agentvec hnsw insert temporary context");
         let segment_id = insert_ctx.switch_to(|_| {
             let base = hot.code_root.block_number;
-            let support =
-                crate::access_method::hnswsq::utils::init_support(index.as_ptr(), base);
+            let support = crate::access_method::hnswsq::utils::init_support(index.as_ptr(), base);
             let mut encoded = vec![0u8; support.codec.vector_bytes()];
             let clamped = support.codec.encode_into(&stored, &mut encoded);
             let mut tid_data = pg_sys::ItemPointerData::default();

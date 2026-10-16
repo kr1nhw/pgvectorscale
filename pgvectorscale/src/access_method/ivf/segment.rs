@@ -25,7 +25,7 @@ use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::util::buffer::LockedBufferExclusive;
 use crate::util::chain::{ChainItemReader, ChainTapeWriter};
 use crate::util::page::{self, PageType, ReadablePage};
-use crate::util::ports::{PageGetItem, PageGetItemId};
+use crate::util::ports::{PageGetItem, PageGetItemId, PageGetItemSlice};
 use crate::util::*;
 
 /// One immutable SoA segment of a list.
@@ -130,11 +130,11 @@ impl IvfSegmentList {
                 buf.extend_from_slice(item.get_data_slice());
             }
             rkyv::from_bytes::<IvfSegmentList>(&buf).unwrap_or_else(|e| {
-                panic!(
+                crate::util::corrupt_data(format!(
                     "IVF: segment-list parse failed ({} bytes): {:?}",
                     buf.len(),
                     e
-                )
+                ))
             })
         }
     }
@@ -184,7 +184,11 @@ impl IvfFreeList {
                 buf.extend_from_slice(item.get_data_slice());
             }
             rkyv::from_bytes::<IvfFreeList>(&buf).unwrap_or_else(|e| {
-                panic!("IVF: free-list parse failed ({} bytes): {:?}", buf.len(), e)
+                crate::util::corrupt_data(format!(
+                    "IVF: free-list parse failed ({} bytes): {:?}",
+                    buf.len(),
+                    e
+                ))
             })
         }
     }
@@ -236,8 +240,9 @@ impl IvfListHeader {
             let page = ReadablePage::read(index, pointer.block_number);
             assert!(page.get_type() == PageType::IvfListHeader);
             let item = page.get_item_unchecked(pointer.offset);
-            rkyv::from_bytes::<IvfListHeader>(item.get_data_slice())
-                .unwrap_or_else(|e| panic!("IVF: list-header parse failed: {:?}", e))
+            rkyv::from_bytes::<IvfListHeader>(item.get_data_slice()).unwrap_or_else(|e| {
+                crate::util::corrupt_data(format!("IVF: list-header parse failed: {:?}", e))
+            })
         }
     }
 
@@ -245,16 +250,22 @@ impl IvfListHeader {
     /// the caller (read-modify-write path).
     unsafe fn parse_buffer(buffer: &LockedBufferExclusive) -> IvfListHeader {
         let page = pg_sys::BufferGetPage(**buffer);
-        let item_id = PageGetItemId(page, 1);
-        let item = PageGetItem(page, item_id);
-        let len = (*item_id).lp_len() as usize;
-        rkyv::from_bytes::<IvfListHeader>(std::slice::from_raw_parts(item as *const u8, len))
-            .unwrap_or_else(|e| {
-                panic!(
-                    "IVF: list-header buffer parse failed ({} bytes): {:?}",
-                    len, e
-                )
-            })
+        // `load` asserts the page type; the buffer path must too, otherwise a
+        // stale list pointer hands us any page of the relation.
+        assert!(
+            page::page_type_of(page) == PageType::IvfListHeader,
+            "IVF: buffer is not a list header page"
+        );
+        // `lp_len` is page metadata: bound the payload to the page before the
+        // parser sees it (see `PageGetItemSlice`).
+        let item = PageGetItemSlice(page, 1);
+        rkyv::from_bytes::<IvfListHeader>(item).unwrap_or_else(|e| {
+            panic!(
+                "IVF: list-header buffer parse failed ({} bytes): {:?}",
+                item.len(),
+                e
+            )
+        })
     }
 
     /// Read-modify-write the header page of list `block` atomically.

@@ -24,6 +24,7 @@ use pgrx::*;
 use crate::access_method::distance::{
     distance_type_cosine, distance_type_inner_product, distance_type_l2,
 };
+use crate::access_method::validate_distance_type_support;
 
 /// hnswsq access method support function numbers:
 ///   1 = distance type function (matches the diskann/ivf/hnswsq convention)
@@ -153,21 +154,12 @@ $$;
     ]
 );
 
-/// Validate the operator class.
+/// Validate the operator class: an hnswsq opclass must provide the
+/// distance-type support function (proc 1), which every operation resolves
+/// through `index_getprocinfo`.
 #[pg_guard]
 pub extern "C-unwind" fn hnswsq_validate(opclassoid: pg_sys::Oid) -> bool {
-    unsafe {
-        // Require the distance-type support function (proc 1).
-        let opclass = pg_sys::SearchSysCache1(
-            pg_sys::SysCacheIdentifier::CLAOID as _,
-            pg_sys::Datum::from(opclassoid),
-        );
-        if opclass.is_null() {
-            return false;
-        }
-        pg_sys::ReleaseSysCache(opclass);
-    }
-    true
+    validate_distance_type_support(opclassoid)
 }
 
 /// Test-build-only index health diagnostic: walk the graph pages and report

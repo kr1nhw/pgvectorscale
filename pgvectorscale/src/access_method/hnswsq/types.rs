@@ -180,6 +180,46 @@ pub fn neighbor_tuple_size(level: usize, m: usize) -> usize {
     }
 }
 
+/// The TID array of the neighbor tuple stored at `offno`, after checking both
+/// the line pointer and the `count` in the tuple header against the tuple's
+/// stored length.
+///
+/// `count` is a field of the tuple itself, and every TID access walks
+/// `count * size_of::<ItemPointerData>()` bytes from the tuple payload, so a
+/// tuple whose header disagrees with its physical length (torn page, corrupt or
+/// foreign block) has to be rejected before the first TID is read or written.
+/// The writer keeps the two in step — `set_neighbor_tuple` fills exactly
+/// `(level + 2) * m` slots and the tuple is stored at
+/// [`neighbor_tuple_size`] — so this only fires on damaged data.
+///
+/// Returns the header, the TID array and the validated count.
+///
+/// # Safety
+///
+/// `page` must be pinned and hold a neighbor tuple at `offno`.
+pub unsafe fn neighbor_tids(
+    page: pg_sys::Page,
+    offno: pg_sys::OffsetNumber,
+) -> (*mut NeighborTupleData, *mut pg_sys::ItemPointerData, usize) {
+    let (ntup_ptr, stored) = crate::util::ports::PageGetItemChecked(page, offno);
+    let ntup = ntup_ptr.cast::<NeighborTupleData>();
+    debug_assert_eq!((*ntup).type_, NEIGHBOR_TUPLE_TYPE);
+    let count = (*ntup).count as usize;
+    let needed =
+        NEIGHBOR_TUPLE_HEADER_SIZE + count * std::mem::size_of::<pg_sys::ItemPointerData>();
+    if needed > stored {
+        crate::util::corrupt_data(format!(
+            "hnswsq: neighbor tuple at offset {offno} records {count} tids ({needed} bytes) \
+             but stores {stored} bytes"
+        ));
+    }
+    let tids = ntup
+        .cast::<u8>()
+        .add(NEIGHBOR_TUPLE_HEADER_SIZE)
+        .cast::<pg_sys::ItemPointerData>();
+    (ntup, tids, count)
+}
+
 /// pgvector's `HNSW_MAX_SIZE`: the largest combined item a page can hold.
 pub fn max_page_item_size() -> usize {
     unsafe {
@@ -405,7 +445,15 @@ pub enum Unvisited {
 /// u64 (packed TID on disk, relptr offset or pointer in memory), hashed with
 /// pgvector's murmur64.
 pub struct Visited {
-    /// key → slot index + 1; 0 = empty.
+    /// The keys themselves (not `key + 1` like pgvector's `tidhash`): slot `i`
+    /// holds the key stored there, and 0 marks an empty slot.
+    ///
+    /// That makes 0 an unusable key, which is why `insert_key_hash` asserts it
+    /// away: every key producer already excludes it.  A packed on-disk TID is
+    /// `(blockno << 32) | offno` (so 0 would mean block 0 offset 0, and block 0
+    /// is the metapage while offset numbers start at 1), a shared-relptr key is
+    /// an arena offset that starts at `MAXALIGN(1)` because 0 is the relptr
+    /// NULL encoding, and a pointer key comes from `palloc`.
     keys: Vec<u64>,
     size: usize,
     mask: usize,

@@ -186,19 +186,14 @@ unsafe fn needs_updated(vac: &VacuumState, element: *mut Element) -> bool {
     );
     pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
     let page = pg_sys::BufferGetPage(buf);
-    let ntup = PageGetItem(page, PageGetItemId(page, (*element).neighbor_offno))
-        .cast::<NeighborTupleData>();
-
-    debug_assert_eq!((*ntup).type_, NEIGHBOR_TUPLE_TYPE);
+    // Validates the line pointer and the tuple's own `count` against the stored
+    // length before any TID is dereferenced.
+    let (_ntup, tids, count) = neighbor_tids(page, (*element).neighbor_offno);
 
     let mut needs = false;
-    let tids = ntup
-        .cast::<u8>()
-        .add(NEIGHBOR_TUPLE_HEADER_SIZE)
-        .cast::<pg_sys::ItemPointerData>();
 
     // Check neighbors
-    for i in 0..(*ntup).count as usize {
+    for i in 0..count {
         let indextid = &*tids.add(i);
         if ip_block(indextid) == pg_sys::InvalidBlockNumber {
             continue;
@@ -213,8 +208,8 @@ unsafe fn needs_updated(vac: &VacuumState, element: *mut Element) -> bool {
     // Also update if layer 0 is not full (this could indicate too many
     // candidates being deleted during insert; there should always be more
     // than zero indextids, but check for safety)
-    if !needs && (*ntup).count > 0 {
-        needs = ip_block(&*tids.add((*ntup).count as usize - 1)) == pg_sys::InvalidBlockNumber;
+    if !needs && count > 0 {
+        needs = ip_block(&*tids.add(count - 1)) == pg_sys::InvalidBlockNumber;
     }
 
     pg_sys::UnlockReleaseBuffer(buf);
@@ -504,115 +499,124 @@ unsafe fn repair_graph(vac: &mut VacuumState) {
 
         // Everything per page — loading and the repair itself — runs in the
         // temporary context, reset per page (pgvector switches to tmpCtx for
-        // the same scope).
+        // the same scope).  The switch back happens in the `finally` block
+        // below, so an error raised anywhere in between (a cancel while
+        // waiting on `LockPage`, an OOM `palloc`, the repair's own `error!`)
+        // cannot leave the global pointing at the per-page context.
         let old_ctx = pg_sys::CurrentMemoryContext;
         pg_sys::CurrentMemoryContext = vac.tmp_ctx.value();
 
-        let mut elements: Vec<Box<Element>> = Vec::new();
-        {
-            let buf = pg_sys::ReadBufferExtended(
-                index,
-                pg_sys::ForkNumber::MAIN_FORKNUM,
-                blkno,
-                pg_sys::ReadBufferMode::RBM_NORMAL,
-                vac.bas,
-            );
-            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
-            let page = pg_sys::BufferGetPage(buf);
-            let maxoffno = PageGetMaxOffsetNumber(page);
-
-            // Load items into memory to minimize locking
-            let mut offno = pg_sys::FirstOffsetNumber;
-            while offno <= maxoffno as pg_sys::OffsetNumber {
-                let etup = PageGetItem(page, PageGetItemId(page, offno)).cast::<ElementTupleData>();
-
-                // Skip neighbor tuples
-                if (*etup).type_ != ELEMENT_TUPLE_TYPE {
-                    offno += 1;
-                    continue;
-                }
-                // Skip deleted tuples
-                if (*etup).deleted != 0 {
-                    offno += 1;
-                    continue;
-                }
-                // Skip updating neighbors if being deleted
-                if ip_block(&(*etup).heaptid) == pg_sys::InvalidBlockNumber {
-                    offno += 1;
-                    continue;
-                }
-
-                // Create an element
-                let mut element = init_element_from_block(blkno, offno);
-                load_element_from_tuple(
-                    &mut *element,
-                    etup,
-                    false,
-                    true,
-                    vac.support.codec.vector_bytes(),
+        pg_sys::PgTryBuilder::new(std::panic::AssertUnwindSafe(|| {
+            let mut elements: Vec<Box<Element>> = Vec::new();
+            {
+                let buf = pg_sys::ReadBufferExtended(
+                    index,
+                    pg_sys::ForkNumber::MAIN_FORKNUM,
+                    blkno,
+                    pg_sys::ReadBufferMode::RBM_NORMAL,
+                    vac.bas,
                 );
-                elements.push(element);
+                pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+                let page = pg_sys::BufferGetPage(buf);
+                let maxoffno = PageGetMaxOffsetNumber(page);
 
-                offno += 1;
+                // Load items into memory to minimize locking
+                let mut offno = pg_sys::FirstOffsetNumber;
+                while offno <= maxoffno as pg_sys::OffsetNumber {
+                    let etup =
+                        PageGetItem(page, PageGetItemId(page, offno)).cast::<ElementTupleData>();
+
+                    // Skip neighbor tuples
+                    if (*etup).type_ != ELEMENT_TUPLE_TYPE {
+                        offno += 1;
+                        continue;
+                    }
+                    // Skip deleted tuples
+                    if (*etup).deleted != 0 {
+                        offno += 1;
+                        continue;
+                    }
+                    // Skip updating neighbors if being deleted
+                    if ip_block(&(*etup).heaptid) == pg_sys::InvalidBlockNumber {
+                        offno += 1;
+                        continue;
+                    }
+
+                    // Create an element
+                    let mut element = init_element_from_block(blkno, offno);
+                    load_element_from_tuple(
+                        &mut *element,
+                        etup,
+                        false,
+                        true,
+                        vac.support.codec.vector_bytes(),
+                    );
+                    elements.push(element);
+
+                    offno += 1;
+                }
+
+                blkno = (*page_opaque(page)).nextblkno;
+
+                pg_sys::UnlockReleaseBuffer(buf);
             }
 
-            blkno = (*page_opaque(page)).nextblkno;
+            // Update neighbor pages
+            for element in elements.iter_mut() {
+                let element_ptr = element.as_mut() as *mut Element;
+                let mut lockmode = pg_sys::ShareLock as pg_sys::LOCKMODE;
 
-            pg_sys::UnlockReleaseBuffer(buf);
-        }
+                // Check if any neighbors point to deleted values
+                if !needs_updated(vac, element_ptr) {
+                    continue;
+                }
 
-        // Update neighbor pages
-        for element in elements.iter_mut() {
-            let element_ptr = element.as_mut() as *mut Element;
-            let mut lockmode = pg_sys::ShareLock as pg_sys::LOCKMODE;
-
-            // Check if any neighbors point to deleted values
-            if !needs_updated(vac, element_ptr) {
-                continue;
-            }
-
-            // Get a shared lock
-            pg_sys::LockPage(index, update_lock_page(vac.base), lockmode);
-
-            // Refresh entry point for each element
-            let mut entry = get_entry_point(index, vac.base);
-            let mut entry_ptr = entry.as_deref_mut().map(|e| e as *mut Element);
-
-            // Prevent concurrent inserts when likely updating entry point
-            if entry_ptr.is_none() || (*element_ptr).level > (*entry_ptr.unwrap()).level {
-                // Release shared lock
-                pg_sys::UnlockPage(index, update_lock_page(vac.base), lockmode);
-
-                // Get exclusive lock
-                lockmode = pg_sys::ExclusiveLock as pg_sys::LOCKMODE;
+                // Get a shared lock
                 pg_sys::LockPage(index, update_lock_page(vac.base), lockmode);
 
-                // Get latest entry point after lock is acquired
-                entry = get_entry_point(index, vac.base);
-                entry_ptr = entry.as_deref_mut().map(|e| e as *mut Element);
+                // Refresh entry point for each element
+                let mut entry = get_entry_point(index, vac.base);
+                let mut entry_ptr = entry.as_deref_mut().map(|e| e as *mut Element);
+
+                // Prevent concurrent inserts when likely updating entry point
+                if entry_ptr.is_none() || (*element_ptr).level > (*entry_ptr.unwrap()).level {
+                    // Release shared lock
+                    pg_sys::UnlockPage(index, update_lock_page(vac.base), lockmode);
+
+                    // Get exclusive lock
+                    lockmode = pg_sys::ExclusiveLock as pg_sys::LOCKMODE;
+                    pg_sys::LockPage(index, update_lock_page(vac.base), lockmode);
+
+                    // Get latest entry point after lock is acquired
+                    entry = get_entry_point(index, vac.base);
+                    entry_ptr = entry.as_deref_mut().map(|e| e as *mut Element);
+                }
+
+                // Repair connections
+                repair_graph_element(vac, element_ptr, entry_ptr);
+
+                // Update metapage if needed (only if the entry point was
+                // replaced and the highest point was outdated)
+                if entry_ptr.is_none() || (*element_ptr).level > (*entry_ptr.unwrap()).level {
+                    update_meta_page(
+                        index,
+                        vac.base,
+                        UPDATE_ENTRY_GREATER,
+                        Some(element_ptr),
+                        pg_sys::InvalidBlockNumber,
+                        false,
+                    );
+                }
+
+                // Release lock
+                pg_sys::UnlockPage(index, update_lock_page(vac.base), lockmode);
             }
+        }))
+        .finally(|| unsafe {
+            pg_sys::CurrentMemoryContext = old_ctx;
+        })
+        .execute();
 
-            // Repair connections
-            repair_graph_element(vac, element_ptr, entry_ptr);
-
-            // Update metapage if needed (only if the entry point was
-            // replaced and the highest point was outdated)
-            if entry_ptr.is_none() || (*element_ptr).level > (*entry_ptr.unwrap()).level {
-                update_meta_page(
-                    index,
-                    vac.base,
-                    UPDATE_ENTRY_GREATER,
-                    Some(element_ptr),
-                    pg_sys::InvalidBlockNumber,
-                    false,
-                );
-            }
-
-            // Release lock
-            pg_sys::UnlockPage(index, update_lock_page(vac.base), lockmode);
-        }
-
-        pg_sys::CurrentMemoryContext = old_ctx;
         pg_sys::MemoryContextReset(vac.tmp_ctx.value());
     }
 }
@@ -678,15 +682,12 @@ unsafe fn confirm_repaired(vac: &VacuumState) {
                 npage = pg_sys::BufferGetPage(nbuf);
             }
 
-            let ntup = PageGetItem(npage, PageGetItemId(npage, neighbor_offno))
-                .cast::<NeighborTupleData>();
-            let tids = ntup
-                .cast::<u8>()
-                .add(NEIGHBOR_TUPLE_HEADER_SIZE)
-                .cast::<pg_sys::ItemPointerData>();
+            // Validates the line pointer and the tuple's own `count` against
+            // the stored length before any TID is dereferenced.
+            let (_ntup, tids, count) = neighbor_tids(npage, neighbor_offno);
 
             // Check neighbors
-            for i in 0..(*ntup).count as usize {
+            for i in 0..count {
                 let indextid = &*tids.add(i);
                 if ip_block(indextid) == pg_sys::InvalidBlockNumber {
                     continue;
@@ -814,8 +815,10 @@ unsafe fn mark_deleted(vac: &mut VacuumState) {
                 npage = pg_sys::GenericXLogRegisterBuffer(state, nbuf, 0);
             }
 
-            let ntup = PageGetItem(npage, PageGetItemId(npage, neighbor_offno))
-                .cast::<NeighborTupleData>();
+            // Validates the line pointer and the tuple's own `count` against the
+            // stored length: this loop *writes* every TID slot, so an
+            // inconsistent `count` would corrupt the page beyond the tuple.
+            let (ntup, tids, count) = neighbor_tids(npage, neighbor_offno);
 
             // Overwrite element
             (*etup).deleted = 1;
@@ -826,11 +829,7 @@ unsafe fn mark_deleted(vac: &mut VacuumState) {
             );
 
             // Overwrite neighbors
-            let tids = ntup
-                .cast::<u8>()
-                .add(NEIGHBOR_TUPLE_HEADER_SIZE)
-                .cast::<pg_sys::ItemPointerData>();
-            for i in 0..(*ntup).count as usize {
+            for i in 0..count {
                 pgrx::itemptr::item_pointer_set_all(
                     &mut *tids.add(i),
                     pg_sys::InvalidBlockNumber,

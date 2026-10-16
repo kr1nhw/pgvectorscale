@@ -15,7 +15,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::access_method::ivf::segment::{IvfActiveBuffer, IvfSegment};
 use crate::access_method::quantization::rabitq::RabitqVector;
 use crate::util::page::{PageType, ReadablePage, WritablePage};
-use crate::util::ports::{PageGetItem, PageGetItemId, PageGetMaxOffsetNumber};
+use crate::util::ports::{PageGetItem, PageGetItemChecked, PageGetItemId, PageGetMaxOffsetNumber};
 use crate::util::*;
 
 /// Magic for the SoA entry byte stream.
@@ -742,13 +742,22 @@ impl<'a> IvfEntryReader<'a> {
             let mut dst = 0usize;
             for i in 0..n {
                 let src_page = base.add(i * blksz) as pg_sys::Page;
-                let item_id = PageGetItemId(src_page, 1);
-                let item = PageGetItem(src_page, item_id);
-                let len = (*item_id).lp_len() as usize;
+                // The payload's start and length are page metadata, so bound
+                // them to the source page and to the scratch space this loop
+                // writes into: an unchecked `lp_len` otherwise turns the
+                // compaction into a heap overflow.  Raw pointers, not a slice:
+                // the same buffer is being written through `base`.
+                let (item, len) = PageGetItemChecked(src_page, 1);
+                if dst + len > self.scratch.len() {
+                    error!(
+                        "IVF: entry burst overruns its buffer (page {} of {}, {} bytes at offset {})",
+                        i, n, len, dst
+                    );
+                }
                 // Always move: even the first payload sits behind its page
                 // header.  `copy` is a memmove, and `dst` never passes the
                 // source of a page that has not been read yet.
-                std::ptr::copy(item as *const u8, base.add(dst), len);
+                std::ptr::copy(item, base.add(dst), len);
                 dst += len;
             }
             dst

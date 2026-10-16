@@ -284,6 +284,33 @@ pub extern "C-unwind" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
     true
 }
 
+/// Does this opclass provide the distance-type support function as proc 1?
+///
+/// `amvalidate` is how PostgreSQL (pg_upgrade, `opr_sanity`, an explicit
+/// `amvalidate()` call) asks an access method whether a catalog opclass is
+/// usable, so returning false here is what makes a user-authored opclass that
+/// omits the distance function get reported instead of being accepted and then
+/// failing at CREATE INDEX with "no distance type function found for index".
+///
+/// The lookup goes through the family's support-function accessor rather than a
+/// catalog scan of `pg_amproc`: `get_opfamily_proc` is the same accessor the
+/// rest of the system uses, and PostgreSQL has no `CLAAMPROCNUM` syscache for
+/// an extension to search.  `CREATE OPERATOR CLASS` records a support function
+/// declared without argument types under the opclass' own input type for both
+/// lefttype and righttype (opclasscmds.c, `assignProcTypes`) — which is exactly
+/// the combination this checks.
+pub fn validate_distance_type_support(opclassoid: pg_sys::Oid) -> bool {
+    unsafe {
+        let mut family = pg_sys::InvalidOid;
+        let mut input_type = pg_sys::InvalidOid;
+        if !pg_sys::get_opclass_opfamily_and_input_type(opclassoid, &mut family, &mut input_type) {
+            // No such opclass in the catalog.
+            return false;
+        }
+        pg_sys::get_opfamily_proc(family, input_type, input_type, 1) != pg_sys::InvalidOid
+    }
+}
+
 /// Implementation of the array overlap operator (&&) for smallint arrays
 /// This function checks if two smallint arrays have at least one element in common
 #[pg_extern(immutable, parallel_safe, create_or_replace)]

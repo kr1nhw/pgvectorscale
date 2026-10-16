@@ -63,6 +63,63 @@ pub unsafe fn PageGetItem(page: pgrx::pg_sys::Page, item_id: ItemId) -> *mut std
         .add((*item_id).lp_off() as _)
 }
 
+/// `PageGetItem` with the line pointer validated against the page.
+///
+/// `PageGetItem` trusts the line pointer, but `lp_off` and `lp_len` are 15-bit
+/// fields read straight off the page: a corrupt, stale or foreign line pointer
+/// can describe up to 64 KiB starting anywhere in (or before) the page, so
+/// using `lp_len` as a length without this check reads out of the shared buffer
+/// pool.  Every caller that turns `lp_len` into a length or a slice must come
+/// through here.
+///
+/// Returns the payload pointer and length.  The checks mirror `ItemIdHasStorage`
+/// (`lp_flags` has storage and `lp_len > 0`) plus the page-bounds invariant
+/// Postgres itself only asserts (`lp_off >= SizeOfPageHeaderData` and
+/// `lp_off + lp_len <= BLCKSZ`).
+///
+/// # Safety
+///
+/// `page` must point to a valid page and `offset` must be a line pointer slot of
+/// that page.
+#[allow(non_snake_case)]
+pub unsafe fn PageGetItemChecked(
+    page: pgrx::pg_sys::Page,
+    offset: OffsetNumber,
+) -> (*mut u8, usize) {
+    assert!(!page.is_null());
+    let item_id = PageGetItemId(page, offset);
+    let flags = (*item_id).lp_flags();
+    let off = (*item_id).lp_off() as usize;
+    let len = (*item_id).lp_len() as usize;
+    // Both failures below mean the page does not describe the item it claims
+    // to, so they are reported as data corruption rather than as an internal
+    // error: `pgrx::ereport!` still unwinds the Rust frames on the way out, so
+    // every RAII buffer lock is released before the transaction aborts.
+    if flags == pgrx::pg_sys::LP_UNUSED || flags == pgrx::pg_sys::LP_REDIRECT || len == 0 {
+        crate::util::corrupt_data(format!(
+            "item {offset} has no storage (lp_flags = {flags}, lp_len = {len})"
+        ));
+    }
+    if off < SizeOfPageHeaderData || off + len > pgrx::pg_sys::BLCKSZ as usize {
+        crate::util::corrupt_data(format!(
+            "item {offset} lies outside the page (lp_off = {off}, lp_len = {len}, page size = {})",
+            pgrx::pg_sys::BLCKSZ
+        ));
+    }
+    (page.cast::<u8>().add(off), len)
+}
+
+/// [`PageGetItemChecked`] as a slice, for parsers that read the payload.
+///
+/// # Safety
+///
+/// As [`PageGetItemChecked`]; the slice borrows the page for `'a`.
+#[allow(non_snake_case)]
+pub unsafe fn PageGetItemSlice<'a>(page: pgrx::pg_sys::Page, offset: OffsetNumber) -> &'a [u8] {
+    let (ptr, len) = PageGetItemChecked(page, offset);
+    std::slice::from_raw_parts(ptr, len)
+}
+
 #[allow(non_snake_case)]
 pub unsafe fn PageGetItemId(page: pgrx::pg_sys::Page, offset: OffsetNumber) -> ItemId {
     //return &((PageHeader) page)->pd_linp[offsetNumber - 1];

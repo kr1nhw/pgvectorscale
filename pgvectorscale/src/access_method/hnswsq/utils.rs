@@ -112,6 +112,15 @@ pub unsafe fn init_support(index: pg_sys::Relation, base: pg_sys::BlockNumber) -
     let (precision, dimensions, calibration) = meta_page_layout(index, base);
     let codec = if precision.needs_calibration() {
         let calib = Sq8Calibration::load(&PgRelation::from_pg(index), calibration);
+        // Every code the codec touches is `dimensions` wide, so a calibration
+        // trained for another dimensionality has to be rejected here rather
+        // than produce a codec whose vectors do not match the stored codes.
+        if calib.dim as usize != dimensions {
+            crate::util::corrupt_data(format!(
+                "hnswsq: calibration covers {} dimensions, the index has {}",
+                calib.dim, dimensions
+            ));
+        }
         Codec::new_sq8(&calib)
     } else {
         Codec::new(precision, dimensions)

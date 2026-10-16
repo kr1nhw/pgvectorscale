@@ -48,14 +48,18 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     let mut total_live: u64 = 0;
     let mut total_dead: u64 = 0;
 
+    // Reused across chains so a scan of many chains performs one allocation
+    // instead of one per chain.  Both stay bounded by the chain size
+    // (hot_segment_max_rows), not by the index size.
+    let mut entries: Vec<(BlockNumber, OffsetNumber, ItemPointer)> = Vec::new();
+    let mut to_tombstone: Vec<(BlockNumber, OffsetNumber)> = Vec::new();
+
     for segment in directory.searchable() {
         match segment.algorithm() {
             SegmentAlgorithm::Flat => {
                 let header = AgentVecSegmentHeader::load(&index_rel, segment.header);
-                // Per chain, which bounds the TID buffer by the chain size
-                // (hot_segment_max_rows) rather than by the index size.
                 for chain_start in header.chain_starts() {
-                    let mut entries: Vec<(BlockNumber, OffsetNumber, ItemPointer)> = Vec::new();
+                    entries.clear();
                     flat::for_each_entry(&index_rel, chain_start, |block, offset, bytes| {
                         if flat::decode_state(bytes) != flat::STATE_LIVE {
                             return;
@@ -65,8 +69,8 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
 
                     // No AgentVec lock is held here: the callback below may touch
                     // heap buffers.
-                    let mut to_tombstone: Vec<(BlockNumber, OffsetNumber)> = Vec::new();
-                    for (block, offset, tid) in entries {
+                    to_tombstone.clear();
+                    for &(block, offset, tid) in entries.iter() {
                         let is_dead = match callback {
                             Some(cb) => {
                                 let mut tid_data = pg_sys::ItemPointerData::default();
@@ -94,7 +98,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
                         &index_rel,
                         segment.header.block_number,
                         |header| {
-                            for (block, offset) in to_tombstone {
+                            for &(block, offset) in to_tombstone.iter() {
                                 flat::mark_dead(&index_rel, block, offset);
                             }
                             header.dead_entries += num_dead;

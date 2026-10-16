@@ -34,7 +34,7 @@ use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::util::buffer::LockedBufferExclusive;
 use crate::util::chain::{ChainItemReader, ChainTapeWriter};
 use crate::util::page::{self, PageType, ReadablePage, WritablePage};
-use crate::util::ports::{PageGetItem, PageGetItemId};
+use crate::util::ports::PageGetItemSlice;
 use crate::util::*;
 
 /// Stable identity of a segment within one logical index.
@@ -57,7 +57,7 @@ impl SegmentLevel {
             0 => SegmentLevel::Hot,
             1 => SegmentLevel::Warm,
             2 => SegmentLevel::Cold,
-            _ => panic!("Unknown SegmentLevel {}", value),
+            _ => crate::util::corrupt_data(format!("Unknown SegmentLevel {}", value)),
         }
     }
 
@@ -99,7 +99,7 @@ impl SegmentState {
             2 => SegmentState::QueuedForMigration,
             3 => SegmentState::Retiring,
             4 => SegmentState::Retired,
-            _ => panic!("Unknown SegmentState {}", value),
+            _ => crate::util::corrupt_data(format!("Unknown SegmentState {}", value)),
         }
     }
 
@@ -140,7 +140,7 @@ impl SegmentAlgorithm {
             0 => SegmentAlgorithm::Flat,
             1 => SegmentAlgorithm::Hnsw,
             2 => SegmentAlgorithm::IvfRaBitQ,
-            _ => panic!("Unknown SegmentAlgorithm {}", value),
+            _ => crate::util::corrupt_data(format!("Unknown SegmentAlgorithm {}", value)),
         }
     }
 
@@ -171,7 +171,7 @@ impl SegmentOwnership {
         match value {
             0 => SegmentOwnership::Owned,
             1 => SegmentOwnership::External,
-            _ => panic!("Unknown SegmentOwnership {}", value),
+            _ => crate::util::corrupt_data(format!("Unknown SegmentOwnership {}", value)),
         }
     }
 
@@ -363,11 +363,11 @@ impl AgentVecDirectory {
                 buf.extend_from_slice(item.get_data_slice());
             }
             rkyv::from_bytes::<AgentVecDirectory>(&buf).unwrap_or_else(|e| {
-                panic!(
+                crate::util::corrupt_data(format!(
                     "agentvec: directory parse failed ({} bytes): {:?}",
                     buf.len(),
                     e
-                )
+                ))
             })
         }
     }
@@ -491,25 +491,29 @@ impl AgentVecSegmentHeader {
                 pointer.block_number
             );
             let item = page.get_item_unchecked(pointer.offset);
-            rkyv::from_bytes::<AgentVecSegmentHeader>(item.get_data_slice())
-                .unwrap_or_else(|e| panic!("agentvec: segment header parse failed: {:?}", e))
+            rkyv::from_bytes::<AgentVecSegmentHeader>(item.get_data_slice()).unwrap_or_else(|e| {
+                crate::util::corrupt_data(format!("agentvec: segment header parse failed: {:?}", e))
+            })
         }
     }
 
     /// Parse a header out of a buffer the caller already holds exclusively.
     unsafe fn parse_buffer(buffer: &LockedBufferExclusive) -> AgentVecSegmentHeader {
         let page = pg_sys::BufferGetPage(**buffer);
-        let item_id = PageGetItemId(page, 1);
-        let item = PageGetItem(page, item_id);
-        let len = (*item_id).lp_len() as usize;
-        rkyv::from_bytes::<AgentVecSegmentHeader>(std::slice::from_raw_parts(
-            item as *const u8,
-            len,
-        ))
-        .unwrap_or_else(|e| {
+        // `load` asserts the page type; the buffer path must too, otherwise a
+        // stale directory pointer hands us any page of the relation.
+        assert!(
+            page::page_type_of(page) == PageType::AgentVecSegmentHeader,
+            "agentvec: buffer is not a segment header page"
+        );
+        // `lp_len` is page metadata: bound the payload to the page before the
+        // parser sees it (see `PageGetItemSlice`).
+        let item = PageGetItemSlice(page, 1);
+        rkyv::from_bytes::<AgentVecSegmentHeader>(item).unwrap_or_else(|e| {
             panic!(
                 "agentvec: segment header buffer parse failed ({} bytes): {:?}",
-                len, e
+                item.len(),
+                e
             )
         })
     }

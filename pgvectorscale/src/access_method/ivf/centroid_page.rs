@@ -65,11 +65,11 @@ impl IvfCentroidPage {
                 buf.extend_from_slice(item.get_data_slice());
             }
             rkyv::from_bytes::<IvfCentroidPage>(&buf).unwrap_or_else(|e| {
-                panic!(
+                crate::util::corrupt_data(format!(
                     "IVF: centroid-page parse failed ({} bytes): {:?}",
                     buf.len(),
                     e
-                )
+                ))
             })
         }
     }

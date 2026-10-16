@@ -161,10 +161,12 @@ $$;
     ]
 );
 
-/// Validate the operator class. Always returns true for now.
+/// Validate the operator class: an IVF opclass must provide the distance-type
+/// support function (proc 1), which every operation resolves through
+/// `index_getprocinfo`.
 #[pg_guard]
-pub extern "C-unwind" fn ivf_validate(_opclassoid: pg_sys::Oid) -> bool {
-    true
+pub extern "C-unwind" fn ivf_validate(opclassoid: pg_sys::Oid) -> bool {
+    crate::access_method::validate_distance_type_support(opclassoid)
 }
 
 /// Cost estimate placeholder for the IVF access method.

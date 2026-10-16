@@ -563,18 +563,23 @@ unsafe fn get_update_index(
 }
 
 /// `ConnectionExists` (hnswinsert.c).
+///
+/// `tids`/`count` come from [`neighbor_tids`], which validated the tuple's
+/// length: the loop stops at `count` so a tuple whose header under-reports its
+/// storage cannot walk past the TID array.
 unsafe fn connection_exists(
     e: *mut Element,
-    ntup: *mut NeighborTupleData,
+    tids: *mut pg_sys::ItemPointerData,
+    count: usize,
     start_idx: usize,
     lm: usize,
 ) -> bool {
-    let tids = ntup
-        .cast::<u8>()
-        .add(NEIGHBOR_TUPLE_HEADER_SIZE)
-        .cast::<pg_sys::ItemPointerData>();
     for i in 0..lm {
-        let indextid = &*tids.add(start_idx + i);
+        let slot = start_idx + i;
+        if slot >= count {
+            break;
+        }
+        let indextid = &*tids.add(slot);
         if ip_block(indextid) == pg_sys::InvalidBlockNumber {
             break;
         }
@@ -611,26 +616,26 @@ unsafe fn update_neighbor_on_disk(
         pg_sys::GenericXLogRegisterBuffer(state, buf, 0)
     };
 
-    // Get tuple
-    let ntup = PageGetItem(page, PageGetItemId(page, (*element).neighbor_offno))
-        .cast::<NeighborTupleData>();
+    // Get tuple.  The helper validates the line pointer and the tuple's own
+    // `count` against its stored length before any TID is read or written.
+    let (_ntup, tids, count) = neighbor_tids(page, (*element).neighbor_offno);
 
     // Calculate index for update
     let start_idx = ((*element).level as usize - lc) * m;
 
     // Check for existing connection
-    if connection_exists(new_element, ntup, start_idx, lm) {
+    if connection_exists(new_element, tids, count, start_idx, lm) {
         idx = -1;
     } else if idx == -2 {
         // Find free offset if still exists
         // TODO Retry updating connections if not
-        let tids = ntup
-            .cast::<u8>()
-            .add(NEIGHBOR_TUPLE_HEADER_SIZE)
-            .cast::<pg_sys::ItemPointerData>();
         for j in 0..lm {
-            if ip_block(&*tids.add(start_idx + j)) == pg_sys::InvalidBlockNumber {
-                idx = (start_idx + j) as i32;
+            let slot = start_idx + j;
+            if slot >= count {
+                break;
+            }
+            if ip_block(&*tids.add(slot)) == pg_sys::InvalidBlockNumber {
+                idx = slot as i32;
                 break;
             }
         }
@@ -639,11 +644,7 @@ unsafe fn update_neighbor_on_disk(
     }
 
     // Make robust to issues
-    if idx >= 0 && (idx as usize) < (*ntup).count as usize {
-        let tids = ntup
-            .cast::<u8>()
-            .add(NEIGHBOR_TUPLE_HEADER_SIZE)
-            .cast::<pg_sys::ItemPointerData>();
+    if idx >= 0 && (idx as usize) < count {
         let indextid = &mut *tids.add(idx as usize);
 
         // Update neighbor on the buffer
@@ -1030,10 +1031,14 @@ mod tests {
             );
 
             let mut e = init_element_from_block(11, 2);
-            assert!(connection_exists(&mut *e, ntup, 0, 3));
+            assert!(connection_exists(&mut *e, tids, 3, 0, 3));
 
             let mut e2 = init_element_from_block(12, 3);
-            assert!(!connection_exists(&mut *e2, ntup, 0, 3));
+            assert!(!connection_exists(&mut *e2, tids, 3, 0, 3));
+
+            // A tuple whose header under-reports its storage must not let the
+            // scan walk past the TID array it was handed.
+            assert!(!connection_exists(&mut *e, tids, 1, 0, 3));
         }
     }
 }

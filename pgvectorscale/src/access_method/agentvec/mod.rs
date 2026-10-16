@@ -188,11 +188,12 @@ $$;
     ]
 );
 
-/// Validate the operator class.  Always true for now: the opclass contract is
-/// just "support function 1 returns the distance type".
+/// Validate the operator class: the opclass contract is "support function 1
+/// returns the distance type", and every operation resolves it through
+/// `index_getprocinfo`, so an opclass without it is not usable.
 #[pg_guard]
-pub extern "C-unwind" fn agentvec_validate(_opclassoid: pg_sys::Oid) -> bool {
-    true
+pub extern "C-unwind" fn agentvec_validate(opclassoid: pg_sys::Oid) -> bool {
+    crate::access_method::validate_distance_type_support(opclassoid)
 }
 
 /// Inspect the segment directory of an `agentvec` index from SQL.

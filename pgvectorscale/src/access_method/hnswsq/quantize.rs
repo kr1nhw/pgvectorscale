@@ -230,13 +230,26 @@ impl Sq8Calibration {
         for item in tape.read(pointer) {
             buf.extend_from_slice(item.get_data_slice());
         }
-        rkyv::from_bytes::<Sq8Calibration>(&buf).unwrap_or_else(|e| {
-            panic!(
+        let calib = rkyv::from_bytes::<Sq8Calibration>(&buf).unwrap_or_else(|e| {
+            crate::util::corrupt_data(format!(
                 "hnswsq: calibration parse failed ({} bytes): {:?}",
                 buf.len(),
                 e
-            )
-        })
+            ))
+        });
+        // `check_bytes` validates rkyv's internal consistency, not that `dim`
+        // agrees with the two vectors it indexes: `Codec::new_sq8` reads
+        // `maxs[d]`/`mins[d]` for `d in 0..dim`, so a truncated or foreign
+        // calibration would otherwise index out of bounds.
+        if calib.mins.len() != calib.dim as usize || calib.maxs.len() != calib.dim as usize {
+            crate::util::corrupt_data(format!(
+                "hnswsq: calibration dim {} does not match its ranges ({} mins, {} maxs)",
+                calib.dim,
+                calib.mins.len(),
+                calib.maxs.len()
+            ));
+        }
+        calib
     }
 }
 
