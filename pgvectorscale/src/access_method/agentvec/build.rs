@@ -52,6 +52,7 @@ fn index_dimensions(index_rel: &PgRelation) -> usize {
 unsafe fn write_empty_index(index_rel: &PgRelation, distance_type: DistanceType, dim: usize) {
     AgentVecMetaPage::create(index_rel, dim as u32, distance_type);
     insert::open_initial_hot_segment(index_rel);
+    insert::ensure_hot_pool(index_rel);
 }
 
 /// Finish a build: record the row count and launch the maintenance worker.
@@ -159,6 +160,9 @@ pub unsafe extern "C-unwind" fn ambuild(
                 header.num_entries = indtuples as u64;
             },
         );
+        // The bulk rows landed in the first HOT segment; publish the rest of
+        // the requested pool so foreground inserts can spread across it.
+        insert::ensure_hot_pool(&index_rel);
         return return_finish(&index_rel, reltuples, indtuples);
     }
     let (reltuples, indtuples, centroids, directory_ptr) =
@@ -235,10 +239,12 @@ pub unsafe extern "C-unwind" fn ambuild(
         None
     };
 
-    // Always open an empty HOT segment for live inserts (the design's
-    // invariant: a HOT segment exists from day one; bulk rows never go
-    // through it).
+    // Always open the empty HOT pool for live inserts (the design's invariant:
+    // a HOT segment exists from day one; bulk rows never go through it).  With
+    // `hot_segment_count > 1` this publishes the whole pool up front, so the
+    // steady-state insert path never has to take the meta lock to create one.
     let _hot_id = insert::open_initial_hot_segment(&index_rel);
+    insert::ensure_hot_pool(&index_rel);
 
     return_finish(&index_rel, reltuples, indtuples)
 }

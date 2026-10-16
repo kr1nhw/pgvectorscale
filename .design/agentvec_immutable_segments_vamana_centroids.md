@@ -42,18 +42,21 @@ Crash windows:
 
 ### 1.1 Exact source vectors for calibrated HOT layouts
 
-The embedded hnswsq region's default layout (`hot_storage_layout = f8`, i.e. calibrated
-SQ8) starts from the **provisional [-1, 1] per-dimension calibration** (the hnswsq
-incremental-build convention).  Any component ≥ 1 clamps to the same byte, so decoded
-inline bytes are unusable as a conversion source: every structured vector ≥ 1 collapses
-to one value.  For calibrated layouts the conversion therefore fetches the **exact heap
-vector** per row (heap_fetch + ExecStoreBufferHeapTuple, the vector's heap attnum read
-from the index catalog's `indkey`), with cosine preprocessing applied to match the
-stored convention.  Rows not visible to the active snapshot are dropped.  The
-training-free layouts (`plain`, `ieeefp16`, `ieeefp8`) decode inline with no heap
-fetch, as originally planned; a future calibration-retrain-at-seal path could replace
-the heap fetches (plugin-model §15 already plans a heap/TID stream for EXTERNAL
-sources).
+The embedded hnswsq region's default layout is now **`plain`** (it was `f8`, i.e. calibrated
+SQ8).  The HOT segment is a bounded write cache, so the uncompressed codes stay cheap: a
+20 000-row dim-128 index measures 16 MB with `plain` against 7.4 MB with `f8`, i.e. roughly
+40 MB vs 18 MB at the 50 000-row cap, against a measured 4 982 rows/s vs 4 263 rows/s (+17 %)
+at 8 concurrent inserters and no recall difference.  A calibrated layout (`f8` / `sq8`) starts from the
+**provisional [-1, 1] per-dimension calibration** (the hnswsq incremental-build convention).
+Any component ≥ 1 clamps to the same byte, so decoded inline bytes are unusable as a
+conversion source: every structured vector ≥ 1 collapses to one value.  For calibrated
+layouts the conversion therefore fetches the **exact heap vector** per row (heap_fetch +
+ExecStoreBufferHeapTuple, the vector's heap attnum read from the index catalog's `indkey`),
+with cosine preprocessing applied to match the stored convention.  Rows not visible to the
+active snapshot are dropped.  The training-free layouts (`plain`, `ieeefp16`, `ieeefp8`)
+decode inline with no heap fetch, as originally planned — which is now the default path; a
+future calibration-retrain-at-seal path could replace the heap fetches for the calibrated
+ones (plugin-model §15 already plans a heap/TID stream for EXTERNAL sources).
 
 ## 2. Immutable segment rules (as built)
 

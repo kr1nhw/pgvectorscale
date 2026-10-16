@@ -28,6 +28,26 @@ use crate::access_method::hnswsq::quantize::HnswPrecision;
 /// asynchronously.
 const DEFAULT_HOT_SEGMENT_MAX_ROWS: i32 = 50_000;
 
+/// Default number of concurrently appendable HOT segments.
+///
+/// 1 preserves the original single-HOT-segment behaviour, which is also what
+/// the measured insert-throughput experiments support on current hardware: K
+/// independent hnswsq regions (emulated with K independent indexes) produced
+/// no aggregate throughput change at 8, 16 or 32 concurrent inserters, because
+/// the foreground insert cost is per-row CPU and buffer-manager work rather
+/// than contention on one graph's pages.  K > 1 is therefore an explicit
+/// opt-in for workloads that need independent seal schedules (so one
+/// consolidation does not stall writers) or a bound on the per-graph size.
+const DEFAULT_HOT_SEGMENT_COUNT: i32 = 1;
+
+/// Sentinel for "adapt the HOT segment count to the observed write load",
+/// used as the `hot_segment_count` reloption value.
+pub const HOT_SEGMENT_COUNT_AUTO: usize = 0;
+
+/// Hard ceiling on the HOT segment pool, so a misconfiguration cannot make
+/// every scan fan out over an unbounded number of graphs.
+pub const MAX_HOT_SEGMENT_COUNT: usize = 16;
+
 /// Target row count of a WARM segment (Phase 6 leveling target).
 const DEFAULT_WARM_SEGMENT_TARGET_ROWS: i32 = 1_000_000;
 
@@ -71,7 +91,21 @@ const DEFAULT_SEARCH_CANDIDATES: i32 = 0;
 
 /// Storage layout of a HOT HNSW segment (the embedded hnswsq region's
 /// `storage_layout`: plain / ieeefp16 / ieeefp8 / f8 / sq8 / sq16).
-const DEFAULT_HOT_STORAGE_LAYOUT_STR: &str = "f8";
+///
+/// `plain` is the default because the HOT segment is a bounded write cache:
+/// it holds at most `hot_segment_max_rows` entries, so the larger codes of an
+/// uncompressed layout stay cheap in absolute terms (a 20 000-row dim-128
+/// index measures 16 MB with `plain` vs 7.4 MB with `f8`, i.e. ~40 MB vs
+/// ~18 MB at the 50 000-row cap), while the quantized layouts pay for that
+/// saving on every foreground insert.  Measured on 32 vCPU / PG 17.11, dim
+/// 128, m=16, ef_construction=64, 8 concurrent inserters: `plain` 4 982 rows/s
+/// vs `f8` 4 263 (+17 %), and 14 171 vs 12 152 at 32 inserters; insert CPU
+/// falls from 1 231 to 937 us/row because the SQ8 codec is ~43 % of the insert
+/// profile.  Recall is unaffected (1.0000@10 against exact ground truth on
+/// both layouts in the 30k-row check), and the training-free layout also makes
+/// consolidation cheaper: it decodes inline instead of fetching every exact
+/// vector from the heap.
+const DEFAULT_HOT_STORAGE_LAYOUT_STR: &str = "plain";
 
 /// HNSW `m` of a HOT segment (neighbors per layer-0 node).
 const DEFAULT_HOT_M: i32 = 16;
@@ -96,6 +130,7 @@ pub struct TSVAgentVecOptions {
     pub hot_ef_construction: i32,
 
     pub hot_segment_max_rows: i32,
+    pub hot_segment_count: i32,
     pub warm_segment_target_rows: i32,
     pub cold_segment_target_rows: i32,
     pub rabitq_bits: i32,
@@ -121,6 +156,7 @@ impl TSVAgentVecOptions {
             ops.hot_m = DEFAULT_HOT_M;
             ops.hot_ef_construction = DEFAULT_HOT_EF_CONSTRUCTION;
             ops.hot_segment_max_rows = DEFAULT_HOT_SEGMENT_MAX_ROWS;
+            ops.hot_segment_count = DEFAULT_HOT_SEGMENT_COUNT;
             ops.warm_segment_target_rows = DEFAULT_WARM_SEGMENT_TARGET_ROWS;
             ops.cold_segment_target_rows = DEFAULT_COLD_SEGMENT_TARGET_ROWS;
             ops.rabitq_bits = DEFAULT_RABITQ_BITS;
@@ -151,6 +187,23 @@ impl TSVAgentVecOptions {
             panic!("hot_segment_max_rows must be >= 1");
         }
         self.hot_segment_max_rows as u64
+    }
+
+    /// HOT segments foreground inserts may append to concurrently.
+    ///
+    /// `1` (the default) keeps the original single-appendable-segment
+    /// behaviour.  A larger value keeps that many HOT segments published and
+    /// appendable at once, so the writer side is not restricted to one
+    /// hnswsq region: a segment being sealed hands its writers to a sibling
+    /// instead of stalling them, and each region carries its own metapage,
+    /// insert page, header page and entry point.
+    ///
+    /// `0` selects the adaptive mode (see [`HOT_SEGMENT_COUNT_AUTO`]).
+    pub fn get_hot_segment_count(&self) -> usize {
+        if self.hot_segment_count < 0 {
+            panic!("hot_segment_count must be >= 0");
+        }
+        self.hot_segment_count as usize
     }
 
     /// Storage layout of a HOT HNSW segment.
@@ -325,6 +378,14 @@ pub unsafe fn init() {
         2_000_000_000,
     );
     add_int_reloption(
+        "hot_segment_count",
+        "HOT segments that accept inserts concurrently (1 = the original \
+         single appendable segment; 0 = adapt to the observed write load)",
+        DEFAULT_HOT_SEGMENT_COUNT,
+        0,
+        MAX_HOT_SEGMENT_COUNT as i32,
+    );
+    add_int_reloption(
         "warm_segment_target_rows",
         "Target row count of a WARM segment (reserved: phase 6)",
         DEFAULT_WARM_SEGMENT_TARGET_ROWS,
@@ -475,7 +536,7 @@ pub unsafe extern "C-unwind" fn amoptions(
         }
     }
 
-    let tab: [pg_sys::relopt_parse_elt; 16] = [
+    let tab: [pg_sys::relopt_parse_elt; 17] = [
         make_relopt_parse_elt(
             "hot_storage_layout",
             pg_sys::relopt_type::RELOPT_TYPE_STRING,
@@ -495,6 +556,11 @@ pub unsafe extern "C-unwind" fn amoptions(
             "hot_segment_max_rows",
             pg_sys::relopt_type::RELOPT_TYPE_INT,
             offset_of!(TSVAgentVecOptions, hot_segment_max_rows) as i32,
+        ),
+        make_relopt_parse_elt(
+            "hot_segment_count",
+            pg_sys::relopt_type::RELOPT_TYPE_INT,
+            offset_of!(TSVAgentVecOptions, hot_segment_count) as i32,
         ),
         make_relopt_parse_elt(
             "warm_segment_target_rows",

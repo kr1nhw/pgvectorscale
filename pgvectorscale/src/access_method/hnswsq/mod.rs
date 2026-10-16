@@ -13,7 +13,6 @@ pub mod ptr;
 pub mod quantize;
 pub mod scan;
 #[cfg(test)]
-mod smoke;
 #[cfg(any(test, feature = "pg_test"))]
 mod tests;
 pub mod types;

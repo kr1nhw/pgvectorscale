@@ -824,8 +824,8 @@ pub unsafe fn load_element_from_tuple(
 ///
 /// Per-search SQ query state: `None` unless the index is an SQ layout
 /// (`f8`, `sq8`, `sq16`) + L2 and the `hnswsq.sq8_distance` GUC selects the
-/// pairwise integer form (see `smoke.rs`).  The query is quantized once per
-/// search; every candidate distance then uses pure integer arithmetic.
+/// pairwise integer form.  The query is quantized once per search; every
+/// candidate distance then uses pure integer arithmetic.
 pub fn sq8_query_state(
     support: &Support,
     q: &[f32],

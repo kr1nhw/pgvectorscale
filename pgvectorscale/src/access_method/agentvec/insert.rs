@@ -5,7 +5,9 @@
 //! bounded local work:
 //!
 //! ```text
-//! resolve the current HOT segment
+//! resolve the appendable HOT pool
+//!     │
+//!     ├── pick the least-loaded member (cached; O(1) on the steady path)
 //!     │
 //!     ├── over the row threshold?  →  seal it + open the next one (metadata only)
 //!     │
@@ -16,9 +18,29 @@
 //! rewrite happens here; the sealed segment is handed to asynchronous
 //! maintenance, which is what phase 4/5 add.
 //!
+//! # The HOT pool
+//!
+//! `hot_segment_count` (default 1) controls how many HOT segments accept
+//! inserts at the same time.  The pool is *derived from the published
+//! directory* — every segment with `level == Hot` and `state == Published` is
+//! appendable — so it needs no new on-disk metadata and no format version
+//! bump: an index written by an earlier build simply has one such segment.
+//! The directory pointer is the invalidation key for the backend-local cache,
+//! because every publication allocates a fresh chained item, so a changed
+//! pointer always means the pool changed.
+//!
+//! Every member is an independent embedded hnswsq region with its own
+//! metapage, insert page, header page and entry point, and every member stays
+//! `Published` and searchable until it is sealed, so the transaction contract
+//! is unchanged: the entry is written into the region and WAL-logged inside
+//! the inserting transaction, exactly as it was with a single HOT segment.
+//!
 //! Lock protocol (see `meta_page`): the metadata path takes the meta page lock
 //! and then a segment header lock inside it; the plain append path takes only
-//! the header lock.  The order is never inverted.
+//! the header lock.  The order is never inverted.  Sealing additionally takes
+//! the *region* update page lock exclusively (the same lock every insert holds
+//! in share mode for the duration of its graph update) so a segment can never
+//! be sealed while an insert is in flight against it.
 
 use pgrx::*;
 
@@ -28,7 +50,9 @@ use crate::access_method::agentvec::directory::{
 };
 use crate::access_method::agentvec::flat;
 use crate::access_method::agentvec::meta_page::AgentVecMetaPage;
-use crate::access_method::agentvec::options::TSVAgentVecOptions;
+use crate::access_method::agentvec::options::{
+    TSVAgentVecOptions, HOT_SEGMENT_COUNT_AUTO, MAX_HOT_SEGMENT_COUNT,
+};
 use crate::access_method::distance::{preprocess_cosine, DistanceType};
 use crate::access_method::hnswsq::quantize::{HnswPrecision, Sq8Calibration};
 use crate::access_method::pg_vector::PgVectorInternal;
@@ -36,9 +60,10 @@ use crate::util::ItemPointer;
 
 /// Insert a tuple into the index.
 ///
-/// This is the entire foreground path: resolve the HOT segment, seal it if it
-/// has reached its row threshold, append the entry.  Nothing here migrates,
-/// retrains, re-encodes, splits, merges or rewrites a posting list.
+/// This is the entire foreground path: resolve the HOT pool, pick a member,
+/// seal it if it has reached its row threshold, append the entry.  Nothing
+/// here migrates, retrains, re-encodes, splits, merges or rewrites a posting
+/// list.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn aminsert(
     index: pg_sys::Relation,
@@ -56,8 +81,10 @@ pub unsafe extern "C-unwind" fn aminsert(
     }
 
     let index_rel = PgRelation::from_pg(index);
-    let meta = AgentVecMetaPage::fetch(&index_rel);
     let options = TSVAgentVecOptions::from_relation(&index_rel);
+    // One meta page read serves both the dimension and the pool resolution:
+    // `insert_entry` takes the already-parsed meta instead of re-fetching it.
+    let meta = AgentVecMetaPage::fetch(&index_rel);
     let vector = extract_vector(*values, meta.get_num_dimensions() as usize);
 
     insert_entry(
@@ -66,11 +93,13 @@ pub unsafe extern "C-unwind" fn aminsert(
         &vector,
         meta.get_distance_type(),
         &options,
+        &meta,
         false,
     );
 
     false
 }
+
 
 /// Payload format version of a phase-1 `FLAT` segment.
 pub const SEGMENT_FORMAT_FLAT_V1: u32 = 1;
@@ -97,6 +126,9 @@ pub struct HotSegment {
 ///
 /// `None` means the index has no usable HOT segment yet (an index whose
 /// directory was never populated), which the caller fixes by opening one.
+///
+/// This is the single-segment form, kept for the paths that only need *one*
+/// appendable segment.  The foreground insert path uses [`resolve_hot_pool`].
 pub unsafe fn current_hot_segment(index: &PgRelation) -> Option<HotSegment> {
     let meta = AgentVecMetaPage::fetch(index);
     let hot_id = meta.get_hot_segment_id();
@@ -117,6 +149,220 @@ pub unsafe fn current_hot_segment(index: &PgRelation) -> Option<HotSegment> {
         code_root: segment.code_root,
     })
 }
+
+// ---------------------------------------------------------------------------
+// The HOT pool
+// ---------------------------------------------------------------------------
+
+/// Whether a directory entry is a segment foreground inserts may append to.
+///
+/// A segment stops being appendable the moment it is sealed (its state leaves
+/// `Published`), which is what lets the pool be derived from the published
+/// directory with no extra metadata.
+fn is_appendable_hot(segment: &AgentVecSegmentMeta) -> bool {
+    segment.level() == SegmentLevel::Hot && segment.state() == SegmentState::Published
+}
+
+/// The appendable HOT segments of a published directory, in directory order.
+fn pool_from_directory(directory: &AgentVecDirectory) -> Vec<HotSegment> {
+    directory
+        .segments
+        .iter()
+        .filter(|s| is_appendable_hot(s))
+        .map(|s| HotSegment {
+            segment_id: s.segment_id,
+            header: s.header,
+            // The authoritative count lives in the header, which the append
+            // path reads for the segment it picks; the directory copy is only
+            // used to spread load and may lag.
+            num_entries: s.vector_count,
+            algorithm: s.algorithm(),
+            code_root: s.code_root,
+        })
+        .collect()
+}
+
+/// A resolved pool plus the per-backend bookkeeping used to spread inserts.
+struct CachedPool {
+    /// Identity of the index this pool belongs to.
+    relid: pg_sys::Oid,
+    /// The published directory pointer the pool was resolved from.  Every
+    /// publication allocates a fresh chained item, so a different pointer
+    /// always means a different pool.
+    directory_pointer: ItemPointer,
+    /// The appendable segments, in directory order.
+    segments: Vec<HotSegment>,
+    /// Inserts this backend has made into each member since resolution, so a
+    /// backend does not keep choosing the same segment every time.  Indexed in
+    /// lockstep with `segments`.
+    local_pending: Vec<u64>,
+}
+
+thread_local! {
+    /// Backend-local HOT pool cache.  Backends are single-threaded, so a
+    /// thread-local is safe.
+    static HOT_POOL: std::cell::RefCell<Option<CachedPool>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// How many HOT segments the writer side should keep appendable.
+///
+/// Returns a value in `1..=MAX_HOT_SEGMENT_COUNT`.
+///
+/// * an explicit `hot_segment_count` is honoured as-is (clamped to the pool
+///   bounds);
+/// * [`HOT_SEGMENT_COUNT_AUTO`] derives the count from the *consolidation
+///   backlog* — the number of HOT segments already sealed and waiting for
+///   maintenance.  That is the in-index signal for "the write side is
+///   producing sealed segments faster than maintenance drains them", the one
+///   condition under which a second appendable segment genuinely helps: the
+///   writers of a sealing, not-yet-consolidated segment can continue in a
+///   sibling instead of queuing behind the seal.  It needs no new persistent
+///   state, because the backlog is already visible in the published directory.
+///
+/// Measured on 32 vCPU / PG 17.11 with 8, 16 and 32 concurrent inserters, K
+/// independent hnswsq regions (emulated with K independent indexes holding
+/// identical graphs) produced no aggregate throughput change, so the default
+/// is 1 rather than auto: the foreground cost is per-row CPU and
+/// buffer-manager work, not contention on one graph's pages.
+fn effective_hot_segment_count(configured: usize, backlog: usize) -> usize {
+    if configured != HOT_SEGMENT_COUNT_AUTO {
+        return configured.clamp(1, MAX_HOT_SEGMENT_COUNT);
+    }
+    // Grow with the backlog, but conservatively: every extra HOT segment is
+    // searched by every scan.
+    const AUTO_CEILING: usize = 4;
+    (1 + backlog).clamp(1, AUTO_CEILING.min(MAX_HOT_SEGMENT_COUNT))
+}
+
+/// Resolve the appendable HOT pool for `index`.
+///
+/// The authoritative segment list is the published directory; the backend-local
+/// cache is keyed on `(index, directory pointer)`, so the steady-state path
+/// only pays a pointer comparison on top of the meta page read the caller
+/// already did.  A changed pointer (any seal, consolidation or build) forces a
+/// reload, which is exactly when the pool can change.
+unsafe fn resolve_hot_pool(
+    index: &PgRelation,
+    meta: &AgentVecMetaPage,
+    options: &TSVAgentVecOptions,
+) -> Vec<HotSegment> {
+    let relid = index.oid();
+    let pointer = meta
+        .get_directory_pointer()
+        .unwrap_or_else(ItemPointer::new_invalid);
+
+    HOT_POOL.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let fresh = match slot.as_ref() {
+            Some(c) => c.relid != relid || c.directory_pointer != pointer,
+            None => true,
+        };
+        let backlog = if fresh {
+            let directory = meta.load_directory(index);
+            let mut segments = pool_from_directory(&directory);
+            // The directory's `vector_count` is only refreshed when a segment
+            // is sealed, so for appendable HOT segments it is a placeholder.
+            // Read each member's header for the authoritative count; this
+            // happens once per publication (K page reads), not per insert.
+            for seg in segments.iter_mut() {
+                seg.num_entries =
+                    AgentVecSegmentHeader::load(index, seg.header).num_entries;
+            }
+            let backlog = directory
+                .segments
+                .iter()
+                .filter(|s| {
+                    s.level() == SegmentLevel::Hot
+                        && matches!(
+                            s.state(),
+                            SegmentState::QueuedForMigration | SegmentState::Retiring
+                        )
+                })
+                .count();
+            let local_pending = vec![0u64; segments.len()];
+            *slot = Some(CachedPool {
+                relid,
+                directory_pointer: pointer,
+                segments,
+                local_pending,
+            });
+            backlog
+        } else {
+            0
+        };
+        let cached = slot.as_mut().expect("pool just populated");
+        let k = effective_hot_segment_count(options.get_hot_segment_count(), backlog);
+
+        // Spread the inserts over the first `k` members, accounting for what
+        // this backend has already put into each since resolution.
+        let mut best = usize::MAX;
+        let mut best_load = u64::MAX;
+        for (i, seg) in cached.segments.iter().enumerate().take(k) {
+            let load = seg.num_entries.saturating_add(cached.local_pending[i]);
+            if load < best_load {
+                best_load = load;
+                best = i;
+            }
+        }
+        if best == usize::MAX {
+            return Vec::new();
+        }
+        cached.local_pending[best] += 1;
+        vec![cached.segments[best]]
+    })
+}
+
+/// Drop the backend-local pool cache, forcing the next insert to reload the
+/// published directory.  Called after a publication that can change the pool.
+fn invalidate_hot_pool_cache() {
+    HOT_POOL.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// A guard holding a segment's hnswsq region update page lock exclusively.
+///
+/// This is the *same* lock `insert_tuple_on_disk` takes in share mode for the
+/// whole duration of a graph update, so acquiring it exclusively is a barrier:
+/// it waits for every in-flight insert into that region to finish and keeps new
+/// ones out until the guard is dropped.  Sealing under this guard is what
+/// guarantees a segment cannot be demoted while an insert is in flight against
+/// it — the precondition for consolidation to collect a complete snapshot.
+pub struct RegionUpdateBarrierGuard {
+    index: pg_sys::Relation,
+    base: pg_sys::BlockNumber,
+}
+
+impl RegionUpdateBarrierGuard {
+    /// Acquire the barrier.  Returns `None` for a segment with no HNSW region
+    /// (a `FLAT` HOT segment), where there is no graph to protect.
+    pub unsafe fn acquire_region(index: &PgRelation, base: pg_sys::BlockNumber) -> Option<Self> {
+        if base == 0 || base == pg_sys::InvalidBlockNumber {
+            return None;
+        }
+        pg_sys::LockPage(
+            index.as_ptr(),
+            crate::access_method::hnswsq::types::update_lock_page(base),
+            pg_sys::ExclusiveLock as pg_sys::LOCKMODE,
+        );
+        Some(RegionUpdateBarrierGuard {
+            index: index.as_ptr(),
+            base,
+        })
+    }
+}
+
+impl Drop for RegionUpdateBarrierGuard {
+    fn drop(&mut self) {
+        unsafe {
+            pg_sys::UnlockPage(
+                self.index,
+                crate::access_method::hnswsq::types::update_lock_page(self.base),
+                pg_sys::ExclusiveLock as pg_sys::LOCKMODE,
+            );
+        }
+    }
+}
+
 
 /// Create a fresh HOT segment and publish it in the directory.
 ///
@@ -215,70 +461,159 @@ unsafe fn create_hot_region(
 /// Create the first HOT segment of an index that has none.
 pub unsafe fn open_initial_hot_segment(index: &PgRelation) -> u64 {
     let options = TSVAgentVecOptions::from_relation(index);
-    AgentVecMetaPage::update(index, |meta| {
+    let id = AgentVecMetaPage::update(index, |meta| {
         let mut directory = meta.load_directory(index);
-        if let Some(seg) = directory.get(meta.get_hot_segment_id()) {
-            if seg.is_searchable() {
-                // Someone else created a live HOT while we waited for the
-                // meta lock.  (A retired bulk-built segment must NOT count:
-                // nothing would ever open its successor.)
-                return meta.get_hot_segment_id();
-            }
+        let already = directory.segments.iter().any(is_appendable_hot);
+        if already {
+            // Someone else created a live HOT while we waited for the meta
+            // lock.  (A retired bulk-built segment must NOT count: nothing
+            // would ever open its successor.)
+            return meta.get_hot_segment_id();
         }
         open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot, &options)
-    })
+    });
+    invalidate_hot_pool_cache();
+    id
 }
 
-/// Seal the current HOT segment and open its successor.
+/// Top the appendable HOT pool up to `hot_segment_count` members.
+///
+/// Called from the build path (so a fresh index already has the requested
+/// number of appendable segments, and the steady-state insert path never has to
+/// take the meta lock to create one) and from the insert path when the pool is
+/// short of its configured size.  Returns the number of members after the call.
+pub unsafe fn ensure_hot_pool(index: &PgRelation) -> usize {
+    let options = TSVAgentVecOptions::from_relation(index);
+    let configured = options.get_hot_segment_count();
+    if configured == HOT_SEGMENT_COUNT_AUTO {
+        // A fresh index has no consolidation backlog, so the adaptive count
+        // starts at 1 and grows as sealed segments accumulate.
+        ensure_initial_hot_segment(index);
+        return 1;
+    }
+    let target = configured.clamp(1, MAX_HOT_SEGMENT_COUNT);
+    let mut created = 0usize;
+    let members = AgentVecMetaPage::update(index, |meta| {
+        let mut directory = meta.load_directory(index);
+        let mut have = directory.segments.iter().filter(|s| is_appendable_hot(s)).count();
+        if have == 0 {
+            open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot, &options);
+            have = 1;
+            created += 1;
+        }
+        while have < target {
+            open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot, &options);
+            have += 1;
+            created += 1;
+        }
+        have
+    });
+    if created > 0 {
+        invalidate_hot_pool_cache();
+    }
+    members
+}
+
+/// Make sure at least one appendable HOT segment exists.
+unsafe fn ensure_initial_hot_segment(index: &PgRelation) {
+    let options = TSVAgentVecOptions::from_relation(index);
+    let created = AgentVecMetaPage::update(index, |meta| {
+        let mut directory = meta.load_directory(index);
+        if directory.segments.iter().any(is_appendable_hot) {
+            return false;
+        }
+        open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot, &options);
+        true
+    });
+    if created {
+        invalidate_hot_pool_cache();
+    }
+}
+
+/// Seal `expected_hot_id` and open its successor.
 ///
 /// Returns true when this call performed the seal (false means another
 /// transaction got there first).  The work is metadata only: sealing freezes
 /// the segment's active chain descriptor, and the new segment is an empty
 /// header plus one directory republication — the vectors themselves are not
 /// touched (design §10).
+///
+/// The seal runs under [`RegionUpdateBarrierGuard`], so it also waits for every
+/// in-flight insert into the segment's HNSW region and keeps new ones out
+/// until the segment has left the appendable pool.  That is what makes the
+/// subsequent consolidation able to collect a complete snapshot of the region
+/// (without it, an insert that had already resolved the segment could append
+/// after the collector walked the graph, and the row would be missing from both
+/// the replacement segment and the retired source).
 pub unsafe fn seal_hot_and_open_new(index: &PgRelation, expected_hot_id: u64) -> bool {
     let options = TSVAgentVecOptions::from_relation(index);
-    AgentVecMetaPage::update(index, |meta| {
-        if meta.get_hot_segment_id() != expected_hot_id {
-            // Another transaction already sealed this segment.
+
+    // Resolve the region base *before* taking any lock, then the barrier, then
+    // the meta lock.  Lock order: region page lock -> meta content lock ->
+    // segment header content lock, which is consistent with the plain append
+    // path (region page lock -> header content lock) and with the documented
+    // meta -> header order.
+    let region_base = {
+        let meta = AgentVecMetaPage::fetch(index);
+        meta.load_directory(index)
+            .get(expected_hot_id)
+            .map(|s| s.code_root.block_number)
+    };
+    let _barrier = region_base.and_then(|base| RegionUpdateBarrierGuard::acquire_region(index, base));
+
+    let sealed = AgentVecMetaPage::update(index, |meta| {
+        let mut directory = meta.load_directory(index);
+        let Some(segment) = directory.get(expected_hot_id) else {
+            return false;
+        };
+        if !is_appendable_hot(segment) {
+            // Another transaction already sealed it (or it was never
+            // appendable).  A successor may still be missing if that
+            // transaction crashed between the two steps, so fall through and
+            // make sure one exists.
+            if !directory.segments.iter().any(is_appendable_hot) {
+                open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot, &options);
+            }
             return false;
         }
-        let mut directory = meta.load_directory(index);
-        if let Some(segment) = directory.get(expected_hot_id) {
-            let header_pointer = segment.header;
-            // Freeze the active chain.  This takes the header lock while
-            // holding the meta lock, which is the documented order.
-            let (vector_count, live_count, dead_count) =
-                AgentVecSegmentHeader::update(index, header_pointer.block_number, |header| {
-                    header.seal_active();
-                    (
-                        header.num_entries,
-                        header.live_entries(),
-                        header.dead_entries,
-                    )
-                });
+        let header_pointer = segment.header;
+        // Freeze the active chain.  This takes the header lock while holding
+        // the meta lock, which is the documented order.
+        let (vector_count, live_count, dead_count) =
+            AgentVecSegmentHeader::update(index, header_pointer.block_number, |header| {
+                header.seal_active();
+                (
+                    header.num_entries,
+                    header.live_entries(),
+                    header.dead_entries,
+                )
+            });
 
-            let epoch = meta.bump_epoch();
-            let segment = directory
-                .get_mut(expected_hot_id)
-                .expect("hot segment disappeared");
-            // The frozen segment is fully searchable; it is only marked as an
-            // input for asynchronous maintenance.
-            segment.state = SegmentState::QueuedForMigration as u8;
-            segment.generation += 1;
-            // Directory counts are refreshed when the directory is republished
-            // anyway (here); between publications the segment header is the
-            // authoritative source, which is what `agentvec_index_info()`
-            // reports.
-            segment.vector_count = vector_count;
-            segment.live_count = live_count;
-            segment.dead_count = dead_count;
-            segment.epoch = epoch;
-        }
+        let epoch = meta.bump_epoch();
+        let segment = directory
+            .get_mut(expected_hot_id)
+            .expect("hot segment disappeared");
+        // The frozen segment is fully searchable; it is only marked as an
+        // input for asynchronous maintenance.
+        segment.state = SegmentState::QueuedForMigration as u8;
+        segment.generation += 1;
+        // Directory counts are refreshed when the directory is republished
+        // anyway (here); between publications the segment header is the
+        // authoritative source, which is what `agentvec_index_info()` reports.
+        segment.vector_count = vector_count;
+        segment.live_count = live_count;
+        segment.dead_count = dead_count;
+        segment.epoch = epoch;
+
         open_new_hot_segment(index, &mut directory, meta, SegmentLevel::Hot, &options);
         true
-    })
+    });
+
+    // The directory was republished either way, so the pool must be reloaded.
+    invalidate_hot_pool_cache();
+    sealed
 }
+
 
 /// Extract and validate a vector datum.
 pub unsafe fn extract_vector(datum: pg_sys::Datum, expected_dim: usize) -> Vec<f32> {
@@ -303,6 +638,10 @@ pub unsafe fn extract_vector(datum: pg_sys::Datum, expected_dim: usize) -> Vec<f
 /// Append one vector to the index — the shared path for `aminsert` and the
 /// heap scan of `ambuild`.
 ///
+/// `meta` is the meta page the caller already parsed; taking it as an argument
+/// rather than re-fetching it removes one page read and one rkyv parse per row
+/// from the foreground path.
+///
 /// Returns the segment id the entry landed in.
 pub unsafe fn insert_entry(
     index: &PgRelation,
@@ -310,6 +649,7 @@ pub unsafe fn insert_entry(
     vector: &[f32],
     distance_type: DistanceType,
     options: &TSVAgentVecOptions,
+    meta: &AgentVecMetaPage,
     building: bool,
 ) -> u64 {
     // Vectors are stored in the representation the distance function expects:
@@ -319,72 +659,95 @@ pub unsafe fn insert_entry(
     if distance_type == DistanceType::Cosine {
         preprocess_cosine(&mut stored);
     }
-    let entry_bytes = flat::encode_entry(heap_tid, &stored, flat::STATE_LIVE);
     let max_rows = options.get_hot_segment_max_rows();
+    // The FLAT entry framing is only needed by the FLAT branch below; building
+    // it on the HNSW path was pure per-row allocation and copying.
+    let mut flat_entry: Option<Vec<u8>> = None;
 
     // Bounded: the first pass may have to create a segment, the second may
-    // have to seal the previous one, and the third appends.
+    // have to seal a full one, and the third appends.  The meta page the caller
+    // parsed is reused on the fast path; the slow paths republish the directory
+    // and therefore re-read it, so the retry sees the new pool instead of a
+    // stale pointer.
+    let mut refreshed: Option<AgentVecMetaPage> = None;
     for _attempt in 0..4 {
-        match current_hot_segment(index) {
-            None => {
+        let meta = refreshed.as_ref().unwrap_or(meta);
+        let pool = resolve_hot_pool(index, meta, options);
+        let Some(hot) = pool.first().copied() else {
+            if options.get_hot_segment_count() != HOT_SEGMENT_COUNT_AUTO {
+                ensure_hot_pool(index);
+            } else {
                 open_initial_hot_segment(index);
             }
-            Some(hot) if hot.algorithm == SegmentAlgorithm::IvfRaBitQ => {
-                error!(
-                    "agentvec: HOT segment {} uses {} storage, which this phase cannot append to",
-                    hot.segment_id,
-                    hot.algorithm.as_str()
-                );
-            }
-            Some(hot) if hot.num_entries >= max_rows => {
-                seal_hot_and_open_new(index, hot.segment_id);
-            }
-            Some(hot) if hot.algorithm == SegmentAlgorithm::Flat => {
-                AgentVecSegmentHeader::update(index, hot.header.block_number, |header| {
-                    let active = header.active.take();
-                    header.active = Some(flat::append_entry(index, active, &entry_bytes));
-                    header.num_entries += 1;
-                });
-                return hot.segment_id;
-            }
-            Some(hot) => {
-                // HNSW: append into the embedded hnswsq region, then bump the
-                // segment's counter.  `stored` is already cosine-normalized
-                // where the metric requires it, matching hnswsq's own insert
-                // convention.  The whole insert runs in a per-insert memory
-                // context like hnswsq's aminsert: the search pallocs one
-                // element-sized buffer per neighbor it loads (the hnswsq
-                // insert path frees them with its per-insert context), and
-                // without the reset they accumulate ~100 KB/row in bulk
-                // builds.
-                let mut insert_ctx =
-                    pgrx::PgMemoryContexts::new("agentvec hnsw insert temporary context");
-                let segment_id = insert_ctx.switch_to(|_| {
-                    let base = hot.code_root.block_number;
-                    let support =
-                        crate::access_method::hnswsq::utils::init_support(index.as_ptr(), base);
-                    let mut encoded = vec![0u8; support.codec.vector_bytes()];
-                    let clamped = support.codec.encode_into(&stored, &mut encoded);
-                    let mut tid_data = pg_sys::ItemPointerData::default();
-                    heap_tid.to_item_pointer_data(&mut tid_data);
-                    crate::access_method::hnswsq::insert::insert_tuple_on_disk(
-                        index.as_ptr(),
-                        base,
-                        &support,
-                        &encoded,
-                        &tid_data,
-                        building,
-                        clamped,
-                    );
-                    AgentVecSegmentHeader::update(index, hot.header.block_number, |header| {
-                        header.num_entries += 1;
-                    });
-                    hot.segment_id
-                });
-                drop(insert_ctx);
-                return segment_id;
-            }
+            refreshed = Some(AgentVecMetaPage::fetch(index));
+            continue;
+        };
+
+        if hot.algorithm == SegmentAlgorithm::IvfRaBitQ {
+            error!(
+                "agentvec: HOT segment {} uses {} storage, which this phase cannot append to",
+                hot.segment_id,
+                hot.algorithm.as_str()
+            );
         }
+
+        // The directory copy of the count may lag; the header is authoritative.
+        let header = AgentVecSegmentHeader::load(index, hot.header);
+        if header.num_entries >= max_rows {
+            // Sealing republishes the directory and therefore refreshes the
+            // pool on the next attempt, which is how the writer moves on to a
+            // sibling segment instead of re-reading a stale pool.
+            seal_hot_and_open_new(index, hot.segment_id);
+            refreshed = Some(AgentVecMetaPage::fetch(index));
+            continue;
+        }
+
+        if hot.algorithm == SegmentAlgorithm::Flat {
+            let entry_bytes = flat_entry.get_or_insert_with(|| {
+                flat::encode_entry(heap_tid, &stored, flat::STATE_LIVE)
+            });
+            AgentVecSegmentHeader::update(index, hot.header.block_number, |header| {
+                let active = header.active.take();
+                header.active = Some(flat::append_entry(index, active, entry_bytes));
+                header.num_entries += 1;
+            });
+            return hot.segment_id;
+        }
+
+        // HNSW: append into the embedded hnswsq region, then bump the
+        // segment's counter.  `stored` is already cosine-normalized where the
+        // metric requires it, matching hnswsq's own insert convention.  The
+        // whole insert runs in a per-insert memory context like hnswsq's
+        // aminsert: the search pallocs one element-sized buffer per neighbor it
+        // loads (the hnswsq insert path frees them with its per-insert
+        // context), and without the reset they accumulate ~100 KB/row in bulk
+        // builds.
+        let mut insert_ctx =
+            pgrx::PgMemoryContexts::new("agentvec hnsw insert temporary context");
+        let segment_id = insert_ctx.switch_to(|_| {
+            let base = hot.code_root.block_number;
+            let support =
+                crate::access_method::hnswsq::utils::init_support(index.as_ptr(), base);
+            let mut encoded = vec![0u8; support.codec.vector_bytes()];
+            let clamped = support.codec.encode_into(&stored, &mut encoded);
+            let mut tid_data = pg_sys::ItemPointerData::default();
+            heap_tid.to_item_pointer_data(&mut tid_data);
+            crate::access_method::hnswsq::insert::insert_tuple_on_disk(
+                index.as_ptr(),
+                base,
+                &support,
+                &encoded,
+                &tid_data,
+                building,
+                clamped,
+            );
+            AgentVecSegmentHeader::update(index, hot.header.block_number, |header| {
+                header.num_entries += 1;
+            });
+            hot.segment_id
+        });
+        drop(insert_ctx);
+        return segment_id;
     }
     error!("agentvec: could not resolve a HOT segment to insert into");
 }

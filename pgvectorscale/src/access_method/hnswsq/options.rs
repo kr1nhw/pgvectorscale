@@ -76,9 +76,8 @@ pub const HNSW_SCAN_MEM_MULTIPLIER: f64 = 1.0;
 /// (tests set it so builds — and recall assertions — are deterministic).
 pub static HNSW_BUILD_SEED: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(-1);
 
-/// SQ8 distance implementation (the smoke-gun A/B switch; see
-/// `smoke.rs`): the scalar decode path, the pairwise-integer form, or the
-/// Lance-style integer dot.
+/// SQ8 distance implementation: the scalar decode path, the pairwise-integer
+/// form, or the Lance-style integer dot.
 #[derive(
     pgrx::PostgresGucEnum, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default,
 )]
@@ -245,7 +244,7 @@ pub unsafe fn init() {
     pgrx::GucRegistry::define_enum_guc(
         c"hnswsq.sq8_distance",
         c"SQ8 distance implementation (scalar, pairwise)",
-        c"The integer forms quantize the query once and compute candidate distances with integer arithmetic (see smoke.rs); the A/B switch for the 1M gate experiment.",
+        c"The integer forms quantize the query once and compute candidate distances with integer arithmetic; the A/B switch for the 1M gate experiment.",
         &HNSW_SQ8_DISTANCE,
         pgrx::GucContext::Userset,
         pgrx::GucFlags::default(),

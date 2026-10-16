@@ -860,6 +860,128 @@ mod tests {
         Ok(())
     }
 
+    /// The number of appendable HOT segments in a directory.
+    fn appendable_hot_count(directory: &AgentVecDirectory) -> usize {
+        directory
+            .segments
+            .iter()
+            .filter(|s| {
+                s.level() == crate::access_method::agentvec::directory::SegmentLevel::Hot
+                    && s.state() == SegmentState::Published
+            })
+            .count()
+    }
+
+    /// `hot_segment_count > 1` keeps several HOT segments appendable at once.
+    ///
+    /// Each member is an independent embedded hnswsq region, but the
+    /// transaction contract is unchanged: every entry is written into a
+    /// published segment inside the inserting transaction, and a scan merges
+    /// all of them, so every committed row is immediately findable.
+    #[pg_test]
+    fn test_agentvec_multi_hot_pool() -> spi::Result<()> {
+        Spi::run(
+            "CREATE TABLE t_av_pool(id int, v vector(2));
+             CREATE INDEX idx_av_pool ON t_av_pool USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_count = 4);
+             INSERT INTO t_av_pool
+                SELECT g, ('[' || g || ',0]')::vector FROM generate_series(1, 32) AS g;",
+        )?;
+        force_index_scan();
+
+        let index = index_relation("idx_av_pool");
+        let meta = AgentVecMetaPage::fetch(&index);
+        let directory: AgentVecDirectory = meta.load_directory(&index);
+        assert_eq!(
+            appendable_hot_count(&directory),
+            4,
+            "the pool should publish hot_segment_count appendable segments, got {:?}",
+            directory
+                .segments
+                .iter()
+                .map(|s| (s.segment_id, s.level, s.state, s.algorithm))
+                .collect::<Vec<_>>()
+        );
+
+        // Every member received rows: the writer spreads by cached load rather
+        // than always taking the first segment.
+        for segment in directory
+            .segments
+            .iter()
+            .filter(|s| s.state() == SegmentState::Published)
+        {
+            let header = AgentVecSegmentHeader::load(&index, segment.header);
+            assert!(
+                header.num_entries > 0,
+                "segment {} received no rows",
+                segment.segment_id
+            );
+        }
+
+        // Every row is still found: the scan must merge all four graphs.
+        let found: i64 = Spi::get_one::<i64>("SELECT count(*) FROM t_av_pool")?.expect("count");
+        assert_eq!(found, 32);
+        assert_eq!(
+            search_ids("t_av_pool", "v", "<->", "[16,0]", 32).len(),
+            32,
+            "a scan must return rows from every member of the HOT pool"
+        );
+        Ok(())
+    }
+
+    /// Sealing one member of a multi-segment pool leaves the pool at its
+    /// configured size and keeps every committed row searchable — the property
+    /// that lets the write side continue while a segment is being handed to
+    /// maintenance.
+    #[pg_test]
+    fn test_agentvec_multi_hot_seal_keeps_writers_going() -> spi::Result<()> {
+        Spi::run(
+            "CREATE TABLE t_av_pool2(id int, v vector(2));
+             CREATE INDEX idx_av_pool2 ON t_av_pool2 USING agentvec (v vector_l2_ops)
+                WITH (hot_segment_count = 2, hot_segment_max_rows = 3);
+             INSERT INTO t_av_pool2
+                SELECT g, ('[' || g || ',0]')::vector FROM generate_series(1, 40) AS g;",
+        )?;
+        force_index_scan();
+
+        let index = index_relation("idx_av_pool2");
+        let meta = AgentVecMetaPage::fetch(&index);
+        let directory: AgentVecDirectory = meta.load_directory(&index);
+
+        // 40 rows at 3 rows per segment over a 2-segment pool: every seal hands
+        // its writers to a sibling and immediately opens a replacement, so the
+        // appendable pool is still exactly two members.
+        assert_eq!(
+            appendable_hot_count(&directory),
+            2,
+            "a seal must be followed by a replacement, got {:?}",
+            directory
+                .segments
+                .iter()
+                .map(|s| (s.segment_id, s.level, s.state))
+                .collect::<Vec<_>>()
+        );
+        let queued: i64 = Spi::get_one::<i64>(
+            "SELECT count(*) FROM agentvec_index_info('idx_av_pool2')
+              WHERE state = 'queued_for_migration'",
+        )?
+        .expect("count");
+        assert!(queued >= 1, "expected sealed segments, got {queued}");
+
+        // No committed row may be lost across the seals.
+        let indexed: i64 = Spi::get_one::<i64>(
+            "SELECT sum(num_entries)::bigint FROM agentvec_index_info('idx_av_pool2')",
+        )?
+        .expect("sum");
+        assert_eq!(indexed, 40, "every inserted row is accounted for");
+        assert_eq!(
+            search_ids("t_av_pool2", "v", "<->", "[0,0]", 40),
+            (1..=40).collect::<Vec<i32>>(),
+            "search must merge every segment, sealed ones included"
+        );
+        Ok(())
+    }
+
     /// Cosine and inner-product operator classes, including the cosine
     /// normalization the stored representation relies on.
     #[pg_test]

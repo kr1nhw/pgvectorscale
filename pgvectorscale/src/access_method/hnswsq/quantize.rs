@@ -451,7 +451,7 @@ impl Codec {
     }
 
     // -----------------------------------------------------------------------
-    // SQ integer distances (the smoke-gun winners; see smoke.rs)
+    // SQ integer distances
     // -----------------------------------------------------------------------
 
     /// Build the per-query state for the integer pairwise distance: the query

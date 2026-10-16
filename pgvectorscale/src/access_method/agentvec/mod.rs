@@ -229,7 +229,7 @@ fn agentvec_index_info(
 > {
     let meta = meta_page::AgentVecMetaPage::fetch(&index);
     let directory = meta.load_directory(&index);
-    let hot_segment_id = meta.get_hot_segment_id();
+    let _hot_segment_id = meta.get_hot_segment_id();
 
     let rows: Vec<_> = directory
         .segments
@@ -242,7 +242,10 @@ fn agentvec_index_info(
                 segment.state().as_str().to_string(),
                 segment.algorithm().as_str().to_string(),
                 segment.ownership().as_str().to_string(),
-                segment.segment_id == hot_segment_id,
+                // `is_hot` means "accepts inserts right now": every published
+                // HOT segment of the pool, of which there is normally one.
+                segment.level() == directory::SegmentLevel::Hot
+                    && segment.state() == directory::SegmentState::Published,
                 segment.generation as i64,
                 segment.epoch as i64,
                 header.num_entries as i64,
