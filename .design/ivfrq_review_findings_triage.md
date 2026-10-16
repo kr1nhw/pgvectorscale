@@ -84,14 +84,35 @@ calibration 0xFF      XX001: hnswsq: calibration parse failed (280 bytes): Check
 nine extension opclasses stay accepted — including the `agentvec vector_l2_ops`
 that 17 indexes (and `items_1b_av`) use.
 
-## The one change that is not end-to-end covered
+## Finding 2: covering a branch nothing produces any more
 
-Finding 2's loop lives in `ambulkdelete`'s `SegmentAlgorithm::Flat` branch.  Flat
-segments have not been produced since `1a85350` ("embed hnswsq as the HOT
-segment"), no index on the box has one, and the current build never creates one,
-so the hoisted buffers can only be exercised on a legacy index.  The change is a
-pure refactor (same items, same order: `entries.clear()` then refill,
-`to_tombstone.clear()` then refill, both still bounded by one chain) and the
-reachable VACUUM paths — `hnsw`, `ivf_rabitq` — were run end-to-end on the patch
-(`VACUUM` on corrupted and healthy `hnswsq`/`agentvec` fixtures, plus the
-`cargo pgrx test` vacuum tests).
+Finding 2's loop lives in `ambulkdelete`'s `SegmentAlgorithm::Flat` branch, and
+Flat segments have not been produced since `1a85350` ("embed hnswsq as the HOT
+segment") — no index on the box has one, so the rewrite would otherwise be code
+that never runs.  `test_agentvec_flat_segment_bulkdelete_across_chains` covers it:
+
+* it turns the empty HOT segment `CREATE INDEX` publishes into a legacy Flat
+  segment (the flag lives in the directory entry and the header), so the
+  **product's own insert path** appends real entries to it;
+* it seals the active chain between four batches (2000 + 1500 + 1000 + 500 rows)
+  so the segment ends up with **four chains** at ~130 pages each — the sweep has
+  to carry its buffers across chains, which is exactly what the rewrite changed;
+* it drives `ambulkdelete` directly with a synthetic dead-verdict callback (the
+  idiom `hnswsq_bulkdelete_tombstones_direct` already uses, because VACUUM's own
+  verdict depends on the cutoff concurrent backends can pin) and then asserts the
+  sweep's stats, the header counters, that exactly the four killed entries are
+  tombstoned, and that a scan agrees with the heap.  A second sweep must find
+  nothing, which is what proves no entry is tombstoned twice.
+
+The test is sensitive to the failure mode the rewrite could introduce, which is
+the point: dropping either `clear()` from the loop makes it fail —
+
+| variant | result |
+|---|---|
+| patched loop | ok |
+| patched loop − `to_tombstone.clear()` | FAILED: `agentvec: entry 72/11 tombstoned twice` |
+| patched loop − `entries.clear()` | FAILED: `agentvec: entry 72/11 tombstoned twice` |
+| HEAD's per-chain `Vec::new()` loop + the same test | ok |
+
+The last row is the useful control: the test is a regression test for the branch
+itself, not something written to fit the rewrite.

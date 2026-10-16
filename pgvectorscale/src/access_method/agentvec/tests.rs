@@ -1138,4 +1138,229 @@ mod tests {
         assert!(header.active.is_none());
         Ok(())
     }
+
+    /// The Flat branch of `ambulkdelete`, with real entries and several chains.
+    ///
+    /// Flat segments are no longer produced (`open_new_hot_segment` always
+    /// builds an HNSW region since 1a85350), so no index created today has one
+    /// and the legacy sweep would otherwise be dead code that never runs in a
+    /// test.  This test turns the empty HOT segment the build publishes into a
+    /// Flat one, then lets the *product's own* insert path append to it, seals
+    /// the active chain between batches to leave the segment with three chains,
+    /// and drives the sweep directly with a synthetic dead-verdict callback
+    /// (VACUUM's own verdict depends on the cutoff, which concurrent backends
+    /// can pin — the same reason `hnswsq_bulkdelete_tombstones_direct` drives
+    /// the AM directly).
+    ///
+    /// Four chains is what makes this a test of the sweep's per-chain buffers:
+    /// if the tombstones or the entry list of one chain leaked into the next,
+    /// `flat::mark_dead` would report an entry tombstoned twice, or the tombstones
+    /// would land on the wrong entries — both of which the assertions below
+    /// catch, against ids read back from the heap.
+    #[pg_test]
+    fn test_agentvec_flat_segment_bulkdelete_across_chains() -> spi::Result<()> {
+        use crate::access_method::agentvec::directory::SegmentAlgorithm;
+        use crate::access_method::agentvec::flat;
+        use crate::access_method::agentvec::insert::SEGMENT_FORMAT_FLAT_V1;
+
+        /// Parse PostgreSQL's `(block,offset)` ctid text.
+        fn parse_ctid(text: &str) -> (u32, u16) {
+            let inner = text.trim().trim_start_matches('(').trim_end_matches(')');
+            let (block, offset) = inner.split_once(',').expect("ctid is (block,offset)");
+            (
+                block.trim().parse().expect("ctid block"),
+                offset.trim().parse().expect("ctid offset"),
+            )
+        }
+
+        struct KillSet(Vec<(u32, u16)>);
+        unsafe extern "C-unwind" fn kill_set(
+            tid: *mut pg_sys::ItemPointerData,
+            state: *mut std::os::raw::c_void,
+        ) -> bool {
+            let targets = &*(state as *const KillSet);
+            let here = (
+                pgrx::itemptr::item_pointer_get_block_number(tid),
+                pgrx::itemptr::item_pointer_get_offset_number(tid),
+            );
+            targets.0.iter().any(|&t| t == here)
+        }
+
+        force_index_scan();
+        Spi::run(
+            "CREATE TABLE t_av_flat(id serial primary key, embedding vector(128));
+             CREATE INDEX idx_av_flat ON t_av_flat USING agentvec (embedding vector_l2_ops)
+                 WITH (hot_segment_max_rows = 1000000);",
+        )?;
+
+        let index = index_relation("idx_av_flat");
+
+        // Legacy-format flag: both the directory entry and the header carry it.
+        let header_pointer = unsafe {
+            let meta = AgentVecMetaPage::fetch(&index);
+            let mut directory = meta.load_directory(&index);
+            let hot_id = meta.get_hot_segment_id();
+            let segment = directory.get_mut(hot_id).expect("the build's HOT segment");
+            assert_eq!(
+                segment.algorithm(),
+                SegmentAlgorithm::Hnsw,
+                "the build publishes an HNSW HOT segment"
+            );
+            let header_pointer = segment.header;
+            segment.algorithm = SegmentAlgorithm::Flat as u8;
+            segment.format_version = SEGMENT_FORMAT_FLAT_V1;
+            let (directory_pointer, directory_blocks) = directory.store(&index);
+            AgentVecMetaPage::update(&index, |meta| {
+                meta.set_directory(directory_pointer, directory_blocks);
+            });
+            AgentVecSegmentHeader::update(&index, header_pointer.block_number, |header| {
+                header.algorithm = SegmentAlgorithm::Flat as u8;
+            });
+            header_pointer
+        };
+
+        // Four batches, sealing the active chain in between: 2000 + 1500 +
+        // 1000 + 500.  A dim-128 entry is 519 bytes, so each chain spans ~130
+        // pages — long enough that a walk of one chain has real state to carry.
+        let mut last_id = 0;
+        for batch in [2000usize, 1500, 1000, 500] {
+            let first = last_id + 1;
+            last_id += batch;
+            Spi::run(&format!(
+                "INSERT INTO t_av_flat(embedding)
+                 SELECT ('[' || g || repeat(',0', 127) || ']')::vector
+                 FROM generate_series({first}, {last_id}) g"
+            ))?;
+            if batch != 500 {
+                unsafe {
+                    AgentVecSegmentHeader::update(&index, header_pointer.block_number, |header| {
+                        assert!(
+                            header.seal_active(),
+                            "the inserts above must have opened a chain"
+                        );
+                    });
+                }
+            }
+        }
+
+        let header = unsafe { AgentVecSegmentHeader::load(&index, header_pointer) };
+        let chains = header.chain_starts();
+        assert_eq!(chains.len(), 4, "one chain per batch: {chains:?}");
+        assert_eq!(header.num_entries, 5000);
+        assert_eq!(header.dead_entries, 0);
+
+        // Every entry, per chain, with the heap TID the insert path stored.
+        let mut per_chain: Vec<usize> = Vec::new();
+        for &chain in &chains {
+            let mut n = 0;
+            unsafe {
+                flat::for_each_entry(&index, chain, |_block, _offset, _bytes| n += 1);
+            }
+            per_chain.push(n);
+        }
+        assert_eq!(
+            per_chain,
+            vec![2000, 1500, 1000, 500],
+            "entries land in the chain they were appended to"
+        );
+
+        // The index is exact and complete before the sweep.
+        let zero = format!(
+            "[{}]",
+            std::iter::repeat("0")
+                .take(128)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let all_ids: Vec<i32> = (1..=5000).collect();
+        assert_eq!(
+            search_ids("t_av_flat", "embedding", "<->", &zero, 5000),
+            all_ids,
+            "all 5000 entries are live and searchable"
+        );
+
+        // Kill one row in each chain, by the ctid the heap reports.
+        let kill_ids = [1000, 3000, 4200, 4800];
+        let mut targets = Vec::new();
+        for id in kill_ids {
+            let ctid: String =
+                Spi::get_one(&format!("SELECT ctid::text FROM t_av_flat WHERE id = {id}"))?
+                    .expect("ctid");
+            targets.push(parse_ctid(&ctid));
+        }
+
+        let mut kill = KillSet(targets.clone());
+        let mut info = pg_sys::IndexVacuumInfo::default();
+        info.index = index.as_ptr();
+        let results = unsafe {
+            crate::access_method::agentvec::vacuum::ambulkdelete(
+                &mut info,
+                std::ptr::null_mut(),
+                Some(kill_set),
+                &mut kill as *mut KillSet as *mut std::os::raw::c_void,
+            )
+        };
+        unsafe {
+            assert_eq!((*results).tuples_removed, 4.0, "four tombstones");
+            assert_eq!((*results).num_index_tuples, 4996.0, "4996 live entries");
+            pg_sys::pfree(results as *mut std::os::raw::c_void);
+        }
+
+        // Exactly the killed entries are dead — nothing from another chain, and
+        // nothing tombstoned twice (which `mark_dead` would have raised on).
+        let header = unsafe { AgentVecSegmentHeader::load(&index, header_pointer) };
+        assert_eq!(
+            header.num_entries, 5000,
+            "the sweep does not remove entries"
+        );
+        assert_eq!(header.dead_entries, 4);
+        let mut dead: Vec<(u32, u16)> = Vec::new();
+        let mut live = 0usize;
+        for &chain in &header.chain_starts() {
+            unsafe {
+                flat::for_each_entry(&index, chain, |_block, _offset, bytes| {
+                    if flat::decode_state(bytes) == flat::STATE_DEAD {
+                        let tid = flat::decode_tid(bytes);
+                        dead.push((tid.block_number, tid.offset));
+                    } else {
+                        live += 1;
+                    }
+                });
+            }
+        }
+        dead.sort_unstable();
+        let mut expected_dead = targets.clone();
+        expected_dead.sort_unstable();
+        assert_eq!(dead, expected_dead, "the killed entries are the dead ones");
+        assert_eq!(live, 4996);
+
+        // … and the scan agrees with the heap.
+        let expected_live: Vec<i32> = (1..=5000).filter(|id| !kill_ids.contains(id)).collect();
+        assert_eq!(
+            search_ids("t_av_flat", "embedding", "<->", &zero, 4996),
+            expected_live,
+            "tombstoned rows are gone from results, live rows are kept"
+        );
+
+        // A second sweep has nothing left to do.
+        let mut kill = KillSet(targets);
+        let results = unsafe {
+            crate::access_method::agentvec::vacuum::ambulkdelete(
+                &mut info,
+                std::ptr::null_mut(),
+                Some(kill_set),
+                &mut kill as *mut KillSet as *mut std::os::raw::c_void,
+            )
+        };
+        unsafe {
+            assert_eq!(
+                (*results).tuples_removed,
+                0.0,
+                "no entry is tombstoned twice"
+            );
+            assert_eq!((*results).num_index_tuples, 4996.0);
+            pg_sys::pfree(results as *mut std::os::raw::c_void);
+        }
+        Ok(())
+    }
 }
