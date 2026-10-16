@@ -296,17 +296,29 @@ The Rust suite (`cargo pgrx test -p vectorscale pg17 agentvec --runas pgtest`) r
 **21 passed / 7 failed**. Both new tests pass:
 `pg_test_agentvec_multi_hot_pool` and `pg_test_agentvec_multi_hot_seal_keeps_writers_going`.
 
-The 7 failures are **one pre-existing failure plus 6 collateral**: the first is
-`pg_test_agentvec_consolidate_lifecycle_and_row_identity`, whose backend dies with signal 6
-during consolidation and takes the shared test instance down with it (the remaining six then fail
-with "Could not obtain test mutex"). Re-running the suite with the only `consolidate.rs` edit
-reverted produces the **identical** 21/7 result, and the code path that aborts is byte-identical
-to HEAD, so the failure is not attributable to this change. It deserves its own investigation.
+The 7 failures are **one real failure plus 6 collateral**. The real one is
+`pg_test_agentvec_consolidate_lifecycle_and_row_identity`: its backend dies with signal 6 and
+takes the shared test instance down with it, after which the other six fail with
+"connection closed" — they are not independently broken.
+
+That failure is **pre-existing and unrelated to this change**, established by A/B rather than by
+inference. Running *only that test*, built from this commit and then from its parent `d6491a6`,
+fails identically both times (`test result: FAILED. 0 passed; 1 failed`).
+
+It is also **specific to the `cargo pgrx test` harness**. The same sequence succeeds against a
+normal cluster in every variant tried: autocommit; inside an explicit transaction (which is how
+the harness wraps a test); with the harness's own GUCs (`maintenance_work_mem = '640MB'`,
+`agentvec.maintenance_worker = off`); and invoked as a SQL function, the way the harness invokes
+it. `agentvec_consolidate` also runs correctly and continuously in production — the maintenance
+worker has repeatedly converted sealed HOT segments into WARM IVF-RaBitQ segments on the 1B
+index. The abort is therefore a harness/environment problem rather than a product defect
+reachable from SQL, worth chasing because it keeps the suite red and hides five other tests.
 
 > Note for whoever picks this up: `cargo pgrx test` needs `-p vectorscale`, `RUST_TEST_THREADS=1`,
 > and `target/test-pgdata` pre-created and owned by the `--runas` user, otherwise every test fails
 > with a misleading "Could not obtain test mutex". A hard-aborted run also leaves that directory
-> poisoned — delete it before re-running.
+> poisoned — delete it before re-running. To reproduce the A/B, keep a copy of the parent's
+> `pgvectorscale/src` and swap it in (the server keeps one at `/data1/avwork/src_parent`).
 
 ### C.3 Measured effect on the real insert path (new build, prefill 20 k, `f8`)
 
